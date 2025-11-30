@@ -48,26 +48,31 @@ func (v *Scanner) OnChannelUpdate(_ context.Context, ch *db.Channel, statusChang
 	defer v.mx.Unlock()
 
 	if ch.Status == db.ChannelStateInactive {
-		if c := v.activeChannels[ch.Address]; c != nil {
+		if c := v.activeChannels[ch.Our.Address]; c != nil {
 			c() // stop listener
-			delete(v.activeChannels, ch.Address)
+			delete(v.activeChannels, ch.Our.Address)
 		}
-		log.Info().Str("address", ch.Address).Msg("stop listening for channel events")
+		log.Info().Str("address", ch.Our.Address).Msg("stop listening for channel events")
 		return
 	}
 
-	if v.activeChannels[ch.Address] == nil {
+	if v.activeChannels[ch.Our.Address] == nil {
 		ctx, cancel := context.WithCancel(v.globalCtx)
-		v.activeChannels[ch.Address] = cancel
+		v.activeChannels[ch.Our.Address] = cancel
 
-		lt := uint64(0)
-		if ch.LastProcessedLT > 0 {
+		ltOur, ltTheir := uint64(0), uint64(0)
+		if ch.Our.LatestProcessedLT > 0 {
 			// to report last tx
-			lt = ch.LastProcessedLT - 1
+			ltOur = ch.Our.LatestProcessedLT - 1
+		}
+		if ch.Their.LatestProcessedLT > 0 {
+			// to report last tx
+			ltTheir = ch.Their.LatestProcessedLT - 1
 		}
 
-		log.Info().Str("address", ch.Address).Msg("start listening for channel events")
-		go v.startForContract(ctx, address.MustParseAddr(ch.Address), lt)
+		log.Info().Str("address", ch.Our.Address).Msg("start listening for channel events")
+		go v.startForContract(ctx, address.MustParseAddr(ch.Our.Address), ltOur)
+		go v.startForContract(ctx, address.MustParseAddr(ch.Their.Address), ltTheir)
 	}
 }
 
@@ -82,7 +87,7 @@ func (v *Scanner) startForContract(ctx context.Context, addr *address.Address, s
 			var acc *client.Account
 			for {
 				var err error
-				acc, err = v.ton.GetAccount(ctx, addr)
+				acc, err = v.ton.GetAccount(ctx, addr, time.Unix(tx.At, 0))
 				if err != nil {
 					log.Error().Err(err).Str("address", addr.String()).Msg("failed to fetch account")
 					time.Sleep(1 * time.Second)
@@ -95,7 +100,7 @@ func (v *Scanner) startForContract(ctx context.Context, addr *address.Address, s
 				continue
 			}
 
-			p, err := v.client.ParseAsyncChannel(addr, acc.Code, acc.Data, true)
+			p, err := v.client.ParseChannel(addr, acc.Code, acc.Data, true)
 			if err != nil {
 				if !errors.Is(err, payments.ErrVerificationNotPassed) {
 					log.Warn().Err(err).Str("addr", addr.String()).Msg("failed to parse payment channel")
@@ -106,8 +111,8 @@ func (v *Scanner) startForContract(ctx context.Context, addr *address.Address, s
 			log.Debug().Str("address", addr.String()).Msg("account fetched and parsed, reporting channel update event")
 
 			v.events <- tonpayments.ChannelUpdatedEvent{
-				Transaction: tx,
-				Channel:     p,
+				Transaction:   tx,
+				LatestChannel: p,
 			}
 		}
 	}
@@ -129,7 +134,7 @@ func (v *Scanner) subscribeOnTransactions(workerCtx context.Context, addr *addre
 		wait = 3 * time.Second
 
 		ctx, cancel := context.WithTimeout(workerCtx, 10*time.Second)
-		acc, err := v.ton.GetAccount(ctx, addr)
+		acc, err := v.ton.GetAccount(ctx, addr, time.Time{})
 		cancel()
 		if err != nil {
 			timer.Reset(wait)

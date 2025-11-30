@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
+	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -19,229 +20,277 @@ import (
 	"time"
 )
 
-func (s *Service) updateOurStateWithAction(channel *db.Channel, action transport.Action, details any) (func(ctx context.Context) error, *cell.Cell, *cell.Cell, error) {
+func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Channel, action transport.Action, details any) (func(ctx context.Context) error, *payments.StateBodySigned, error) {
 	var onSuccess func(ctx context.Context) error
 
-	cc, err := s.ResolveCoinConfig(channel.JettonAddress, channel.ExtraCurrencyID, false)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to resolve coin config: %w", err)
-	}
-
 	var idempotency bool
-	dictRoot := cell.CreateProofSkeleton()
+
+	state := channel.LoadSignedState()
 
 	switch act := action.(type) {
 	case transport.IncrementStatesAction:
-	case transport.OpenVirtualAction:
-		vch := details.(payments.VirtualChannel)
+	case transport.AddConditionalAction:
+		cond := details.(payments.Conditional)
 
-		if vch.Capacity.Sign() <= 0 {
-			return nil, nil, nil, fmt.Errorf("invalid capacity")
+		if err := cond.ValidateOnAdd(); err != nil {
+			return nil, nil, err
 		}
 
-		if vch.Fee.Sign() < 0 {
-			return nil, nil, nil, fmt.Errorf("invalid fee")
-		}
+		val := cond.Serialize()
+		key := cell.BeginCell().MustStoreSlice(val.Hash(), 256).EndCell()
 
-		if vch.Prepay.Sign() < 0 {
-			return nil, nil, nil, fmt.Errorf("invalid prepay")
-		}
-
-		if vch.Deadline < time.Now().UTC().Unix() {
-			return nil, nil, nil, fmt.Errorf("deadline expired")
-		}
-
-		val := vch.Serialize()
-
-		key := big.NewInt(int64(binary.LittleEndian.Uint32(vch.Key)))
-		keyCell := cell.BeginCell().MustStoreBigInt(key, 32).EndCell()
-
-		sl, proofValueBranch, err := channel.Our.Conditionals.LoadValueWithProof(keyCell, dictRoot)
+		_, err := channel.Our.Data.Conditionals.LoadValue(key)
 		if err == nil {
-			if bytes.Equal(sl.MustToCell().Hash(), val.Hash()) {
-				// idempotency
-				proofValueBranch.SetRecursive()
-				idempotency = true
-				break
-			}
-			return nil, nil, nil, fmt.Errorf("virtual channel with the same key prefix and different content is already exists")
+			// idempotency
+			idempotency = true
+			break
 		} else if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
-			return nil, nil, nil, fmt.Errorf("failed to load our condition: %w", err)
+			return nil, nil, fmt.Errorf("failed to load our condition: %w", err)
 		}
 
-		// TODO: check virtual channels limit
-
-		if err := channel.Our.Conditionals.SetIntKey(key, val); err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to set condition: %w", err)
-		}
-
-		_, proofValueBranch, err = channel.Our.Conditionals.LoadValueWithProof(keyCell, dictRoot)
+		var saveAction bool
+		actId := cond.GetAction().IDCell()
+		_, err = channel.Our.Data.ActionStates.LoadValue(actId)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to find key for proof branch: %w", err)
+			if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
+				return nil, nil, fmt.Errorf("failed to load our action state: %w", err)
+			}
+
+			if act.NewActionCode == nil {
+				return nil, nil, fmt.Errorf("action code myst be set")
+			}
+
+			if err := channel.Our.Data.ActionStates.Set(actId, cond.GetAction().GetEmptyState()); err != nil {
+				return nil, nil, fmt.Errorf("failed to set action state: %w", err)
+			}
+			saveAction = true
 		}
-		// include a whole value cell in proof
-		proofValueBranch.SetRecursive()
+
+		// TODO: virtual channels limit?
+
+		if err := channel.Our.Data.Conditionals.Set(key, val); err != nil {
+			return nil, nil, fmt.Errorf("failed to set condition: %w", err)
+		}
+
+		if saveAction {
+			if err = s.SaveAction(ctx, cond.GetAction()); err != nil {
+				return nil, nil, fmt.Errorf("failed to save action: %w", err)
+			}
+		}
+
+		onSuccess = func(ctx context.Context) error {
+			log.Info().Fields(cond.GetLogInfo()).
+				Str("channel", channel.Our.Address).
+				Msg("our conditional added")
+			return nil
+		}
 	case transport.CommitVirtualAction:
-		_, vch, err := payments.FindVirtualChannelWithProof(channel.Our.Conditionals, act.Key, dictRoot)
+		upd, err := payments.CodeToConditional(ctx, act.UpdatedConditional, s)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, fmt.Errorf("failed to parse updated conditional: %w", err)
 		}
 
-		prepay := new(big.Int).SetBytes(act.PrepayAmount)
-		toSend := new(big.Int).Sub(prepay, vch.Prepay)
+		idx, cond, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, act.ID, s)
+		if err != nil {
+			return nil, nil, err
+		}
 
-		if toSend.Sign() < 0 {
-			return nil, nil, nil, fmt.Errorf("prepay amount is less than before")
-		} else if toSend.Sign() == 0 {
+		condAction := cond.GetAction()
+		actIdx := condAction.IDCell()
+
+		actState, err := channel.Their.Data.ActionStates.LoadValue(actIdx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to load action state: %w", err)
+		}
+
+		if bytes.Equal(act.UpdatedConditional.Hash(), cond.Serialize().Hash()) {
 			// same
 			idempotency = true
 			break
 		}
 
-		key := big.NewInt(int64(binary.LittleEndian.Uint32(vch.Key)))
-
-		vch.Prepay = prepay
-		if err := channel.Our.Conditionals.SetIntKey(key, vch.Serialize()); err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to set condition: %w", err)
+		updatedActState, err := cond.Commit(upd, actState.MustToCell())
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to commit conditional: %w", err)
 		}
 
-		channel.Our.State.Data.Sent = cc.MustAmount(new(big.Int).Add(channel.Our.State.Data.Sent.Nano(), toSend))
+		if err := channel.Our.Data.Conditionals.Set(idx, cond.Serialize()); err != nil {
+			return nil, nil, fmt.Errorf("failed to set condition: %w", err)
+		}
+
+		if err := channel.Our.Data.ActionStates.Set(actIdx, updatedActState); err != nil {
+			return nil, nil, fmt.Errorf("failed to set condition: %w", err)
+		}
 
 		onSuccess = func(_ context.Context) error {
-			log.Info().Str("key", base64.StdEncoding.EncodeToString(vch.Key)).
-				Str("capacity", tlb.MustFromNano(vch.Capacity, int(cc.Decimals)).String()).
-				Str("fee", tlb.MustFromNano(vch.Fee, int(cc.Decimals)).String()).
-				Str("prepaid", vch.Prepay.String()).
-				Str("channel", channel.Address).
-				Msg("virtual channel commit confirmed")
+			log.Info().Fields(cond.GetLogInfo()).
+				Str("channel", channel.Our.Address).
+				Msg("conditional commit confirmed")
 			return nil
 		}
-	case transport.RemoveVirtualAction:
-		idx, vch, err := payments.FindVirtualChannelWithProof(channel.Our.Conditionals, act.Key, dictRoot)
+	case transport.RemoveConditionalAction:
+		idx, vch, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, act.ID, s)
 		if err != nil {
 			if errors.Is(err, payments.ErrNotFound) {
 				// idempotency, if not found we consider it already closed
 				idempotency = true
 				break
 			}
-			return nil, nil, nil, err
-		}
-		// new skeleton to reset prev path
-		dictRoot = cell.CreateProofSkeleton()
-
-		if err = channel.Our.Conditionals.DeleteIntKey(idx); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 
-		key := big.NewInt(int64(binary.LittleEndian.Uint32(vch.Key)))
-		keyCell := cell.BeginCell().MustStoreBigInt(key, 32).EndCell()
-
-		_, _, err = channel.Our.Conditionals.LoadValueWithProof(keyCell, dictRoot)
-		if err == nil || !errors.Is(err, cell.ErrNoSuchKeyInDict) {
-			return nil, nil, nil, fmt.Errorf("deleted value is still exists for some reason: %w", err)
+		if err = channel.Our.Data.Conditionals.Delete(idx); err != nil {
+			return nil, nil, err
 		}
 
 		onSuccess = func(_ context.Context) error {
-			log.Info().Str("key", base64.StdEncoding.EncodeToString(vch.Key)).
-				Str("capacity", tlb.MustFromNano(vch.Capacity, int(cc.Decimals)).String()).
-				Str("channel", channel.Address).
-				Msg("virtual channel successfully removed")
+			log.Info().Fields(vch.GetLogInfo()).
+				Msg("our conditional successfully removed")
 			return nil
 		}
-	case transport.ConfirmCloseAction:
-		var vState payments.VirtualChannelState
-		if err := tlb.LoadFromCell(&vState, act.State.BeginParse()); err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to load virtual channel state cell: %w", err)
-		}
+	case transport.ConfirmExecuteConditionalAction:
+		meta := details.(*db.ConditionalMeta)
 
-		if !vState.Verify(act.Key) {
-			return nil, nil, nil, fmt.Errorf("incorrect channel state signature")
-		}
-
-		idx, vch, err := payments.FindVirtualChannelWithProof(channel.Our.Conditionals, act.Key, dictRoot)
+		idx, cond, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, act.ID, s)
 		if err != nil {
 			if errors.Is(err, payments.ErrNotFound) {
 				// idempotency, if not found we consider it already closed
 				idempotency = true
 				break
 			}
-			return nil, nil, nil, err
-		}
-		// new skeleton to reset prev path
-		dictRoot = cell.CreateProofSkeleton()
-
-		if vch.Deadline < time.Now().UTC().Unix() {
-			return nil, nil, nil, fmt.Errorf("virtual channel has expired")
+			return nil, nil, err
 		}
 
-		if err = channel.Our.Conditionals.DeleteIntKey(idx); err != nil {
-			return nil, nil, nil, err
+		if err = cond.ValidateState(nil, act.State); err != nil {
+			return nil, nil, fmt.Errorf("failed to validate state: %w", err)
 		}
 
-		key := big.NewInt(int64(binary.LittleEndian.Uint32(vch.Key)))
-		keyCell := cell.BeginCell().MustStoreBigInt(key, 32).EndCell()
-
-		_, _, err = channel.Our.Conditionals.LoadValueWithProof(keyCell, dictRoot)
-		if err == nil || !errors.Is(err, cell.ErrNoSuchKeyInDict) {
-			return nil, nil, nil, fmt.Errorf("deleted value is still exists for some reason: %w", err)
+		if cond.GetDeadline().Before(time.Now()) {
+			return nil, nil, fmt.Errorf("conditional has expired")
 		}
 
-		toSend := new(big.Int).Set(vState.Amount)
-		toSend = toSend.Sub(toSend, vch.Prepay)
-		toSend = toSend.Add(toSend, vch.Fee)
-
-		if toSend.Sign() > 0 {
-			// we cannot decrease sent, even when we prepaid more than actual
-			channel.Our.State.Data.Sent = cc.MustAmount(new(big.Int).Add(toSend, channel.Our.State.Data.Sent.Nano()))
+		if err = channel.Our.Data.Conditionals.Delete(idx); err != nil {
+			return nil, nil, err
 		}
 
-		if channel.OurLockedDeposit != nil {
-			// mark part of the rented deposit as used
-			channel.OurLockedDeposit.Used.Add(channel.OurLockedDeposit.Used, toSend)
+		actId := cond.GetAction().IDCell()
+		actState, err := channel.Our.Data.ActionStates.LoadValue(actId)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to load action state: %w", err)
 		}
 
-		onSuccess = func(_ context.Context) error {
-			log.Info().Str("key", base64.StdEncoding.EncodeToString(vch.Key)).
-				Str("capacity", cc.MustAmount(vch.Capacity).String()).
-				Str("fee", cc.MustAmount(vch.Fee).String()).
-				Str("amount", cc.MustAmount(vState.Amount).String()).
-				Str("prepaid", cc.MustAmount(vch.Prepay).String()).
-				Str("channel", channel.Address).
-				Msg("virtual channel close confirmed")
+		newActState, err := cond.Execute(actState.MustToCell(), act.State, channel.Our.LockedDeposits)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to execute condition: %w", err)
+		}
+
+		if err = channel.Our.Data.ActionStates.Set(actId, newActState); err != nil {
+			return nil, nil, fmt.Errorf("failed to set action: %w", err)
+		}
+
+		balanceDiff, err := cond.GetAction().StatesDiff(actState.MustToCell(), newActState)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to calc balance diff: %w", err)
+		}
+
+		evData := db.ChannelHistoryActionTransferOutData{
+			Amounts: s.formatDiff(balanceDiff),
+			To:      meta.FinalDestination,
+		}
+		jsonData, err := json.Marshal(evData)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to marshal event data")
+		}
+
+		onSuccess = func(ctx context.Context) error {
+			if err = s.db.CreateChannelEvent(ctx, channel, time.Now(), db.ChannelHistoryItem{
+				Action: db.ChannelHistoryActionTransferOut,
+				Data:   jsonData,
+			}); err != nil {
+				return fmt.Errorf("failed to create channel event: %w", err)
+			}
+
+			log.Info().Fields(cond.GetLogInfo()).
+				Str("channel", channel.Our.Address).
+				Msg("conditional close confirmed")
 			return nil
 		}
 	case transport.RentCapacityAction:
+		bi := hex.EncodeToString(act.BalanceID)
+		cc, err := s.ResolveBalanceType(bi)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to resolve balance type %s: %w", bi, err)
+		}
+
 		amount := new(big.Int).SetBytes(act.Amount)
 		till := time.Unix(int64(act.Till), 0)
 		totalFee := channel.CalcDepositFee(cc, amount, till, true)
 
-		channel.Our.State.Data.Sent = cc.MustAmount(new(big.Int).Add(channel.Our.State.Data.Sent.Nano(), totalFee))
+		a, err := actions.NewSendActionFromBalanceID(ctx, cc, channel.SideA().Address, channel.SideB().Address)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create send action: %w", err)
+		}
 
+		actId := a.IDCell()
+		aState, err := channel.Our.Data.ActionStates.LoadValue(actId)
+		if err != nil && !errors.Is(err, cell.ErrNoSuchKeyInDict) {
+			return nil, nil, fmt.Errorf("failed to load action state: %w", err)
+		}
+
+		var saveAction bool
+		if aState == nil {
+			saveAction = true
+			aState = a.GetEmptyState().BeginParse()
+		}
+
+		var actState actions.StateActionSend
+		if err = payments.LoadState(&actState, aState.MustToCell()); err != nil {
+			return nil, nil, fmt.Errorf("failed to load action state: %w", err)
+		}
+		actState.Amount = cc.MustAmount(new(big.Int).Add(actState.Amount.Nano(), amount))
+
+		updatedState, err := tlb.ToCell(actState)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to serialize updated action state: %w", err)
+		}
+
+		if err := channel.Our.Data.ActionStates.Set(actId, updatedState); err != nil {
+			return nil, nil, fmt.Errorf("failed to set condition: %w", err)
+		}
+
+		ld := channel.Their.LockedDeposits[cc.BalanceID]
 		used := big.NewInt(0)
-		if channel.TheirLockedDeposit != nil && channel.TheirLockedDeposit.Till.After(time.Now()) {
-			used = channel.TheirLockedDeposit.Used
-			if amount.Cmp(channel.TheirLockedDeposit.Amount) <= 0 {
-				return nil, nil, nil, fmt.Errorf("amount should increase only")
+		if ld != nil && ld.Till.After(time.Now()) {
+			used = ld.Used
+			if amount.Cmp(ld.Amount) <= 0 {
+				return nil, nil, fmt.Errorf("amount should increase only")
 			}
-			if till.Before(channel.TheirLockedDeposit.Till) {
-				return nil, nil, nil, fmt.Errorf("new till should be greater than old one")
+			if till.Before(ld.Till) {
+				return nil, nil, fmt.Errorf("new till should be greater than old one")
 			}
 		}
 
-		channel.TheirLockedDeposit = &db.LockedDepositInfo{
+		channel.Their.LockedDeposits[cc.BalanceID] = &payments.LockedDepositInfo{
 			Amount: amount,
 			Till:   till,
 			Used:   used,
 		}
 
 		evData := db.ChannelHistoryActionRentCapData{
-			Amount: amount.String(),
-			Fee:    totalFee.String(),
-			Till:   till.Unix(),
+			BalanceID: cc.BalanceID,
+			Amount:    amount.String(),
+			Fee:       totalFee.String(),
+			Till:      till.Unix(),
 		}
 		jsonData, err := json.Marshal(evData)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to marshal event data: %w", err)
+			return nil, nil, fmt.Errorf("failed to marshal event data: %w", err)
+		}
+
+		if saveAction {
+			if err = s.SaveAction(ctx, a); err != nil {
+				return nil, nil, fmt.Errorf("failed to save action: %w", err)
+			}
 		}
 
 		onSuccess = func(ctx context.Context) error {
@@ -252,46 +301,87 @@ func (s *Service) updateOurStateWithAction(channel *db.Channel, action transport
 				return fmt.Errorf("failed to create channel our cap rent event: %w", err)
 			}
 
-			log.Info().Str("fee", cc.MustAmount(totalFee).String()).
+			log.Info().Str("balance_id", cc.BalanceID).Str("fee", cc.MustAmount(totalFee).String()).
 				Str("amount", cc.MustAmount(amount).String()).
-				Str("channel", channel.Address).
+				Str("channel", channel.Our.Address).
 				Time("till", till).
 				Msg("capacity rent confirmed")
 			return nil
 		}
 	case transport.CooperativeCommitAction:
-		var req payments.CooperativeCommit
-		err = tlb.LoadFromCell(&req, act.SignedCommitRequest.BeginParse())
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to parse commit channel request: %w", err)
+		if channel.PendingCommit != nil {
+			return nil, nil, fmt.Errorf("can't execute action while there is already pending commit")
+		}
+		if len(channel.Their.PendingOnchainTransfers) > 0 || len(channel.Our.PendingOnchainTransfers) > 0 {
+			return nil, nil, fmt.Errorf("can't execute action while there are pending onchian transfers")
 		}
 
-		totalFee := cc.MustAmountDecimal(cc.FeePerWithdrawPropose).Nano()
-		channel.Our.State.Data.Sent = cc.MustAmount(new(big.Int).Add(channel.Our.State.Data.Sent.Nano(), totalFee))
+		fees := make(map[string]*big.Int)
+		var payFee *bool
+		if act.WithFee {
+			side := channel.WeLeft
+			payFee = &side
 
-		wd := req.Signed.WithdrawB.Nano()
-		if channel.WeLeft {
-			wd = req.Signed.WithdrawA.Nano()
-		}
+			a, err := s.ResolveAction(ctx, act.ActionID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to resolve action: %w", err)
+			}
 
-		if err = channel.UpdatePendingWithdraw(false, wd); err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to update our pending withdraw: %w", err)
-		}
-
-		ourTargetBalance, _, err := channel.CalcBalance(false)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to calc our side balance with target: %w", err)
-		}
-
-		if ourTargetBalance.Sign() < 0 {
-			return nil, nil, nil, fmt.Errorf("not enough available balance with target")
+			fees, err = a.GetFeesPerCommitPropose()
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get fees per commit propose: %w", err)
+			}
 		}
 
 		jsonData, err := json.Marshal(db.ChannelHistoryActionTxRequest{
-			Fee: totalFee.String(),
+			Fees: s.formatDiff(fees),
 		})
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to marshal event data: %w", err)
+			return nil, nil, fmt.Errorf("failed to marshal event data: %w", err)
+		}
+
+		req, ourPending, theirPending, _, err := s.getCommitRequest(ctx, channel, act.ActionID, !act.WithFee, payFee)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to prepare execute action channel request: %w", err)
+		}
+
+		msg, err := tlb.ToCell(req.Signed)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to serialize pending commit message: %w", err)
+		}
+
+		if !msg.Verify(channel.Our.OnchainInfo.Key, act.MsgSignature) {
+			return nil, nil, fmt.Errorf("commit state missmatch")
+		}
+
+		aid := cell.BeginCell().MustStoreSlice(act.ActionID, 256).EndCell()
+
+		our, their := req.Signed.Action.StateA, req.Signed.Action.StateB
+		if !channel.WeLeft {
+			our, their = their, our
+		}
+
+		if our != nil {
+			if err = channel.Our.Data.ActionStates.Set(aid, our); err != nil {
+				return nil, nil, fmt.Errorf("failed to set our action state: %w", err)
+			}
+		}
+		if their != nil {
+			if err = channel.Their.Data.ActionStates.Set(aid, their); err != nil {
+				return nil, nil, fmt.Errorf("failed to set their action state: %w", err)
+			}
+		}
+
+		if ourPending != nil {
+			channel.Our.PendingOnchainTransfers[pendingIDCommit(req.Signed.Seqno)] = ourPending
+		}
+		if theirPending != nil {
+			channel.Their.PendingOnchainTransfers[pendingIDCommit(req.Signed.Seqno)] = theirPending
+		}
+
+		channel.PendingCommit = &db.PendingCommit{
+			Seqno:   req.Signed.Seqno,
+			Message: msg,
 		}
 
 		onSuccess = func(ctx context.Context) error {
@@ -302,47 +392,175 @@ func (s *Service) updateOurStateWithAction(channel *db.Channel, action transport
 				return fmt.Errorf("failed to create channel our cap rent event: %w", err)
 			}
 
-			log.Info().Str("fee", cc.MustAmount(totalFee).String()).
-				Msg("withdraw transaction proposal accepted")
+			log.Info().Str("action_id", base64.StdEncoding.EncodeToString(act.ActionID)).Msg("commit proposal accepted")
+			return nil
+		}
+	case transport.SwapAction:
+		fromCC, err := s.ResolveCoinConfig(hex.EncodeToString(act.FromBalanceID))
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to resolve from coin config: %w", err)
+		}
+
+		toCC, err := s.ResolveCoinConfig(hex.EncodeToString(act.ToBalanceID))
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to resolve to coin config: %w", err)
+		}
+
+		fromAmt := fromCC.MustAmount(new(big.Int).SetBytes(act.FromAmount))
+		toAmt := toCC.MustAmount(new(big.Int).SetBytes(act.ToAmount))
+
+		fromAct, err := actions.NewSendActionFromBalanceID(ctx, fromCC, channel.SideA().Address, channel.SideB().Address)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create send action from 'from' balance id: %w", err)
+		}
+
+		toAct, err := actions.NewSendActionFromBalanceID(ctx, toCC, channel.SideA().Address, channel.SideB().Address)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create send action from 'to' balance id: %w", err)
+		}
+
+		saveOurAction, saveTheirAction := false, false
+
+		theirState, err := channel.Their.Data.ActionStates.LoadValue(toAct.IDCell())
+		if err != nil {
+			if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
+				return nil, nil, fmt.Errorf("failed to load to action state: %w", err)
+			}
+			saveTheirAction = true
+			theirState = toAct.GetEmptyState().BeginParse()
+		}
+		ourState, err := channel.Our.Data.ActionStates.LoadValue(fromAct.IDCell())
+		if err != nil {
+			if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
+				return nil, nil, fmt.Errorf("failed to load from action state: %w", err)
+			}
+			saveOurAction = true
+			ourState = fromAct.GetEmptyState().BeginParse()
+		}
+
+		newTheirState, err := toAct.AddCoins(theirState.MustToCell(), toAmt.Nano(), channel.Their.LockedDeposits)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to add coins to their action state: %w", err)
+		}
+		newOurState, err := fromAct.AddCoins(ourState.MustToCell(), fromAmt.Nano(), channel.Our.LockedDeposits)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to add coins to our action state: %w", err)
+		}
+
+		if err = channel.Their.Data.ActionStates.Set(toAct.IDCell(), newTheirState); err != nil {
+			return nil, nil, fmt.Errorf("failed to set their action state: %w", err)
+		}
+		if err = channel.Our.Data.ActionStates.Set(fromAct.IDCell(), newOurState); err != nil {
+			return nil, nil, fmt.Errorf("failed to set our action state: %w", err)
+		}
+
+		resolver := tmpFullResolver{[]payments.Action{fromAct, toAct}, s}
+
+		theirBalance, err := channel.CalcBalance(ctx, true, resolver)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to calc their balance: %w", err)
+		}
+		if b := theirBalance[fromCC.BalanceID]; b == nil || b.Available().Sign() < 0 {
+			return nil, nil, fmt.Errorf("not enough funds on their balance")
+		}
+
+		ourBalance, err := channel.CalcBalance(ctx, false, resolver)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to calc our balance: %w", err)
+		}
+		if b := ourBalance[toCC.BalanceID]; b == nil || b.Available().Sign() < 0 {
+			return nil, nil, fmt.Errorf("not enough funds on our balance")
+		}
+
+		if saveOurAction {
+			if err = s.SaveAction(ctx, fromAct); err != nil {
+				return nil, nil, fmt.Errorf("failed to save action: %w", err)
+			}
+		}
+
+		if saveTheirAction {
+			if err = s.SaveAction(ctx, toAct); err != nil {
+				return nil, nil, fmt.Errorf("failed to save action: %w", err)
+			}
+		}
+
+		onSuccess = func(ctx context.Context) error {
+			log.Info().Str("addr", channel.Our.Address).
+				Str("from", fromAmt.String()+" "+fromCC.Symbol).Str("to", toAmt.String()+" "+toCC.Symbol).
+				Msg("requested swap confirmed")
+
 			return nil
 		}
 	default:
-		return nil, nil, nil, fmt.Errorf("unexpected action type: %s", reflect.TypeOf(act).String())
+		return nil, nil, fmt.Errorf("unexpected action type: %s", reflect.TypeOf(act).String())
 	}
 
-	var cond *cell.Cell
-	if !channel.Our.Conditionals.IsEmpty() {
-		cond = channel.Our.Conditionals.AsCell()
+	var ourCond, theirCond *cell.Cell
+	if !channel.Our.Data.Conditionals.IsEmpty() {
+		ourCond = channel.Our.Data.Conditionals.AsCell()
+	}
+	if !channel.Their.Data.Conditionals.IsEmpty() {
+		theirCond = channel.Their.Data.Conditionals.AsCell()
+	}
+
+	var ourAct, theirAct *cell.Cell
+	if !channel.Our.Data.ActionStates.IsEmpty() {
+		ourAct = channel.Our.Data.ActionStates.AsCell()
+	}
+	if !channel.Their.Data.ActionStates.IsEmpty() {
+		theirAct = channel.Their.Data.ActionStates.AsCell()
 	}
 
 	if !idempotency {
-		channel.Our.State.Data.Seqno++
-		if cond != nil {
-			channel.Our.State.Data.ConditionalsHash = cond.Hash()
+		state.Body.Seqno++
+
+		our, their := &state.Body.A, &state.Body.B
+		if !channel.WeLeft {
+			our, their = their, our
+		}
+
+		if ourCond != nil {
+			our.ConditionalsHash = ourCond.Hash()
 		} else {
-			channel.Our.State.Data.ConditionalsHash = make([]byte, 32)
+			our.ConditionalsHash = make([]byte, 32)
 		}
-		cl, err := tlb.ToCell(channel.Our.State)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to serialize state for signing: %w", err)
+		if theirCond != nil {
+			their.ConditionalsHash = theirCond.Hash()
+		} else {
+			their.ConditionalsHash = make([]byte, 32)
 		}
-		channel.Our.Signature = payments.Signature{Value: cl.Sign(s.key)}
+
+		if ourAct != nil {
+			our.ActionStatesHash = ourAct.Hash()
+		} else {
+			our.ActionStatesHash = make([]byte, 32)
+		}
+		if theirAct != nil {
+			their.ActionStatesHash = theirAct.Hash()
+		} else {
+			their.ActionStatesHash = make([]byte, 32)
+		}
 	}
 
-	res, err := tlb.ToCell(channel.Our.SignedSemiChannel)
+	toSign, err := tlb.ToCell(state.Body)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to serialize signed state: %w", err)
+		return nil, nil, fmt.Errorf("failed to serialize state for signing: %w", err)
+	}
+	if channel.WeLeft {
+		state.SignatureA = payments.Signature{Value: toSign.Sign(s.key)}
+		state.SignatureB = payments.Signature{Value: make([]byte, 64)}
+	} else {
+		state.SignatureA = payments.Signature{Value: make([]byte, 64)}
+		state.SignatureB = payments.Signature{Value: toSign.Sign(s.key)}
 	}
 
-	if cond == nil {
-		// empty conditionals
-		return onSuccess, res, nil, nil
-	}
+	return onSuccess, state, nil
+}
 
-	updateProof, err := cond.CreateProof(dictRoot)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create proof from conditionals: %w, DUMP: %s", err, cond.Dump())
-	}
+func pendingIDCommit(seqno uint64) string {
+	return fmt.Sprintf("commit_%d", seqno)
+}
 
-	return onSuccess, res, updateProof, nil
+func pendingIDWallet(seqno uint32) string {
+	return fmt.Sprintf("wallet_%d", seqno)
 }

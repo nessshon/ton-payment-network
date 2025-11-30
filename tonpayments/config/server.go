@@ -131,6 +131,7 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, err
 		}
 
+		cfg.assignBalanceID()
 		return cfg, nil
 	} else if err == nil {
 		data, err := os.ReadFile(path)
@@ -144,6 +145,8 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, err
 		}
 		cfg.ChannelConfig.SupportedCoins.Ton.Decimals = 9 // force to avoid problems on change
+
+		cfg.assignBalanceID()
 		return &cfg, nil
 	}
 

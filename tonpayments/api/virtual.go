@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
-	"github.com/xssnick/ton-payment-network/tonpayments/config"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/address"
@@ -24,22 +23,21 @@ type NodeChain struct {
 	DeadlineGapSeconds int64  `json:"deadline_gap_seconds"`
 }
 
-type VirtualSide struct {
-	ChannelAddress          string    `json:"channel_address"`
-	Capacity                string    `json:"capacity"`
-	Fee                     string    `json:"fee"`
-	UncooperativeDeadlineAt time.Time `json:"uncooperative_deadline_at"`
-	SafeDeadlineAt          time.Time `json:"safe_deadline_at"`
+type ConditionalSide struct {
+	ChannelAddress          string     `json:"channel_address"`
+	Code                    *cell.Cell `json:"code"`
+	UncooperativeDeadlineAt time.Time  `json:"uncooperative_deadline_at"`
+	SafeDeadlineAt          time.Time  `json:"safe_deadline_at"`
 }
 
-type VirtualChannel struct {
-	Key       string       `json:"key"`
-	Status    string       `json:"status"`
-	Amount    string       `json:"amount"`
-	Outgoing  *VirtualSide `json:"outgoing"`
-	Incoming  *VirtualSide `json:"incoming"`
-	CreatedAt time.Time    `json:"created_at"`
-	UpdatedAt time.Time    `json:"updated_at"`
+type Conditional struct {
+	Key       string           `json:"key"`
+	Status    string           `json:"status"`
+	Resolve   *cell.Cell       `json:"resolve"`
+	Outgoing  *ConditionalSide `json:"outgoing"`
+	Incoming  *ConditionalSide `json:"incoming"`
+	CreatedAt time.Time        `json:"created_at"`
+	UpdatedAt time.Time        `json:"updated_at"`
 }
 
 func (s *Server) handleVirtualGet(w http.ResponseWriter, r *http.Request) {
@@ -66,29 +64,7 @@ func (s *Server) handleVirtualGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var addr string
-	if meta.Outgoing != nil {
-		addr = meta.Outgoing.ChannelAddress
-	} else if meta.Incoming != nil {
-		addr = meta.Incoming.ChannelAddress
-	} else {
-		writeErr(w, 400, "channel address is unknown")
-		return
-	}
-
-	ch, err := s.svc.GetChannel(r.Context(), addr)
-	if err != nil {
-		writeErr(w, 500, "failed to get channel: "+err.Error())
-		return
-	}
-
-	cc, err := s.svc.ResolveCoinConfig(ch.JettonAddress, ch.ExtraCurrencyID, false)
-	if err != nil {
-		writeErr(w, 400, "failed to resolve coin config"+err.Error())
-		return
-	}
-
-	res, err := s.getVirtual(r.Context(), meta, int(cc.Decimals))
+	res, err := s.getVirtual(r.Context(), meta)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -121,34 +97,27 @@ func (s *Server) handleVirtualList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "failed to get channel: "+err.Error())
 		return
 	}
+	var our, their = make([]*Conditional, 0), make([]*Conditional, 0)
 
-	cc, err := s.svc.ResolveCoinConfig(ch.JettonAddress, ch.ExtraCurrencyID, false)
-	if err != nil {
-		writeErr(w, 400, "failed to resolve coin config"+err.Error())
-		return
-	}
-
-	var our, their = make([]*VirtualChannel, 0), make([]*VirtualChannel, 0)
-
-	allTheir, err := ch.Their.Conditionals.LoadAll()
+	allTheir, err := ch.Their.Data.Conditionals.LoadAll()
 	if err != nil {
 		writeErr(w, 500, "failed to load their conditionals: "+err.Error())
 		return
 	}
 
 	for _, kv := range allTheir {
-		vch, err := payments.ParseVirtualChannelCond(kv.Value)
+		vch, err := payments.CodeToConditional(r.Context(), kv.Value.MustToCell(), s.svc)
 		if err != nil {
 			continue
 		}
 
-		meta, err := s.svc.GetVirtualChannelMeta(r.Context(), vch.Key)
+		meta, err := s.svc.GetVirtualChannelMeta(r.Context(), vch.GetKey())
 		if err != nil {
 			writeErr(w, 500, "failed to get virtual channel meta: "+err.Error())
 			return
 		}
 
-		res, err := s.getVirtual(r.Context(), meta, int(cc.Decimals))
+		res, err := s.getVirtual(r.Context(), meta)
 		if err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -156,25 +125,25 @@ func (s *Server) handleVirtualList(w http.ResponseWriter, r *http.Request) {
 		their = append(their, res)
 	}
 
-	allOur, err := ch.Our.Conditionals.LoadAll()
+	allOur, err := ch.Our.Data.Conditionals.LoadAll()
 	if err != nil {
 		writeErr(w, 500, "failed to load our conditionals: "+err.Error())
 		return
 	}
 
 	for _, kv := range allOur {
-		vch, err := payments.ParseVirtualChannelCond(kv.Value)
+		vch, err := payments.CodeToConditional(r.Context(), kv.Value.MustToCell(), s.svc)
 		if err != nil {
 			continue
 		}
 
-		meta, err := s.svc.GetVirtualChannelMeta(r.Context(), vch.Key)
+		meta, err := s.svc.GetVirtualChannelMeta(r.Context(), vch.GetKey())
 		if err != nil {
 			writeErr(w, 500, "failed to get virtual channel meta: "+err.Error())
 			return
 		}
 
-		res, err := s.getVirtual(r.Context(), meta, int(cc.Decimals))
+		res, err := s.getVirtual(r.Context(), meta)
 		if err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -183,70 +152,50 @@ func (s *Server) handleVirtualList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeResp(w, struct {
-		Their []*VirtualChannel `json:"their"`
-		Our   []*VirtualChannel `json:"our"`
+		Their []*Conditional `json:"their"`
+		Our   []*Conditional `json:"our"`
 	}{their, our})
 }
 
-func (s *Server) getVirtual(ctx context.Context, meta *db.VirtualChannelMeta, decimals int) (*VirtualChannel, error) {
+func (s *Server) getVirtual(ctx context.Context, meta *db.ConditionalMeta) (*Conditional, error) {
 	var status string
 	switch meta.Status {
-	case db.VirtualChannelStateActive:
+	case db.ConditionalStateActive:
 		status = "active"
-	case db.VirtualChannelStateClosed:
+	case db.ConditionalStateClosed:
 		status = "closed"
-	case db.VirtualChannelStateRemoved:
+	case db.ConditionalStateRemoved:
 		status = "removed"
-	case db.VirtualChannelStateWantRemove:
+	case db.ConditionalStateWantRemove:
 		status = "want_remove"
-	case db.VirtualChannelStateWantClose:
+	case db.ConditionalStateWantClose:
 		status = "want_close"
 	default:
 		return nil, fmt.Errorf("unknown virtual channel %s state: %d", base64.StdEncoding.EncodeToString(meta.Key), meta.Status)
 	}
 
-	res := &VirtualChannel{
+	res := &Conditional{
 		Key:       base64.StdEncoding.EncodeToString(meta.Key),
 		Status:    status,
+		Resolve:   meta.LastKnownResolve,
 		CreatedAt: meta.CreatedAt,
 		UpdatedAt: meta.UpdatedAt,
-		Amount:    "0",
 	}
 
-	if len(meta.LastKnownResolve) > 0 {
-		cll, err := cell.FromBOC(meta.LastKnownResolve)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse last known resolve BoC: %w", err)
-		}
-
-		var st payments.VirtualChannelState
-		if err = tlb.LoadFromCell(&st, cll.BeginParse()); err != nil {
-			return nil, fmt.Errorf("failed to parse last known resolve state: %w", err)
-		}
-
-		if !st.Verify(meta.Key) {
-			return nil, fmt.Errorf("failed to verify last known resolve state: %w", err)
-		}
-
-		res.Amount = tlb.MustFromNano(st.Amount, decimals).String()
-	}
-
-	if meta.Status != db.VirtualChannelStateClosed && meta.Status != db.VirtualChannelStateRemoved {
+	if meta.Status != db.ConditionalStateClosed && meta.Status != db.ConditionalStateRemoved {
 		if meta.Incoming != nil {
-			res.Incoming = &VirtualSide{
+			res.Incoming = &ConditionalSide{
 				ChannelAddress:          meta.Incoming.ChannelAddress,
-				Capacity:                meta.Incoming.Capacity,
-				Fee:                     meta.Incoming.Fee,
+				Code:                    meta.Incoming.Conditional,
 				UncooperativeDeadlineAt: meta.Incoming.UncooperativeDeadline,
 				SafeDeadlineAt:          meta.Incoming.SafeDeadline,
 			}
 		}
 
 		if meta.Outgoing != nil {
-			res.Outgoing = &VirtualSide{
+			res.Outgoing = &ConditionalSide{
 				ChannelAddress:          meta.Outgoing.ChannelAddress,
-				Capacity:                meta.Outgoing.Capacity,
-				Fee:                     meta.Outgoing.Fee,
+				Code:                    meta.Outgoing.Conditional,
 				UncooperativeDeadlineAt: meta.Outgoing.UncooperativeDeadline,
 				SafeDeadlineAt:          meta.Outgoing.SafeDeadline,
 			}
@@ -258,8 +207,8 @@ func (s *Server) getVirtual(ctx context.Context, meta *db.VirtualChannelMeta, de
 
 func (s *Server) handleVirtualState(w http.ResponseWriter, r *http.Request) {
 	type request struct {
-		Key   string `json:"key"`
-		State string `json:"state"`
+		Key   string     `json:"key"`
+		State *cell.Cell `json:"state"`
 	}
 
 	if r.Method != "POST" {
@@ -279,13 +228,7 @@ func (s *Server) handleVirtualState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	st, err := parseState(req.State, key)
-	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-
-	if err = s.svc.AddVirtualChannelResolve(r.Context(), key, st); err != nil && !errors.Is(err, db.ErrNewerStateIsKnown) {
+	if err = s.svc.AddConditionalResolve(r.Context(), key, req.State); err != nil && !errors.Is(err, db.ErrNewerStateIsKnown) {
 		writeErr(w, 500, "failed to add virtual channel state: "+err.Error())
 		return
 	}
@@ -295,8 +238,8 @@ func (s *Server) handleVirtualState(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVirtualClose(w http.ResponseWriter, r *http.Request) {
 	type request struct {
-		Key   string `json:"key"`
-		State string `json:"state"`
+		Key   string     `json:"key"`
+		State *cell.Cell `json:"state"`
 	}
 
 	if r.Method != "POST" {
@@ -316,18 +259,12 @@ func (s *Server) handleVirtualClose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	st, err := parseState(req.State, key)
-	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-
-	if err = s.svc.AddVirtualChannelResolve(r.Context(), key, st); err != nil && !errors.Is(err, db.ErrNewerStateIsKnown) {
+	if err = s.svc.AddConditionalResolve(r.Context(), key, req.State); err != nil && !errors.Is(err, db.ErrNewerStateIsKnown) {
 		writeErr(w, 500, "failed to add virtual channel state: "+err.Error())
 		return
 	}
 
-	if err = s.svc.CloseVirtualChannel(r.Context(), key); err != nil {
+	if err = s.svc.CloseConditional(r.Context(), key); err != nil {
 		writeErr(w, 500, "failed to close virtual channel: "+err.Error())
 		return
 	}
@@ -337,11 +274,10 @@ func (s *Server) handleVirtualClose(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVirtualOpen(w http.ResponseWriter, r *http.Request) {
 	type request struct {
-		TTLSeconds      int64       `json:"ttl_seconds"`
-		Capacity        string      `json:"capacity"`
-		JettonMaster    string      `json:"jetton_master"`
-		ExtraCurrencyID uint32      `json:"ec_id"`
-		NodesChain      []NodeChain `json:"nodes_chain"`
+		TTLSeconds int64       `json:"ttl_seconds"`
+		Capacity   string      `json:"capacity"`
+		Currency   string      `json:"currency"`
+		NodesChain []NodeChain `json:"nodes_chain"`
 	}
 
 	if r.Method != "POST" {
@@ -353,21 +289,6 @@ func (s *Server) handleVirtualOpen(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "incorrect request body: "+err.Error())
 		return
-	}
-
-	var jetton *address.Address
-	if req.JettonMaster != "" {
-		var err error
-		jetton, err = address.ParseAddr(req.JettonMaster)
-		if err != nil {
-			writeErr(w, 400, "incorrect jetton address format: "+err.Error())
-			return
-		}
-
-		if req.ExtraCurrencyID != 0 {
-			writeErr(w, 400, "jetton master address and extra currency id are mutually exclusive")
-			return
-		}
 	}
 
 	if len(req.NodesChain) == 0 {
@@ -383,7 +304,7 @@ func (s *Server) handleVirtualOpen(w http.ResponseWriter, r *http.Request) {
 		deadline = deadline.Add(time.Duration(req.NodesChain[i].DeadlineGapSeconds) * time.Second)
 	}
 
-	cc, err := s.svc.ResolveCoinConfig(req.JettonMaster, req.ExtraCurrencyID, true)
+	cc, err := s.svc.ResolveCoinConfigBySymbol(req.Currency)
 	if err != nil {
 		writeErr(w, 400, "failed to resolve coin config"+err.Error())
 		return
@@ -428,13 +349,13 @@ func (s *Server) handleVirtualOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vc, firstInstructionKey, tun, err := transport.GenerateTunnel(vPriv, tunChain, 5, false, s.svc.GetPrivateKey())
+	firstInstructionKey, tun, err := transport.GenerateTunnel(vPriv, tunChain, 5, true, s.svc.GetPrivateKey(), cc)
 	if err != nil {
 		writeErr(w, 500, "failed to generate tunnel: "+err.Error())
 		return
 	}
 
-	err = s.svc.OpenVirtualChannel(r.Context(), with, firstInstructionKey, tunChain[len(tunChain)-1].Target, vPriv, tun, vc, jetton, req.ExtraCurrencyID)
+	err = s.svc.CreateSendConditional(r.Context(), firstInstructionKey, vPriv, tunChain[0], tunChain[len(tunChain)-1], tun, cc)
 	if err != nil {
 		writeErr(w, 403, "failed to request virtual channel open: "+err.Error())
 		return
@@ -455,11 +376,10 @@ func (s *Server) handleVirtualOpen(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVirtualTransfer(w http.ResponseWriter, r *http.Request) {
 	type request struct {
-		TTLSeconds      int64       `json:"ttl_seconds"`
-		Amount          string      `json:"amount"`
-		JettonMaster    string      `json:"jetton_master"`
-		ExtraCurrencyID uint32      `json:"ec_id"`
-		NodesChain      []NodeChain `json:"nodes_chain"`
+		TTLSeconds int64       `json:"ttl_seconds"`
+		Amount     string      `json:"amount"`
+		Currency   string      `json:"currency"`
+		NodesChain []NodeChain `json:"nodes_chain"`
 	}
 
 	if r.Method != "POST" {
@@ -473,27 +393,12 @@ func (s *Server) handleVirtualTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var jetton *address.Address
-	if req.JettonMaster != "" {
-		var err error
-		jetton, err = address.ParseAddr(req.JettonMaster)
-		if err != nil {
-			writeErr(w, 400, "incorrect jetton address format: "+err.Error())
-			return
-		}
-
-		if req.ExtraCurrencyID != 0 {
-			writeErr(w, 400, "jetton master address and extra currency id are mutually exclusive")
-			return
-		}
-	}
-
 	if len(req.NodesChain) == 0 {
 		writeErr(w, 400, "no nodes passed")
 		return
 	}
 
-	cc, err := s.svc.ResolveCoinConfig(req.JettonMaster, req.ExtraCurrencyID, false)
+	cc, err := s.svc.ResolveCoinConfigBySymbol(req.Currency)
 	if err != nil {
 		writeErr(w, 400, "failed to resolve coin config"+err.Error())
 		return
@@ -546,13 +451,13 @@ func (s *Server) handleVirtualTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vc, firstInstructionKey, tun, err := transport.GenerateTunnel(vPriv, tunChain, 5, true, s.svc.GetPrivateKey())
+	firstInstructionKey, tun, err := transport.GenerateTunnel(vPriv, tunChain, 5, true, s.svc.GetPrivateKey(), cc)
 	if err != nil {
 		writeErr(w, 500, "failed to generate tunnel: "+err.Error())
 		return
 	}
 
-	err = s.svc.OpenVirtualChannel(r.Context(), with, firstInstructionKey, tunChain[len(tunChain)-1].Target, vPriv, tun, vc, jetton, req.ExtraCurrencyID)
+	err = s.svc.CreateSendConditional(r.Context(), firstInstructionKey, vPriv, tunChain[0], tunChain[len(tunChain)-1], tun, cc)
 	if err != nil {
 		writeErr(w, 403, "failed to request virtual channel open: "+err.Error())
 		return
@@ -567,8 +472,8 @@ func (s *Server) handleVirtualTransfer(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) PushVirtualChannelEvent(ctx context.Context, event db.VirtualChannelEventType, meta *db.VirtualChannelMeta, cc *config.CoinConfig) error {
-	vc, err := s.getVirtual(ctx, meta, int(cc.Decimals))
+func (s *Server) PushVirtualChannelEvent(ctx context.Context, event db.VirtualChannelEventType, meta *db.ConditionalMeta) error {
+	vc, err := s.getVirtual(ctx, meta)
 	if err != nil {
 		return fmt.Errorf("failed to get virtual channel: %w", err)
 	}

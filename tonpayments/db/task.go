@@ -85,6 +85,8 @@ func (d *DB) ListActiveTasks(ctx context.Context, poolName string) ([]*Task, err
 	return result, nil
 }
 
+var _StartedAt = time.Now()
+
 func (d *DB) AcquireTask(ctx context.Context, poolName string) (*Task, error) {
 	var result *Task
 	err := d.Transaction(ctx, func(ctx context.Context) error {
@@ -130,8 +132,9 @@ func (d *DB) AcquireTask(ctx context.Context, poolName string) (*Task, error) {
 			if task.CompletedAt != nil {
 				continue
 			}
+			now = time.Now() // refresh
 
-			if task.LockedTill != nil && task.LockedTill.After(now) {
+			if task.LockedAt != nil && task.LockedTill != nil && task.LockedTill.After(now) && task.LockedAt.After(_StartedAt) {
 				// locked by someone else (already in progress)
 				// we skip everything in this queue to not break the order
 				toSkip = append(toSkip, task.Queue)
@@ -157,6 +160,7 @@ func (d *DB) AcquireTask(ctx context.Context, poolName string) (*Task, error) {
 			// we need to lock task to not acquire it twice when using multiple workers
 			till := time.Now().Add(5 * time.Minute)
 			result.LockedTill = &till
+			result.LockedAt = &now
 
 			data, err = json.Marshal(result)
 			if err != nil {

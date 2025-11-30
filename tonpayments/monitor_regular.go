@@ -29,7 +29,7 @@ func (s *Service) walletMonitor() {
 			ctx, cancel := context.WithTimeout(s.globalCtx, 10*time.Second)
 			defer cancel()
 
-			acc, err := s.ton.GetAccount(ctx, s.wallet.WalletAddress())
+			acc, err := s.ton.GetAccount(ctx, s.wallet.WalletAddress(), time.Time{})
 			if err != nil {
 				return fmt.Errorf("failed to get ton balance: %w", err)
 			}
@@ -61,7 +61,7 @@ func (s *Service) walletMonitor() {
 
 			for jettonAddr, config := range s.cfg.SupportedCoins.Jettons {
 				var balance float64
-				jb, err := s.ton.GetJettonBalance(ctx, address.MustParseAddr(jettonAddr), s.wallet.WalletAddress())
+				jb, err := s.ton.GetJettonBalance(ctx, address.MustParseAddr(jettonAddr), s.wallet.WalletAddress(), time.Time{})
 				if err != nil {
 					log.Trace().Err(err).Msg("failed to get jetton balance")
 					continue
@@ -84,16 +84,10 @@ func (s *Service) walletMonitor() {
 }
 
 func (s *Service) channelsMonitor() {
-	type virtualData struct {
-		decimals int
-		num      int
-		capacity *big.Int
-		fees     *big.Int
-	}
-
 	type split struct {
 		balance map[string]float64
-		virtual map[bool]*virtualData
+		condNum int
+		actNum  int
 	}
 	stats := map[string]map[string]map[bool]*split{}
 
@@ -112,90 +106,75 @@ func (s *Service) channelsMonitor() {
 
 	next:
 		for _, channel := range list {
-			coinConfig, err := s.ResolveCoinConfig(channel.JettonAddress, channel.ExtraCurrencyID, false)
-			if err != nil {
-				log.Error().Err(err).Msg("failed to resolve coin config")
-				continue next
-			}
-
-			channelName := "other"
-			s.urgentPeersMx.RLock()
-			key := base64.StdEncoding.EncodeToString(channel.TheirOnchain.Key)
-			if s.urgentPeers[key] > 0 {
-				channelName = key[:16]
-			}
-			s.urgentPeersMx.RUnlock()
-
-			channelStats, exists := stats[channelName]
-			if !exists {
-				channelStats = map[string]map[bool]*split{}
-				stats[channelName] = channelStats
-			}
-
-			coinStats, exists := channelStats[coinConfig.Symbol]
-			if !exists {
-				coinStats = map[bool]*split{}
-				channelStats[coinConfig.Symbol] = coinStats
-			}
-
 			for _, isOurSide := range []bool{true, false} {
-				sideStats, exists := coinStats[isOurSide]
-				if !exists {
-					sideStats = &split{
-						balance: map[string]float64{},
-						virtual: map[bool]*virtualData{},
-					}
-					coinStats[isOurSide] = sideStats
+				balances, err := channel.CalcBalance(context.Background(), !isOurSide, s)
+				if err != nil {
+					log.Error().Err(err).Msg("failed to calc balance")
+					continue next
 				}
 
-				onchainState, virtuals := channel.TheirOnchain, channel.Their.Conditionals
-				if isOurSide {
-					onchainState, virtuals = channel.OurOnchain, channel.Our.Conditionals
+				sideCond, sideAct := channel.Our.Data.Conditionals, channel.Our.Data.ActionStates
+				if !isOurSide {
+					sideCond, sideAct = channel.Their.Data.Conditionals, channel.Their.Data.ActionStates
 				}
 
-				for _, kv := range virtuals.All() {
-					vch, err := payments.ParseVirtualChannelCond(kv.Value.BeginParse())
-					if err != nil {
-						log.Error().Err(err).Msg("failed to parse virtual channel")
-						continue next
+				conds, _ := sideCond.LoadAll()
+				acts, _ := sideAct.LoadAll()
+
+				for _, coinConfig := range s.knownBalanceTypes {
+					channelName := "other"
+					s.urgentPeersMx.RLock()
+					key := base64.StdEncoding.EncodeToString(channel.Their.OnchainInfo.Key)
+					if s.urgentPeers[key] > 0 {
+						channelName = key[:16]
+					}
+					s.urgentPeersMx.RUnlock()
+
+					channelStats, exists := stats[channelName]
+					if !exists {
+						channelStats = map[string]map[bool]*split{}
+						stats[channelName] = channelStats
 					}
 
-					outdated := time.Now().After(time.Unix(vch.Deadline, 0))
-					v := sideStats.virtual[outdated]
-					if v == nil {
-						v = &virtualData{
-							decimals: int(coinConfig.Decimals),
-							num:      0,
-							capacity: big.NewInt(0),
-							fees:     big.NewInt(0),
+					coinStats, exists := channelStats[coinConfig.Symbol]
+					if !exists {
+						coinStats = map[bool]*split{}
+						channelStats[coinConfig.Symbol] = coinStats
+					}
+
+					sideStats, exists := coinStats[isOurSide]
+					if !exists {
+						sideStats = &split{
+							balance: map[string]float64{},
 						}
+						coinStats[isOurSide] = sideStats
 					}
-					v.num++
-					v.capacity.Add(v.capacity, vch.Capacity)
-					v.fees.Add(v.fees, vch.Fee)
+					sideStats.actNum = len(acts)
+					sideStats.condNum = len(conds)
 
-					sideStats.virtual[outdated] = v
-				}
+					b := balances[coinConfig.BalanceID]
+					if b == nil {
+						b = payments.NewBalanceInfo(coinConfig)
+					}
 
-				for _, category := range []string{"deposited", "balance", "sent", "withdrawn"} {
-					var value *big.Int
-					switch category {
-					case "deposited":
-						value = onchainState.Deposited
-					case "sent":
-						value = onchainState.Sent
-					case "withdrawn":
-						value = onchainState.Withdrawn
-					case "balance":
-						value, _, err = channel.CalcBalance(isOurSide)
-						if err != nil {
-							log.Error().Err(err).Msg("failed to calc balance")
-							continue next
+					for _, category := range []string{"onchain", "action", "on_hold", "cond_locked", "cond_pending"} {
+						var value *big.Int
+						switch category {
+						case "onchain":
+							value = b.Onchain
+						case "action":
+							value = b.Action
+						case "on_hold":
+							value = b.OnHold
+						case "cond_locked":
+							value = b.ConditionalLocked
+						case "cond_pending":
+							value = b.ConditionalPending
 						}
-					}
 
-					parsedValue, _ := strconv.ParseFloat(tlb.MustFromNano(value, int(coinConfig.Decimals)).String(), 64)
-					sideStats.balance[category] += parsedValue
+						parsedValue, _ := strconv.ParseFloat(tlb.MustFromNano(value, int(coinConfig.Decimals)).String(), 64)
+						sideStats.balance[category] += parsedValue
+					}
 				}
 			}
 		}
@@ -203,21 +182,11 @@ func (s *Service) channelsMonitor() {
 		for channelName, channelStats := range stats {
 			for coinSymbol, coinStats := range channelStats {
 				for isOurSide, sideStats := range coinStats {
-					for wantRemove, v := range sideStats.virtual {
-						capacity, _ := strconv.ParseFloat(tlb.MustFromNano(v.capacity, v.decimals).String(), 64)
-						fee, _ := strconv.ParseFloat(tlb.MustFromNano(v.fees, v.decimals).String(), 64)
+					metrics.ActiveConditionals.WithLabelValues(channelName, coinSymbol, strconv.FormatBool(isOurSide)).Set(float64(sideStats.condNum))
+					metrics.ActiveActions.WithLabelValues(channelName, coinSymbol, strconv.FormatBool(isOurSide)).Set(float64(sideStats.actNum))
 
-						metrics.ActiveVirtualChannels.WithLabelValues(channelName, coinSymbol, strconv.FormatBool(isOurSide), strconv.FormatBool(wantRemove)).Set(float64(v.num))
-						metrics.ActiveVirtualChannelsCapacity.WithLabelValues(channelName, coinSymbol, strconv.FormatBool(isOurSide), strconv.FormatBool(wantRemove)).Set(capacity)
-						metrics.ActiveVirtualChannelsFee.WithLabelValues(channelName, coinSymbol, strconv.FormatBool(isOurSide), strconv.FormatBool(wantRemove)).Set(fee)
-
-						sideStats.virtual[wantRemove] = &virtualData{
-							decimals: v.decimals,
-							num:      0,
-							capacity: big.NewInt(0),
-							fees:     big.NewInt(0),
-						} // reset to calc in next iteration
-					}
+					sideStats.condNum = 0
+					sideStats.actNum = 0
 
 					for category, balance := range sideStats.balance {
 						metrics.ChannelBalance.WithLabelValues(channelName, coinSymbol, strconv.FormatBool(isOurSide), category).Set(balance)

@@ -5,12 +5,15 @@ package client
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/ton/jetton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 	"math/big"
+	"time"
 )
 
 type TON struct {
@@ -23,10 +26,19 @@ func NewTON(api ton.APIClientWrapped) *TON {
 	}
 }
 
-func (t *TON) GetAccount(ctx context.Context, addr *address.Address) (*Account, error) {
+func (t *TON) GetAccount(ctx context.Context, addr *address.Address, blockAfter time.Time) (*Account, error) {
 	block, err := t.api.GetMasterchainInfo(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get current masterchain info: %w", err)
+	}
+
+	hdr, err := t.api.GetBlockHeader(ctx, block)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block header: %w", err)
+	}
+
+	if int64(hdr.GenUtime) < blockAfter.Unix() {
+		return nil, fmt.Errorf("current block is before required timestamp")
 	}
 
 	acc, err := t.api.GetAccount(ctx, block, addr)
@@ -64,21 +76,35 @@ func (t *TON) GetJettonWalletAddress(ctx context.Context, root, addr *address.Ad
 	return jw.Address(), nil
 }
 
-func (t *TON) GetJettonBalance(ctx context.Context, root, addr *address.Address) (*big.Int, error) {
+func (t *TON) GetJettonBalance(ctx context.Context, root, addr *address.Address, blockAfter time.Time) (*big.Int, error) {
 	jw, err := jetton.NewJettonMasterClient(t.api, root).GetJettonWallet(ctx, addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get jetton wallet: %w", err)
 	}
 
-	balance, err := jw.GetBalance(ctx)
+	block, err := t.api.GetMasterchainInfo(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current masterchain info: %w", err)
+	}
+
+	hdr, err := t.api.GetBlockHeader(ctx, block)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block header: %w", err)
+	}
+
+	if int64(hdr.GenUtime) < blockAfter.Unix() {
+		return nil, fmt.Errorf("current block is before required timestamp")
+	}
+
+	balance, err := jw.GetBalanceAtBlock(ctx, block)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get jetton balance: %w", err)
 	}
 	return balance, nil
 }
 
-func (t *TON) GetLastTransaction(ctx context.Context, addr *address.Address) (*Transaction, *Account, error) {
-	acc, err := t.GetAccount(ctx, addr)
+func (t *TON) GetLastTransaction(ctx context.Context, addr *address.Address, blockAfter time.Time) (*Transaction, *Account, error) {
+	acc, err := t.GetAccount(ctx, addr, blockAfter)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get account: %w", err)
 	}
@@ -101,6 +127,72 @@ func (t *TON) GetLastTransaction(ctx context.Context, addr *address.Address) (*T
 		return nil, nil, fmt.Errorf("failed to get transactions: last tx mismatch")
 	}
 
+	res, err := ConvertTx(tx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to convert tx: %w", err)
+	}
+
+	return res, acc, nil
+}
+
+func (t *TON) GetTransactionByInMsgHash(ctx context.Context, addr *address.Address, msgHash []byte, after time.Time) (*Transaction, error) {
+	tx, err := t.api.FindLastTransactionByInMsgHashAfterTime(ctx, addr, msgHash, after)
+	if err != nil {
+		if errors.Is(err, ton.ErrTxWasNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to find last transaction: %w", err)
+	}
+
+	res, err := ConvertTx(tx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert tx: %w", err)
+	}
+
+	return res, nil
+}
+
+func (t *TON) GetTransactionsList(ctx context.Context, addr *address.Address, lt uint64, hash []byte) ([]*Transaction, error) {
+	txList, err := t.api.ListTransactions(ctx, addr, 5, lt, hash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get transactions: %w", err)
+	}
+
+	if len(txList) == 0 {
+		return nil, nil
+	}
+
+	var list []*Transaction
+	for _, tx := range txList {
+		res, err := ConvertTx(tx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert tx: %w", err)
+		}
+
+		list = append(list, res)
+	}
+
+	return list, nil
+}
+
+func (t *TON) SendWaitExternalMessage(ctx context.Context, to *address.Address, body *cell.Cell) ([]byte, error) {
+	ext := &tlb.ExternalMessage{
+		DstAddr: to,
+		Body:    body,
+	}
+
+	_, _, _, err := t.api.SendExternalMessageWaitTransaction(ctx, &tlb.ExternalMessage{
+		DstAddr: to,
+		Body:    body,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to send wait external message: %w", err)
+	}
+
+	return ext.NormalizedHash(), err
+}
+
+func ConvertTx(tx *tlb.Transaction) (*Transaction, error) {
 	res := &Transaction{
 		Hash:       tx.Hash,
 		PrevTxHash: tx.PrevTxHash,
@@ -112,46 +204,74 @@ func (t *TON) GetLastTransaction(ctx context.Context, addr *address.Address) (*T
 	if desc, ok := tx.Description.(tlb.TransactionDescriptionOrdinary); ok {
 		if comp, ok := desc.ComputePhase.Phase.(tlb.ComputePhaseVM); ok && comp.Success {
 			res.Success = true
-			if tx.IO.In.MsgType == tlb.MsgTypeInternal {
-				res.InternalInBody = tx.IO.In.AsInternal().Body
-			}
 		}
 	}
 
-	return res, acc, nil
-}
+	toMsgInfo := func(msg *tlb.Message) (MsgInfo, error) {
+		switch msg.MsgType {
+		case tlb.MsgTypeExternalIn:
+			m := msg.AsExternalIn()
+			return MsgInfo{
+				Type:    tlb.MsgTypeExternalIn,
+				From:    m.SrcAddr.String(),
+				To:      m.DstAddr.String(),
+				MsgHash: m.NormalizedHash(),
+				Body:    m.Body,
+			}, nil
+		case tlb.MsgTypeInternal:
+			m := msg.AsInternal()
+			c, err := tlb.ToCell(m)
+			if err != nil {
+				return MsgInfo{}, fmt.Errorf("failed to convert cell: %w", err)
+			}
 
-func (t *TON) GetTransactionsList(ctx context.Context, addr *address.Address, lt uint64, hash []byte) ([]Transaction, error) {
-	txList, err := t.api.ListTransactions(ctx, addr, 5, lt, hash)
+			return MsgInfo{
+				Type:    tlb.MsgTypeInternal,
+				From:    m.SrcAddr.String(),
+				To:      m.DstAddr.String(),
+				MsgHash: c.Hash(),
+				Body:    m.Body,
+			}, nil
+		case tlb.MsgTypeExternalOut:
+			m := msg.AsExternalOut()
+			c, err := tlb.ToCell(m)
+			if err != nil {
+				return MsgInfo{}, fmt.Errorf("failed to convert cell: %w", err)
+			}
+
+			return MsgInfo{
+				Type:    tlb.MsgTypeExternalOut,
+				From:    m.SrcAddr.String(),
+				To:      m.DstAddr.String(),
+				MsgHash: c.Hash(),
+				Body:    m.Body,
+			}, nil
+		default:
+			return MsgInfo{}, fmt.Errorf("unknown msg type: %s", msg.MsgType)
+		}
+	}
+
+	var err error
+	res.In, err = toMsgInfo(tx.IO.In)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get transactions: %w", err)
+		return nil, fmt.Errorf("failed to convert in: %w", err)
 	}
 
-	if len(txList) == 0 {
-		return nil, nil
-	}
-
-	var list []Transaction
-	for _, tx := range txList {
-		res := Transaction{
-			PrevTxHash: tx.PrevTxHash,
-			Hash:       tx.Hash,
-			PrevTxLT:   tx.PrevTxLT,
-			LT:         tx.LT,
-			At:         int64(tx.Now),
+	if tx.IO.Out != nil {
+		outList, err := tx.IO.Out.ToSlice()
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert out to slice: %w", err)
 		}
 
-		if desc, ok := tx.Description.(tlb.TransactionDescriptionOrdinary); ok {
-			if comp, ok := desc.ComputePhase.Phase.(tlb.ComputePhaseVM); ok && comp.Success {
-				res.Success = true
-				if tx.IO.In.MsgType == tlb.MsgTypeInternal {
-					res.InternalInBody = tx.IO.In.AsInternal().Body
-				}
+		for _, msg := range outList {
+			out, err := toMsgInfo(&msg)
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert in: %w", err)
 			}
-		}
 
-		list = append(list, res)
+			res.Out = append(res.Out, out)
+		}
 	}
 
-	return list, nil
+	return res, nil
 }

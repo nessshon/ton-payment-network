@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/ton-payment-network/tonpayments/api"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain"
@@ -39,7 +40,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"strconv"
 	"strings"
 	"time"
 
@@ -289,18 +289,14 @@ func main() {
 	}
 
 	inv := make(chan any)
-	sc := chain.NewScanner(apiClient, seqno, scanLog)
+	sc := chain.NewScanner(apiClient, seqno, scanLog, inv)
 
 	if *UseBlockScanner {
-		if err = sc.Start(context.Background(), inv); err != nil {
+		if err = sc.Start(context.Background()); err != nil {
 			log.Fatal().Err(err).Msg("failed to start block scanner")
 			return
 		}
 	} else {
-		if err = sc.StartSmall(inv); err != nil {
-			log.Fatal().Err(err).Msg("failed to start account scanner")
-			return
-		}
 		fdb.SetOnChannelUpdated(sc.OnChannelUpdate)
 
 		chList, err := fdb.GetChannels(context.Background(), nil, db.ChannelStateAny)
@@ -337,6 +333,23 @@ func main() {
 	if webTr != nil {
 		webTr.SetService(svc)
 	}
+
+	// example
+	svc.SetOnSwap(func(ctx context.Context, ch *db.Channel, fromCC, toCC *payments.CoinConfig, from, to tlb.Coins) error {
+		if fromCC.Symbol == "TON" && toCC.Symbol == "USDX" {
+			toF, _ := new(big.Float).SetString(to.String())
+			fromF, _ := new(big.Float).SetString(from.String())
+
+			coff := new(big.Float).Quo(toF, fromF)
+			log.Info().Msgf("swap from %s to %s: coff %s", fromCC.Symbol, toCC.Symbol, coff.String())
+
+			if coff.Cmp(big.NewFloat(2)) < 0 {
+				return fmt.Errorf("coff should be greater or eq 2, but it is %s", coff.String())
+			}
+			return nil
+		}
+		return fmt.Errorf("unsupported currencies for swap")
+	})
 
 	log.Info().Str("pubkey", base64.StdEncoding.EncodeToString(ed25519.NewKeyFromSeed(cfg.PaymentNodePrivateKey).Public().(ed25519.PublicKey))).Msg("payment node initialized")
 
@@ -387,7 +400,21 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 
 	switch cmd {
 	case "list":
-		svc.DebugPrintVirtualChannels()
+		svc.DebugPrintChannels(context.Background(), db.ChannelStateActive)
+	case "list_all":
+		svc.DebugPrintChannels(context.Background(), db.ChannelStateAny)
+	case "show":
+		log.Info().Msg("enter channel address:")
+
+		var addrStr string
+		_, _ = fmt.Scanln(&addrStr)
+
+		addr, err := address.ParseAddr(addrStr)
+		if err != nil {
+			return fmt.Errorf("incorrect format of address: %w", err)
+		}
+
+		svc.DebugPrintChannelInfo(context.Background(), addr.Bounce(true).String())
 	case "inc":
 		log.Info().Msg("input channel address to run increment state test:")
 		var addr string
@@ -450,12 +477,11 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 			return fmt.Errorf("you are not initiator of this virtual channel")
 		}
 
-		ch, err := svc.GetChannel(context.Background(), meta.Outgoing.ChannelAddress)
-		if err != nil {
-			return fmt.Errorf("failed to get channel: %w", err)
-		}
+		log.Info().Msg("input currency:")
+		var strCur string
+		_, _ = fmt.Scanln(&strCur)
 
-		cc, err := svc.ResolveCoinConfig(ch.JettonAddress, ch.ExtraCurrencyID, false)
+		cc, err := svc.ResolveCoinConfigBySymbol(strCur)
 		if err != nil {
 			return fmt.Errorf("failed to get coin config: %w", err)
 		}
@@ -469,12 +495,17 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 			return fmt.Errorf("incorrect format of amount")
 		}
 
-		state, enc, err := payments.SignState(amt, vcKey, meta.FinalDestination)
+		state, enc, err := conditionals.SignVirtualChannelState(amt, vcKey, meta.FinalDestination)
 		if err != nil {
 			return fmt.Errorf("failed to sign state: %w", err)
 		}
 
-		if err = svc.AddVirtualChannelResolve(context.Background(), vcKey.Public().(ed25519.PublicKey), state); err != nil {
+		cl, err := state.ToCell()
+		if err != nil {
+			return fmt.Errorf("failed to convert to cell: %w", err)
+		}
+
+		if err = svc.AddConditionalResolve(context.Background(), vcKey.Public().(ed25519.PublicKey), cl); err != nil {
 			return fmt.Errorf("failed to add resolve to channel: %w", err)
 		}
 
@@ -490,17 +521,22 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 			return fmt.Errorf("incorrect format of state: %w", err)
 		}
 
-		key, state, err := payments.ParseState(btsState, svc.GetPrivateKey())
+		key, state, err := conditionals.ParseVirtualChannelState(btsState, svc.GetPrivateKey())
 		if err != nil {
 			return fmt.Errorf("incorrect state: %w", err)
 		}
 
-		err = svc.AddVirtualChannelResolve(context.Background(), key, state)
+		cl, err := state.ToCell()
+		if err != nil {
+			return fmt.Errorf("failed to convert to cell: %w", err)
+		}
+
+		err = svc.AddConditionalResolve(context.Background(), key, cl)
 		if err != nil {
 			return fmt.Errorf("failed to add resolve to channel: %w", err)
 		}
 
-		err = svc.CloseVirtualChannel(context.Background(), key)
+		err = svc.CloseConditional(context.Background(), key)
 		if err != nil {
 			return fmt.Errorf("failed to close channel: %w", err)
 		}
@@ -521,6 +557,58 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 		if err = svc.RequestRemoveVirtual(context.Background(), btsKey); err != nil {
 			return fmt.Errorf("failed to remove virtual channel: %w", err)
 		}
+	case "swap":
+		log.Info().Msg("enter channel address to swap from:")
+
+		var addrStr string
+		_, _ = fmt.Scanln(&addrStr)
+
+		addr, err := address.ParseAddr(addrStr)
+		if err != nil {
+			return fmt.Errorf("incorrect format of address: %w", err)
+		}
+
+		ch, err := svc.GetActiveChannel(context.Background(), addr.String())
+		if err != nil {
+			return fmt.Errorf("failed to get channel: %w", err)
+		}
+
+		log.Info().Msg("input currency from:")
+		var strCur string
+		_, _ = fmt.Scanln(&strCur)
+
+		ccFrom, err := svc.ResolveCoinConfigBySymbol(strCur)
+		if err != nil {
+			return fmt.Errorf("failed to get coin config: %w", err)
+		}
+
+		log.Info().Msg("input amount:")
+		var strAmt string
+		_, _ = fmt.Scanln(&strAmt)
+
+		amtFrom, err := tlb.FromDecimal(strAmt, int(ccFrom.Decimals))
+		if err != nil {
+			return fmt.Errorf("incorrect format of amount")
+		}
+
+		log.Info().Msg("input currency to:")
+		_, _ = fmt.Scanln(&strCur)
+
+		ccTo, err := svc.ResolveCoinConfigBySymbol(strCur)
+		if err != nil {
+			return fmt.Errorf("failed to get coin config: %w", err)
+		}
+		log.Info().Msg("input amount:")
+		_, _ = fmt.Scanln(&strAmt)
+
+		amtTo, err := tlb.FromDecimal(strAmt, int(ccTo.Decimals))
+		if err != nil {
+			return fmt.Errorf("incorrect format of amount")
+		}
+
+		if err = svc.InitiateSwap(context.Background(), ch, ccFrom, ccTo, amtFrom, amtTo); err != nil {
+			return fmt.Errorf("failed to initiate swap: %w", err)
+		}
 	case "topup":
 		log.Info().Msg("enter channel address to topup:")
 
@@ -537,7 +625,11 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 			return fmt.Errorf("failed to get channel: %w", err)
 		}
 
-		cc, err := svc.ResolveCoinConfig(ch.JettonAddress, ch.ExtraCurrencyID, true)
+		log.Info().Msg("input currency:")
+		var strCur string
+		_, _ = fmt.Scanln(&strCur)
+
+		cc, err := svc.ResolveCoinConfigBySymbol(strCur)
 		if err != nil {
 			return fmt.Errorf("failed to get coin config: %w", err)
 		}
@@ -551,7 +643,7 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 			return fmt.Errorf("incorrect format of amount")
 		}
 
-		if err = svc.TopupChannel(context.Background(), ch, amt); err != nil {
+		if err = svc.TopupChannel(context.Background(), ch, cc.BalanceID, amt, false); err != nil {
 			return fmt.Errorf("failed to topup channel: %w", err)
 		}
 	case "withdraw":
@@ -565,12 +657,26 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 			return fmt.Errorf("incorrect format of address: %w", err)
 		}
 
-		ch, err := svc.GetChannel(context.Background(), addrStr)
+		ch, err := svc.GetChannel(context.Background(), addr.String())
 		if err != nil {
 			return fmt.Errorf("failed to get channel: %w", err)
 		}
 
-		cc, err := svc.ResolveCoinConfig(ch.JettonAddress, ch.ExtraCurrencyID, true)
+		log.Info().Msg("enter destination address:")
+
+		var toStr string
+		_, _ = fmt.Scanln(&toStr)
+
+		to, err := address.ParseAddr(toStr)
+		if err != nil {
+			return fmt.Errorf("incorrect format of address: %w", err)
+		}
+
+		log.Info().Msg("input currency:")
+		var strCur string
+		_, _ = fmt.Scanln(&strCur)
+
+		cc, err := svc.ResolveCoinConfigBySymbol(strCur)
 		if err != nil {
 			return fmt.Errorf("failed to get coin config: %w", err)
 		}
@@ -584,7 +690,7 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 			return fmt.Errorf("incorrect format of amount")
 		}
 
-		if err = svc.RequestWithdraw(context.Background(), addr, amt, false); err != nil {
+		if err = svc.RequestWithdrawToAddr(context.Background(), ch.Our.Address, to, cc, amt.Nano()); err != nil {
 			return fmt.Errorf("failed to withdraw from channel: %w", err)
 		}
 	case "init":
@@ -601,24 +707,8 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 			return fmt.Errorf("incorrect len of key: %d, should be 32", len(btsKey))
 		}
 
-		log.Info().Msg("input jetton master address or extra currency id, or skip for ton:")
-		var jetton string
-		_, _ = fmt.Scanln(&jetton)
-
-		var ecID uint64
-		var jettonMaster *address.Address
-		if jetton != "" {
-			ecID, err = strconv.ParseUint(jetton, 10, 32)
-			if err != nil {
-				jettonMaster, err = address.ParseAddr(jetton)
-				if err != nil {
-					return fmt.Errorf("incorrect format: %w", err)
-				}
-			}
-		}
-
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		_, err = svc.OpenChannelWithNode(ctx, btsKey, jettonMaster, uint32(ecID))
+		_, err = svc.OpenChannelWithNode(ctx, btsKey)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("failed to deploy channel with node: %w", err)
@@ -692,30 +782,16 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 			parsedKeys = append(parsedKeys, btsKey)
 		}
 
-		log.Info().Msg("input jetton master address or extra currency id, or skip for ton:")
-		var jetton string
-		_, _ = fmt.Scanln(&jetton)
+		log.Info().Msg("input currency symbol:")
+		var sym string
+		_, _ = fmt.Scanln(&sym)
 
-		var ecID uint64
-		var jettonMaster *address.Address
-		var jettonMasterStr string
-		if jetton != "" {
-			ecID, err = strconv.ParseUint(jetton, 10, 32)
-			if err != nil {
-				jettonMaster, err = address.ParseAddr(jetton)
-				if err != nil {
-					return fmt.Errorf("incorrect format: %w", err)
-				}
-				jettonMasterStr = jettonMaster.Bounce(true).String()
-			}
-		}
-
-		log.Info().Msg("input amount, excluding tunnelling fee:")
-
-		cc, err := svc.ResolveCoinConfig(jettonMasterStr, uint32(ecID), false)
+		cc, err := svc.ResolveCoinConfigBySymbol(sym)
 		if err != nil {
 			return fmt.Errorf("failed to get coin config: %w", err)
 		}
+
+		log.Info().Msg("input amount, excluding tunnelling fee:")
 
 		var strAmt string
 		_, _ = fmt.Scanln(&strAmt)
@@ -738,7 +814,10 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 			return fmt.Errorf("incorrect format of fee amount")
 		}
 
-		safeHopTTL := time.Duration(cfg.ChannelConfig.QuarantineDurationSec+cfg.ChannelConfig.BufferTimeToCommit+cfg.ChannelConfig.ConditionalCloseDurationSec+
+		safeHopTTL := time.Duration(cfg.ChannelConfig.QuarantineDurationSec+
+			cfg.ChannelConfig.BufferTimeToCommit+
+			cfg.ChannelConfig.ConditionalCloseDurationSec+
+			cfg.ChannelConfig.ActionsDuration+
 			cfg.ChannelConfig.MinSafeVirtualChannelTimeoutSec) * time.Second
 
 		fullAmt := new(big.Int).Set(amt.Nano())
@@ -759,13 +838,13 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 		}
 
 		_, vPriv, _ := ed25519.GenerateKey(nil)
-		vc, firstInstructionKey, tun, err := transport.GenerateTunnel(vPriv, tunChain, 5, cmd == "send", svc.GetPrivateKey())
+		firstInstructionKey, tun, err := transport.GenerateTunnel(vPriv, tunChain, 5, cmd == "send", svc.GetPrivateKey(), cc)
 		if err != nil {
 			return fmt.Errorf("failed to generate tunnel: %w", err)
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		err = svc.OpenVirtualChannel(ctx, tunChain[0].Target, firstInstructionKey, tunChain[len(tunChain)-1].Target, vPriv, tun, vc, jettonMaster, uint32(ecID))
+		err = svc.CreateSendConditional(ctx, firstInstructionKey, vPriv, tunChain[0], tunChain[len(tunChain)-1], tun, cc)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("failed to open virtual channel with node: %w", err)

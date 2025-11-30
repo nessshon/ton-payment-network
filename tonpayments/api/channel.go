@@ -6,49 +6,39 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/xssnick/ton-payment-network/tonpayments/config"
+	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/tonutils-go/address"
-	"github.com/xssnick/tonutils-go/tlb"
 	"math/big"
 	"net/http"
 	"time"
 )
 
-type Onchain struct {
-	CommittedSeqno uint64 `json:"committed_seqno"`
-	WalletAddress  string `json:"wallet_address"`
-	Deposited      string `json:"deposited"`
-	Withdrawn      string `json:"withdrawn"`
-}
-
 type Side struct {
-	Key              string  `json:"key"`
-	AvailableBalance string  `json:"available_balance"`
-	Onchain          Onchain `json:"onchain"`
+	Key                  string            `json:"key"`
+	Balances             map[string]string `json:"balances"`
+	LatestProcessedLT    uint64            `json:"processed_lt"`
+	LatestCommittedSeqno uint64            `json:"committed_seqno"`
+	LatestWalletSeqno    uint32            `json:"wallet_seqno"`
 }
 
 type OnchainChannel struct {
 	ID               string `json:"id"`
 	Address          string `json:"address"`
-	JettonAddress    string `json:"jetton_address"`
-	ExtraCurrencyID  uint32 `json:"ec_id"`
+	TheirAddress     string `json:"their_address"`
 	AcceptingActions bool   `json:"accepting_actions"`
 	Status           string `json:"status"`
 	WeLeft           bool   `json:"we_left"`
 	Our              Side   `json:"our"`
 	Their            Side   `json:"their"`
 
-	InitAt          time.Time `json:"init_at"`
-	CreatedAt       time.Time `json:"created_at"`
-	LastProcessedLT uint64    `json:"processed_lt"`
+	InitAt    time.Time `json:"init_at"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 func (s *Server) handleChannelOpen(w http.ResponseWriter, r *http.Request) {
 	type request struct {
-		WithNode        string `json:"with_node"`
-		JettonMaster    string `json:"jetton_master"`
-		ExtraCurrencyID uint32 `json:"ec_id"`
+		WithNode string `json:"with_node"`
 	}
 	type response struct {
 		Address string `json:"address"`
@@ -71,21 +61,7 @@ func (s *Server) handleChannelOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var jetton *address.Address
-	if req.JettonMaster != "" {
-		jetton, err = address.ParseAddr(req.JettonMaster)
-		if err != nil {
-			writeErr(w, 400, "incorrect jetton address format: "+err.Error())
-			return
-		}
-
-		if req.ExtraCurrencyID != 0 {
-			writeErr(w, 400, "jetton master address and extra currency id are mutually exclusive")
-			return
-		}
-	}
-
-	addr, err := s.svc.OpenChannelWithNode(r.Context(), key, jetton, req.ExtraCurrencyID)
+	addr, err := s.svc.OpenChannelWithNode(r.Context(), key)
 	if err != nil {
 		writeErr(w, 500, "failed to open channel: "+err.Error())
 		return
@@ -98,8 +74,9 @@ func (s *Server) handleChannelOpen(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTopup(w http.ResponseWriter, r *http.Request) {
 	type request struct {
-		Address string `json:"address"`
-		Amount  string `json:"amount_nano"`
+		Address  string `json:"address"`
+		Amount   string `json:"amount_nano"`
+		Currency string `json:"currency"`
 	}
 
 	if r.Method != "POST" {
@@ -131,13 +108,13 @@ func (s *Server) handleTopup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cc, err := s.svc.ResolveCoinConfig(ch.JettonAddress, ch.ExtraCurrencyID, true)
+	cc, err := s.svc.ResolveCoinConfigBySymbol(req.Currency)
 	if err != nil {
 		writeErr(w, 500, "failed to resolve coin config: "+err.Error())
 		return
 	}
 
-	if err = s.svc.TopupChannel(r.Context(), ch, cc.MustAmount(amt)); err != nil {
+	if err = s.svc.TopupChannel(r.Context(), ch, cc.BalanceID, cc.MustAmount(amt), false); err != nil {
 		writeErr(w, 500, "failed to topup channel: "+err.Error())
 		return
 	}
@@ -147,9 +124,10 @@ func (s *Server) handleTopup(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleWithdraw(w http.ResponseWriter, r *http.Request) {
 	type request struct {
-		Address            string `json:"address"`
-		Amount             string `json:"amount_nano"`
-		ExecuteOnOtherSide bool   `json:"execute_on_other_side"`
+		Address  string `json:"address"`
+		To       string `json:"to"`
+		Amount   string `json:"amount_nano"`
+		Currency string `json:"currency"`
 	}
 
 	if r.Method != "POST" {
@@ -175,24 +153,19 @@ func (s *Server) handleWithdraw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ch, err := s.svc.GetChannel(r.Context(), addr.String())
+	to, err := address.ParseAddr(req.To)
 	if err != nil {
-		writeErr(w, 500, "failed to get channel: "+err.Error())
+		writeErr(w, 400, "incorrect to address format: "+err.Error())
 		return
 	}
 
-	cc, err := s.svc.ResolveCoinConfig(ch.JettonAddress, ch.ExtraCurrencyID, false)
+	cc, err := s.svc.ResolveCoinConfigBySymbol(req.Currency)
 	if err != nil {
 		writeErr(w, 500, "failed to resolve coin config: "+err.Error())
 		return
 	}
 
-	amtCoin, err := tlb.FromNano(amt, int(cc.Decimals))
-	if err != nil {
-		writeErr(w, 400, "failed to convert amount: "+err.Error())
-	}
-
-	if err = s.svc.RequestWithdraw(r.Context(), addr, amtCoin, !req.ExecuteOnOtherSide); err != nil {
+	if err = s.svc.RequestWithdrawToAddr(r.Context(), addr.Bounce(true).String(), to, cc, amt); err != nil {
 		writeErr(w, 500, "failed to request withdraw channel: "+err.Error())
 		return
 	}
@@ -279,13 +252,7 @@ func (s *Server) handleChannelsList(w http.ResponseWriter, r *http.Request) {
 
 	res := make([]OnchainChannel, 0, len(list))
 	for i, channel := range list {
-		cc, err := s.svc.ResolveCoinConfig(channel.JettonAddress, channel.ExtraCurrencyID, false)
-		if err != nil {
-			writeErr(w, 500, "failed to resolve coin config: "+err.Error())
-			return
-		}
-
-		v, err := convertChannel(channel, cc)
+		v, err := s.convertChannel(r.Context(), channel)
 		if err != nil {
 			writeErr(w, 500, "failed to convert channel "+fmt.Sprint(i)+": "+err.Error())
 			return
@@ -321,13 +288,7 @@ func (s *Server) handleChannelGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cc, err := s.svc.ResolveCoinConfig(ch.JettonAddress, ch.ExtraCurrencyID, false)
-	if err != nil {
-		writeErr(w, 500, "failed to resolve coin config: "+err.Error())
-		return
-	}
-
-	res, err := convertChannel(ch, cc)
+	res, err := s.convertChannel(r.Context(), ch)
 	if err != nil {
 		writeErr(w, 500, "failed to convert channel: "+err.Error())
 		return
@@ -336,7 +297,7 @@ func (s *Server) handleChannelGet(w http.ResponseWriter, r *http.Request) {
 	writeResp(w, res)
 }
 
-func convertChannel(c *db.Channel, cc *config.CoinConfig) (OnchainChannel, error) {
+func (s *Server) convertChannel(ctx context.Context, c *db.Channel) (OnchainChannel, error) {
 	var status string
 	switch c.Status {
 	case db.ChannelStateActive:
@@ -347,60 +308,57 @@ func convertChannel(c *db.Channel, cc *config.CoinConfig) (OnchainChannel, error
 		status = "inactive"
 	}
 
-	theirBalance, _, err := c.CalcBalance(true)
+	convBalances := func(bls map[string]*payments.BalanceInfo) map[string]string {
+		m := map[string]string{}
+		for _, info := range bls {
+			m[info.CoinConfig.Symbol] = info.CoinConfig.MustAmount(info.Available()).String()
+		}
+		return m
+	}
+
+	theirBalance, err := c.CalcBalance(ctx, true, s.svc)
 	if err != nil {
 		return OnchainChannel{}, fmt.Errorf("failed to calc balance: %w", err)
 	}
-	ourBalance, _, err := c.CalcBalance(true)
+	ourBalance, err := c.CalcBalance(ctx, false, s.svc)
 	if err != nil {
 		return OnchainChannel{}, fmt.Errorf("failed to calc balance: %w", err)
 	}
 
 	return OnchainChannel{
 		ID:               base64.StdEncoding.EncodeToString(c.ID),
-		Address:          c.Address,
-		JettonAddress:    c.JettonAddress,
-		ExtraCurrencyID:  c.ExtraCurrencyID,
+		Address:          c.Our.Address,
+		TheirAddress:     c.Their.Address,
 		AcceptingActions: c.AcceptingActions,
 		Status:           status,
 		WeLeft:           c.WeLeft,
 		Our: Side{
-			Key:              base64.StdEncoding.EncodeToString(c.OurOnchain.Key),
-			AvailableBalance: tlb.MustFromNano(ourBalance, int(cc.Decimals)).String(),
-			Onchain: Onchain{
-				CommittedSeqno: c.OurOnchain.CommittedSeqno,
-				WalletAddress:  c.OurOnchain.WalletAddress,
-				Deposited:      tlb.MustFromNano(c.OurOnchain.Deposited, int(cc.Decimals)).String(),
-			},
+			Key:                  base64.StdEncoding.EncodeToString(c.Our.OnchainInfo.Key),
+			Balances:             convBalances(ourBalance),
+			LatestProcessedLT:    c.Our.LatestProcessedLT,
+			LatestCommittedSeqno: c.Our.LatestCommitedSeqno,
+			LatestWalletSeqno:    c.Our.LatestWalletSeqno,
 		},
 		Their: Side{
-			Key:              base64.StdEncoding.EncodeToString(c.TheirOnchain.Key),
-			AvailableBalance: tlb.MustFromNano(theirBalance, int(cc.Decimals)).String(),
-			Onchain: Onchain{
-				CommittedSeqno: c.TheirOnchain.CommittedSeqno,
-				WalletAddress:  c.TheirOnchain.WalletAddress,
-				Deposited:      tlb.MustFromNano(c.TheirOnchain.Deposited, int(cc.Decimals)).String(),
-			},
+			Key:                  base64.StdEncoding.EncodeToString(c.Their.OnchainInfo.Key),
+			Balances:             convBalances(theirBalance),
+			LatestProcessedLT:    c.Their.LatestProcessedLT,
+			LatestCommittedSeqno: c.Their.LatestCommitedSeqno,
+			LatestWalletSeqno:    c.Their.LatestWalletSeqno,
 		},
-		InitAt:          c.InitAt,
-		LastProcessedLT: c.LastProcessedLT,
-		CreatedAt:       c.CreatedAt,
+		InitAt:    c.InitAt,
+		CreatedAt: c.CreatedAt,
 	}, nil
 }
 
 func (s *Server) PushChannelEvent(ctx context.Context, ch *db.Channel) error {
-	cc, err := s.svc.ResolveCoinConfig(ch.JettonAddress, ch.ExtraCurrencyID, false)
-	if err != nil {
-		return fmt.Errorf("failed to resolve coin config: %w", err)
-	}
-
-	res, err := convertChannel(ch, cc)
+	res, err := s.convertChannel(ctx, ch)
 	if err != nil {
 		return fmt.Errorf("failed to convert channel: %w", err)
 	}
 
 	if err = s.queue.CreateTask(ctx, WebhooksTaskPool, "onchain-channel-event", "events",
-		ch.Address+"-"+fmt.Sprint(res.LastProcessedLT),
+		ch.Our.Address+"-"+fmt.Sprint(res.Our.LatestProcessedLT),
 		res, nil, nil,
 	); err != nil {
 		return fmt.Errorf("failed to create webhook task: %w", err)
