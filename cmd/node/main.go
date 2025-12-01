@@ -57,6 +57,8 @@ var APICredentialsPassword = flag.String("api-password", "", "HTTP API credentia
 var ConfigPath = flag.String("config", "payment-network-config.json", "config path")
 var ForceBlock = flag.Uint64("force-block", 0, "master block seqno to start scan from, ignored if 0, otherwise - overrides db value")
 var UseBlockScanner = flag.Bool("use-block-scanner", false, "use block scanner instead of watching specific contracts")
+var ShowWebInfo = flag.Bool("web-conn-info", false, "show web connection info")
+var DemoSwap = flag.Bool("demo-swap", false, "demo swap callback enable")
 
 var LogFilename = flag.String("log-filename", "payment-network.log", "log file name")
 var LogMaxSize = flag.Int("log-max-size", 1024, "maximum log file size in MB before rotation")
@@ -139,6 +141,14 @@ func main() {
 		}
 
 		log.Warn().Msg("config was upgraded, file changed, check the settings and strat again if it is ok for you")
+		return
+	}
+
+	if *ShowWebInfo {
+		println("Web initializer:\n", fmt.Sprintf("window.startPaymentNetwork(\"%s\", \"%s\")",
+			base64.StdEncoding.EncodeToString(ed25519.NewKeyFromSeed(cfg.ADNLServerKey).Public().(ed25519.PublicKey)),
+			base64.StdEncoding.EncodeToString(ed25519.NewKeyFromSeed(cfg.PaymentNodePrivateKey).Public().(ed25519.PublicKey)),
+		))
 		return
 	}
 
@@ -334,22 +344,24 @@ func main() {
 		webTr.SetService(svc)
 	}
 
-	// example
-	svc.SetOnSwap(func(ctx context.Context, ch *db.Channel, fromCC, toCC *payments.CoinConfig, from, to tlb.Coins) error {
-		if fromCC.Symbol == "TON" && toCC.Symbol == "USDX" {
-			toF, _ := new(big.Float).SetString(to.String())
-			fromF, _ := new(big.Float).SetString(from.String())
+	if *DemoSwap {
+		// example
+		svc.SetOnSwap(func(ctx context.Context, ch *db.Channel, fromCC, toCC *payments.CoinConfig, from, to tlb.Coins) error {
+			if fromCC.Symbol == "TON" && toCC.Symbol == "USDX" {
+				toF, _ := new(big.Float).SetString(to.String())
+				fromF, _ := new(big.Float).SetString(from.String())
 
-			coff := new(big.Float).Quo(toF, fromF)
-			log.Info().Msgf("swap from %s to %s: coff %s", fromCC.Symbol, toCC.Symbol, coff.String())
+				coff := new(big.Float).Quo(toF, fromF)
+				log.Info().Msgf("swap from %s to %s: coff %s", fromCC.Symbol, toCC.Symbol, coff.String())
 
-			if coff.Cmp(big.NewFloat(2)) < 0 {
-				return fmt.Errorf("coff should be greater or eq 2, but it is %s", coff.String())
+				if coff.Cmp(big.NewFloat(2)) < 0 {
+					return fmt.Errorf("coff should be greater or eq 2, but it is %s", coff.String())
+				}
+				return nil
 			}
-			return nil
-		}
-		return fmt.Errorf("unsupported currencies for swap")
-	})
+			return fmt.Errorf("unsupported currencies for swap")
+		})
+	}
 
 	log.Info().Str("pubkey", base64.StdEncoding.EncodeToString(ed25519.NewKeyFromSeed(cfg.PaymentNodePrivateKey).Public().(ed25519.PublicKey))).Msg("payment node initialized")
 

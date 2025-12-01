@@ -86,7 +86,7 @@ func (h *HTTP) Connect(ctx context.Context, channelKey ed25519.PublicKey) (*tran
 	connCh := make(chan struct{})
 	var connected bool
 	url := fmt.Sprintf("/web-channel/api/v1/subscribe?timestamp=%d&token=%s&key=%s", ts, token, base64.URLEncoding.EncodeToString(h.GetOurID()))
-	stop, err := h.subscribeSSE(ctx, url, func(msg []byte) {
+	stop, err := h.subscribeSSE(ctx, url, func(ctx context.Context, msg []byte) {
 		var e Event
 		if err = json.Unmarshal(msg, &e); err != nil {
 			log.Error().Err(err).Msg("event json parse err")
@@ -120,7 +120,10 @@ func (h *HTTP) Connect(ctx context.Context, channelKey ed25519.PublicKey) (*tran
 			return
 		}
 
-		_, err = peer.pushJSON(ctx, "/web-channel/api/v1/push", Event{Key: h.GetOurID(), Data: resp, QueryID: e.QueryID})
+		ev := Event{Key: h.GetOurID(), Data: resp, QueryID: e.QueryID}
+		ev.Sign(h.key)
+
+		_, err = peer.pushJSON(ctx, "/web-channel/api/v1/push", ev)
 		if err != nil {
 			log.Error().Err(err).Msg("push response err")
 			return
@@ -157,7 +160,10 @@ func (p *PeerConnection) Query(ctx context.Context, msg, res tl.Serializable) er
 		return err
 	}
 
-	resBytes, err := p.pushJSON(ctx, "/web-channel/api/v1/push", Event{Key: p.key.Public().(ed25519.PublicKey), Data: req})
+	e := Event{Key: p.key.Public().(ed25519.PublicKey), Data: req}
+	e.Sign(p.key)
+
+	resBytes, err := p.pushJSON(ctx, "/web-channel/api/v1/push", e)
 	if err != nil {
 		return err
 	}
@@ -268,7 +274,7 @@ func (p *PeerConnection) pushJSON(ctx context.Context, url string, body any) ([]
 	return []byte(str), nil
 }
 
-func (h *HTTP) subscribeSSE(ctx context.Context, url string, onMsg func(msg []byte), onDisconnect func()) (func(), error) {
+func (h *HTTP) subscribeSSE(ctx context.Context, url string, onMsg func(ctx context.Context, msg []byte), onDisconnect func()) (func(), error) {
 	eventSourceConstructor := js.Global().Get("EventSource")
 	if eventSourceConstructor.IsUndefined() {
 		return nil, fmt.Errorf("EventSource not supported")
@@ -276,9 +282,12 @@ func (h *HTTP) subscribeSSE(ctx context.Context, url string, onMsg func(msg []by
 	eventSource := eventSourceConstructor.New(url)
 
 	onMessage := js.FuncOf(func(this js.Value, args []js.Value) any {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
 		event := args[0]
 		data := event.Get("data").String()
-		onMsg([]byte(data))
+		onMsg(ctx, []byte(data))
 		return nil
 	})
 

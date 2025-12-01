@@ -29,7 +29,6 @@ type BalanceControlConfig struct {
 type CoinConfig struct {
 	Enabled               bool
 	VirtualTunnelConfig   VirtualConfig
-	MisbehaviorFine       string
 	Symbol                string
 	Decimals              uint8
 	MinCapacityRequest    string
@@ -118,9 +117,9 @@ func Generate() (*Config, error) {
 		ADNLServerKey:                  nodePriv.Seed(),
 		PaymentNodePrivateKey:          priv.Seed(),
 		WalletPrivateKey:               walletPriv.Seed(),
-		APIListenAddr:                  "0.0.0.0:8096",
+		APIListenAddr:                  "127.0.0.1:8096",
 		WebTransportListenAddr:         "",
-		MetricsListenAddr:              "0.0.0.0:8097",
+		MetricsListenAddr:              "127.0.0.1:8097",
 		MetricsNamespace:               "",
 		NodeListenAddr:                 "0.0.0.0:17555",
 		ExternalIP:                     "",
@@ -141,7 +140,6 @@ func Generate() (*Config, error) {
 						ProxyFeePercent:             0.5,
 						AllowTunneling:              true,
 					},
-					MisbehaviorFine:       "3",
 					Symbol:                "TON",
 					Decimals:              9,
 					MinCapacityRequest:    "1",
@@ -164,7 +162,6 @@ func Generate() (*Config, error) {
 							ProxyFeePercent:             0.8,
 							AllowTunneling:              false,
 						},
-						MisbehaviorFine:       "12",
 						Symbol:                "USDT",
 						Decimals:              6,
 						MinCapacityRequest:    "3",

@@ -247,7 +247,7 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 		if err = payments.LoadState(&actState, aState.MustToCell()); err != nil {
 			return nil, nil, fmt.Errorf("failed to load action state: %w", err)
 		}
-		actState.Amount = cc.MustAmount(new(big.Int).Add(actState.Amount.Nano(), amount))
+		actState.Amount.Val = new(big.Int).Add(actState.Amount.Nano(), totalFee)
 
 		updatedState, err := tlb.ToCell(actState)
 		if err != nil {

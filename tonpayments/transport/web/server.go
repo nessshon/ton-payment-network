@@ -89,11 +89,13 @@ func (h *HTTP) getAccountHandler(w http.ResponseWriter, r *http.Request) {
 	addr, err := address.ParseAddr(r.URL.Query().Get("address"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	acc, err := h.ton.GetAccount(r.Context(), addr, time.Unix(after, 0))
@@ -114,6 +116,7 @@ func (h *HTTP) sendExternalHandler(w http.ResponseWriter, r *http.Request) {
 	addr, err := address.ParseAddr(r.URL.Query().Get("address"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	type request struct {
@@ -146,11 +149,13 @@ func (h *HTTP) getLastTxHandler(w http.ResponseWriter, r *http.Request) {
 	addr, err := address.ParseAddr(r.URL.Query().Get("address"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	tx, acc, err := h.ton.GetLastTransaction(r.Context(), addr, time.Unix(after, 0))
@@ -174,11 +179,13 @@ func (h *HTTP) getTxByInMsgHashHandler(w http.ResponseWriter, r *http.Request) {
 	addr, err := address.ParseAddr(r.URL.Query().Get("address"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	hash, err := base64.URLEncoding.DecodeString(r.URL.Query().Get("hash"))
@@ -281,11 +288,13 @@ func (h *HTTP) getJettonWalletBalanceHandler(w http.ResponseWriter, r *http.Requ
 	addr, err := address.ParseAddr(r.URL.Query().Get("address"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	res, err := h.ton.GetJettonBalance(r.Context(), jet, addr, time.Unix(after, 0))
@@ -324,6 +333,11 @@ func (h *HTTP) pushHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !e.Verify(e.Key) {
+		http.Error(w, "invalid signature", http.StatusBadRequest)
+		return
+	}
+
 	var req tl.Serializable
 	if _, err := tl.Parse(&req, e.Data, true); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -359,6 +373,7 @@ func (h *HTTP) pushHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Error().Err(err).Msg("failed to serialize response")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	_ = json.NewEncoder(w).Encode(Event{Data: data})

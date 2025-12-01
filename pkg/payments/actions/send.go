@@ -10,10 +10,32 @@ import (
 	"math/big"
 )
 
+// Coins decimal-safe from missuse
+type Coins struct {
+	Val *big.Int
+}
+
+func (c *Coins) Nano() *big.Int {
+	return new(big.Int).Set(c.Val)
+}
+
+func (g *Coins) LoadFromCell(loader *cell.Slice) error {
+	coins, err := loader.LoadBigCoins()
+	if err != nil {
+		return err
+	}
+	g.Val = coins
+	return nil
+}
+
+func (g Coins) ToCell() (*cell.Cell, error) {
+	return cell.BeginCell().MustStoreBigCoins(g.Val).EndCell(), nil
+}
+
 type StateActionSend struct {
-	Amount        tlb.Coins `tlb:"."`
-	Commited      tlb.Coins `tlb:"."`
-	CommitedSeqno uint64    `tlb:"## 64"`
+	Amount        Coins  `tlb:"."`
+	Commited      Coins  `tlb:"."`
+	CommitedSeqno uint64 `tlb:"## 64"`
 }
 
 func NewSendActionFromBalanceID(ctx context.Context, cc *payments.CoinConfig, a, b string) (payments.ActionSend, error) {
@@ -79,12 +101,12 @@ func prepareExecuteSendState(state *cell.Cell, seqno uint64, coin *payments.Coin
 			return nil, nil, fmt.Errorf("not enough balance to pay fee")
 		}
 
-		curState.Amount = curState.Amount.MustAdd(coin.FeePerWithdrawPropose)
+		curState.Amount.Val.Add(curState.Amount.Val, coin.FeePerWithdrawPropose.Nano())
 	}
 
 	// if it was committed before, we should decrease the amount to avoid conflicts with uncoop close
-	if !curState.Commited.IsZero() {
-		curState.Amount = curState.Amount.MustSub(curState.Commited)
+	if curState.Commited.Val.Sign() != 0 {
+		curState.Amount.Val.Sub(curState.Amount.Val, curState.Commited.Nano())
 	}
 
 	curState.Commited = curState.Amount
@@ -108,8 +130,8 @@ func prepareExecuteSendState(state *cell.Cell, seqno uint64, coin *payments.Coin
 
 func emptySendState() *cell.Cell {
 	state, err := tlb.ToCell(StateActionSend{
-		Amount:   tlb.ZeroCoins,
-		Commited: tlb.ZeroCoins,
+		Amount:   Coins{Val: big.NewInt(0)},
+		Commited: Coins{Val: big.NewInt(0)},
 	})
 	if err != nil {
 		panic(err.Error())
@@ -142,7 +164,7 @@ func sendStatesDiff(before, after *cell.Cell, balanceId string) (map[string]*big
 	}
 
 	return map[string]*big.Int{
-		balanceId: afterState.Amount.MustSub(beforeState.Amount).Nano(),
+		balanceId: new(big.Int).Sub(afterState.Amount.Val, beforeState.Amount.Val),
 	}, nil
 }
 
@@ -152,7 +174,7 @@ func sendAddCoins(cc *payments.CoinConfig, actionState *cell.Cell, amount *big.I
 		return nil, fmt.Errorf("failed to load old state: %w", err)
 	}
 
-	actState.Amount = cc.MustAmount(new(big.Int).Add(actState.Amount.Nano(), amount))
+	actState.Amount.Val = new(big.Int).Add(actState.Amount.Nano(), amount)
 
 	newActionState, err := tlb.ToCell(actState)
 	if err != nil {

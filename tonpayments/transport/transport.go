@@ -472,7 +472,7 @@ func (t *Transport) OpenOffchainChannel(ctx context.Context, theirChannelKey, co
 }
 
 func (t *Transport) doQuery(ctx context.Context, theirKey []byte, req, resp tl.Serializable, connect bool) error {
-	maxWait := 7 * time.Second
+	maxWait := 10 * time.Second
 	if connect {
 		maxWait = 30 * time.Second
 	}

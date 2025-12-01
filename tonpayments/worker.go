@@ -98,6 +98,11 @@ func (s *Service) taskExecutor() {
 						return nil
 					}
 
+					if meta.LastKnownResolve == nil {
+						log.Warn().Str("key", base64.StdEncoding.EncodeToString(data.VirtualKey)).Msg("no last known resolve, cannot close")
+						return nil
+					}
+
 					toChannel, lockId, unlock, err := s.AcquireChannel(ctx, meta.Outgoing.ChannelAddress)
 					if err != nil {
 						return fmt.Errorf("failed to acquire 'to' channel: %w", err)
@@ -108,7 +113,7 @@ func (s *Service) taskExecutor() {
 						if toChannel.Status == db.ChannelStateActive {
 							err = s.proposeAction(ctx, lockId, meta.Outgoing.ChannelAddress, transport.ConfirmExecuteConditionalAction{
 								ID:    meta.Outgoing.Conditional.Hash(),
-								State: data.State,
+								State: meta.LastKnownResolve,
 							}, meta)
 							if err != nil {
 								return fmt.Errorf("failed to propose action: %w", err)
@@ -121,7 +126,7 @@ func (s *Service) taskExecutor() {
 					} else if toChannel.Status == db.ChannelStateActive {
 						err = s.proposeAction(ctx, lockId, meta.Outgoing.ChannelAddress, transport.ConfirmExecuteConditionalAction{
 							ID:    meta.Outgoing.Conditional.Hash(),
-							State: data.State,
+							State: meta.LastKnownResolve,
 						}, meta)
 						if err != nil {
 							return fmt.Errorf("failed to propose action: %w", err)

@@ -15,7 +15,7 @@ all:
 	wasm-opt -Oz -o build/payment-node-web.wasm build/payment-node-web.wasm
 
 web-dev:
-	tinygo build -target=wasm -tags=js -no-debug -o cmd/web/web-payments-frontend/public/web.wasm cmd/web/main.go
+	tinygo build -target=wasm -tags=js -o cmd/web/web-payments-frontend/public/web.wasm cmd/web/main.go
 	ls -lh cmd/web/web-payments-frontend/public/web.wasm
 
 web-prod:

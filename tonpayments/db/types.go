@@ -292,17 +292,13 @@ func (ch *Channel) CalcBalance(ctx context.Context, isTheir bool, resolver payme
 
 	// TODO: cache and precalc
 	balances := make(map[string]*payments.BalanceInfo)
+	for _, config := range resolver.GetKnownBalanceTypes() {
+		balances[config.BalanceID] = payments.NewBalanceInfo(config)
+	}
 
 	if s1.ActiveOnchain {
 		for id, b := range s1.OnchainBalances {
-			t, err := resolver.ResolveBalanceType(id)
-			if err != nil {
-				return nil, fmt.Errorf("failed to resolve balance type %s: %w", id, err)
-			}
-
-			bi := payments.NewBalanceInfo(t)
-			bi.Onchain = new(big.Int).Set(b)
-			balances[id] = bi
+			balances[id].Onchain = new(big.Int).Set(b)
 		}
 	}
 
@@ -329,17 +325,7 @@ func (ch *Channel) CalcBalance(ctx context.Context, isTheir bool, resolver payme
 	for _, tr := range s1.PendingOnchainTransfers {
 		for bid, amt := range tr.Amounts {
 			b := balances[bid]
-			if b == nil {
-				t, err := resolver.ResolveBalanceType(bid)
-				if err != nil {
-					return nil, fmt.Errorf("failed to resolve balance type %s: %w", bid, err)
-				}
-
-				b = payments.NewBalanceInfo(t)
-				balances[bid] = b
-			}
-
-			b.OnHold = new(big.Int).Add(b.OnHold, amt)
+			b.OnHold.Add(b.OnHold, amt)
 		}
 	}
 

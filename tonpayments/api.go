@@ -78,7 +78,7 @@ func (s *Service) GetTunnelingFees(ctx context.Context, balanceId string) (enabl
 }
 
 func (s *Service) OpenChannelWithNode(ctx context.Context, nodeKey ed25519.PublicKey) (*address.Address, error) {
-	log.Info().Msg("locating node and proposing channel config...")
+	log.Info().Str("with", base64.StdEncoding.EncodeToString(nodeKey)).Msg("locating node and proposing channel config...")
 
 	codeHash := payments.PaymentChannelCodes[0].Hash()
 	channelId := make([]byte, 16)

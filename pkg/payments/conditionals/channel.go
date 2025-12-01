@@ -226,7 +226,7 @@ func (c *ConditionalVirtualChannel) Commit(updated payments.Conditional, actStat
 		return nil, fmt.Errorf("failed to load old state: %w", err)
 	}
 
-	state.Amount = newCond.Action.GetAffectedCoins()[0].MustAmount(new(big.Int).Add(state.Amount.Nano(), prepayAmt))
+	state.Amount.Val = new(big.Int).Add(state.Amount.Nano(), prepayAmt)
 
 	newState, err := tlb.ToCell(state)
 	if err != nil {
@@ -467,7 +467,7 @@ func (c *ConditionalVirtualChannel) Execute(actionState, latestCondState *cell.C
 
 	ccs := c.Action.GetAffectedCoins()
 
-	actState.Amount = ccs[0].MustAmount(new(big.Int).Add(actState.Amount.Nano(), needAmt))
+	actState.Amount.Val = new(big.Int).Add(actState.Amount.Nano(), needAmt)
 
 	newActionState, err := tlb.ToCell(actState)
 	if err != nil {

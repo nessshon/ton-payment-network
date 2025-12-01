@@ -41,6 +41,7 @@ type ActionResolver interface {
 
 type BalanceTypeResolver interface {
 	ResolveBalanceType(id string) (*CoinConfig, error)
+	GetKnownBalanceTypes() []*CoinConfig
 }
 
 type FullResolver interface {

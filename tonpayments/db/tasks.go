@@ -122,7 +122,6 @@ type ChannelCooperativeCloseTask struct {
 
 type ConfirmCloseVirtualTask struct {
 	VirtualKey []byte
-	State      *cell.Cell
 }
 
 type CloseNextVirtualTask struct {

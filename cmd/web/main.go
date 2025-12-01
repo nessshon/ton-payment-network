@@ -63,16 +63,13 @@ func main() {
 					return
 				}
 
-				if len(args) < 2 || len(args) > 3 {
+				if len(args) != 3 {
 					reject.Invoke("wrong number of arguments")
 					return
 				}
 
 				// currency is optional third arg, default TON for backward compatibility
-				currency := "TON"
-				if len(args) == 3 {
-					currency = args[2].String()
-				}
+				currency := args[2].String()
 
 				cc, err := Service.ResolveCoinConfigBySymbol(currency)
 				if err != nil {
@@ -91,8 +88,19 @@ func main() {
 					return
 				}
 
-				// default per-hop fee based on coin config
-				feeAmt := cc.FeePerWithdrawPropose
+				// min per-hop fee based on coin config
+				minFeeAmt := cc.VirtualTunnelConfig.ProxyMinFee.Nano()
+
+				flt := new(big.Float).SetInt(amt.Nano())
+				flt.Mul(flt, big.NewFloat(cc.VirtualTunnelConfig.ProxyFeePercent/100))
+				fee, acc := flt.Int(new(big.Int))
+				if acc == big.Below {
+					fee.Add(fee, big.NewInt(1))
+				}
+
+				if fee.Cmp(minFeeAmt) < 0 {
+					fee.Set(minFeeAmt)
+				}
 
 				addr, err := base64.StdEncoding.DecodeString(args[1].String())
 				if err != nil {
@@ -100,7 +108,7 @@ func main() {
 					return
 				}
 
-				_, vKey, err := sendTransfer(amt, feeAmt, cc, [][]byte{sPub, addr}, false)
+				_, vKey, err := sendTransfer(amt, cc.MustAmount(fee), cc, [][]byte{sPub, addr}, false)
 				if err != nil {
 					reject.Invoke("failed to send transfer: " + err.Error())
 					return
@@ -119,14 +127,11 @@ func main() {
 			return js.Null()
 		}
 
-		if len(args) < 2 || len(args) > 3 {
+		if len(args) != 3 {
 			return js.ValueOf("wrong number of arguments")
 		}
 
-		currency := "TON"
-		if len(args) == 3 {
-			currency = args[2].String()
-		}
+		currency := args[2].String()
 
 		cc, err := Service.ResolveCoinConfigBySymbol(currency)
 		if err != nil {
@@ -150,7 +155,21 @@ func main() {
 			return js.ValueOf("")
 		}
 
-		fullAmt, _, err := sendTransfer(amt, cc.FeePerWithdrawPropose, cc, [][]byte{sPub, addr}, true)
+		// min per-hop fee based on coin config
+		minFeeAmt := cc.VirtualTunnelConfig.ProxyMinFee.Nano()
+
+		flt := new(big.Float).SetInt(amt.Nano())
+		flt.Mul(flt, big.NewFloat(cc.VirtualTunnelConfig.ProxyFeePercent/100))
+		fee, acc := flt.Int(new(big.Int))
+		if acc == big.Below {
+			fee.Add(fee, big.NewInt(1))
+		}
+
+		if fee.Cmp(minFeeAmt) < 0 {
+			fee.Set(minFeeAmt)
+		}
+
+		fullAmt, _, err := sendTransfer(amt, cc.MustAmount(fee), cc, [][]byte{sPub, addr}, true)
 		if err != nil {
 			return js.ValueOf("failed to estimate transfer: " + err.Error())
 		}
@@ -163,16 +182,12 @@ func main() {
 			return js.Null()
 		}
 
-		if len(args) < 3 || len(args) > 4 {
+		if len(args) != 4 {
 			println("wrong number of arguments")
 			return js.Null()
 		}
 
-		// optional 4th arg is currency symbol
-		currency := "TON"
-		if len(args) == 4 {
-			currency = args[3].String()
-		}
+		currency := args[3].String()
 
 		cc, err := Service.ResolveCoinConfigBySymbol(currency)
 		if err != nil {
@@ -374,12 +389,12 @@ func main() {
 					switch expr := e.ParseData().(type) {
 					case *db.ChannelHistoryActionAmountData:
 						obj.Set("isTheir", expr.IsTheir)
-						obj.Set("amounts", expr.Amounts)
+						obj.Set("amounts", mapConvert(expr.Amounts))
 					case *db.ChannelHistoryActionTransferInData:
-						obj.Set("amounts", expr.Amounts)
+						obj.Set("amounts", mapConvert(expr.Amounts))
 						obj.Set("party", base64.StdEncoding.EncodeToString(expr.From))
 					case *db.ChannelHistoryActionTransferOutData:
-						obj.Set("amounts", expr.Amounts)
+						obj.Set("amounts", mapConvert(expr.Amounts))
 						obj.Set("party", base64.StdEncoding.EncodeToString(expr.To))
 					}
 
@@ -513,7 +528,7 @@ func start(peerKey, channelKey []byte) {
 	wl, _ := wallet.InitWallet()
 	userId := hex.EncodeToString(wl.WalletAddress().Data())
 
-	var configPath = "payments-config-" + userId
+	var configPath = "payments-config-v2-" + userId
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		panic(err)
@@ -533,11 +548,28 @@ func start(peerKey, channelKey []byte) {
 	cfg.ChannelConfig.SupportedCoins.Ton.VirtualTunnelConfig.CapacityFeePercentPer30Days = 0.1
 	cfg.ChannelConfig.SupportedCoins.Ton.BalanceControl = nil
 
+	cfg.ChannelConfig.SupportedCoins.Jettons["EQDQp0PWKNlb3rFzP3WgLp_0vzL0bAcoZXWlvs9SmcGRPkJv"] = config.CoinConfig{
+		Enabled: true,
+		VirtualTunnelConfig: config.VirtualConfig{
+			MaxCapacityToRentPerTx:      "10",
+			CapacityDepositFee:          "0.3",
+			CapacityFeePercentPer30Days: 0.1,
+			ProxyMaxCapacity:            "15.5",
+			ProxyMinFee:                 "0.002",
+			ProxyFeePercent:             0.8,
+		},
+		Symbol:                "USDX",
+		Decimals:              6,
+		MinCapacityRequest:    "3",
+		FeePerWithdrawPropose: "0.3",
+		BalanceControl:        nil,
+	}
+
 	if err = config.SaveConfig(cfg, configPath); err != nil {
 		panic(err)
 	}
 
-	idb, freshDb, err := browser.NewIndexedDB(userId)
+	idb, freshDb, err := browser.NewIndexedDB(userId + ".v2")
 	if err != nil {
 		panic(err.Error())
 	}
@@ -579,16 +611,16 @@ func start(peerKey, channelKey []byte) {
 		sc.OnChannelUpdate(ctx, ch, statusChanged)
 
 		resBalances, resCapacities,
-			resLocked, resPending := map[string]string{}, map[string]string{},
-			map[string]string{}, map[string]string{}
+			resLocked, resPending := map[string]any{}, map[string]any{},
+			map[string]any{}, map[string]any{}
 
 		balances, err := ch.CalcBalance(ctx, false, Service)
 		if err != nil {
 			println("failed to calc balance: " + err.Error())
 			return
 		}
-		for s, info := range balances {
-			resBalances[s] = info.CoinConfig.MustAmount(info.Available()).String()
+		for _, info := range balances {
+			resBalances[info.CoinConfig.Symbol] = info.CoinConfig.MustAmount(info.Available()).String()
 		}
 
 		capacity, err := ch.CalcBalance(ctx, true, Service)
@@ -596,14 +628,14 @@ func start(peerKey, channelKey []byte) {
 			println("failed to calc capacity: " + err.Error())
 			return
 		}
-		for s, info := range capacity {
-			resCapacities[s] = info.CoinConfig.MustAmount(info.Available()).String()
+		for _, info := range capacity {
+			resCapacities[info.CoinConfig.Symbol] = info.CoinConfig.MustAmount(info.Available()).String()
 		}
 
 		// compute locked (our locked deposits) for this coin
 		for s, ld := range ch.Our.LockedDeposits {
 			cc, _ := Service.ResolveCoinConfig(s)
-			resLocked[s] = cc.MustAmount(ld.Available()).String()
+			resLocked[cc.Symbol] = cc.MustAmount(ld.Available()).String()
 		}
 
 		pendSums := map[string]*big.Int{}
@@ -625,15 +657,15 @@ func start(peerKey, channelKey []byte) {
 
 		for s, b := range pendSums {
 			cc, _ := Service.ResolveCoinConfig(s)
-			resPending[s] = cc.MustAmount(b).String()
+			resPending[cc.Symbol] = cc.MustAmount(b).String()
 		}
 
 		jsEvent := map[string]any{
 			"active":     ch.Status == db.ChannelStateActive,
-			"balances":   resBalances,
-			"capacities": resCapacities,
-			"locked":     resLocked,
-			"pendingIn":  resPending,
+			"balances":   js.ValueOf(resBalances),
+			"capacities": js.ValueOf(resCapacities),
+			"locked":     js.ValueOf(resLocked),
+			"pendingIn":  js.ValueOf(resPending),
 			"address":    ch.Our.Address,
 		}
 
@@ -678,9 +710,12 @@ func start(peerKey, channelKey []byte) {
 
 	if noChannels {
 		jsEvent := map[string]any{
-			"active":  false,
-			"balance": "",
-			"address": "",
+			"active":     false,
+			"balances":   js.ValueOf(map[string]any{}),
+			"capacities": js.ValueOf(map[string]any{}),
+			"locked":     js.ValueOf(map[string]any{}),
+			"pendingIn":  js.ValueOf(map[string]any{}),
+			"address":    "",
 		}
 
 		pcuFunc.Invoke(js.ValueOf(jsEvent))
@@ -747,4 +782,12 @@ func sendTransfer(amt, feeAmt tlb.Coins, cc *payments.CoinConfig, keys [][]byte,
 	}
 
 	return fullAmt, vPub, nil
+}
+
+func mapConvert(m map[string]string) map[string]any {
+	var res = make(map[string]any)
+	for k, v := range m {
+		res[k] = v
+	}
+	return res
 }

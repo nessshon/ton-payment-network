@@ -110,7 +110,7 @@ func (v *Scanner) startForContract(ctx context.Context, addr *address.Address, s
 
 			log.Debug().Str("address", addr.String()).Msg("account fetched and parsed, reporting channel update event")
 
-			v.events <- tonpayments.ChannelUpdatedEvent{
+			v.events <- &tonpayments.ChannelUpdatedEvent{
 				Transaction:   tx,
 				LatestChannel: p,
 			}

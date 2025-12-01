@@ -46,6 +46,7 @@ type Service interface {
 
 	ResolveAction(ctx context.Context, id []byte) (payments.Action, error)
 	ResolveBalanceType(id string) (*payments.CoinConfig, error)
+	GetKnownBalanceTypes() []*payments.CoinConfig
 }
 
 type Success struct {

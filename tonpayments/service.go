@@ -211,6 +211,14 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 	}
 
 	addBalanceControl := func(balanceId string, currency config.CoinConfig) error {
+		if currency.BalanceControl == nil {
+			currency.BalanceControl = &config.BalanceControlConfig{
+				DepositWhenAmountLessThan: "0",
+				DepositUpToAmount:         "0",
+				WithdrawWhenAmountReached: "0",
+			}
+		}
+
 		conf := &balanceControlConfig{
 			DepositWhenAmountLessThan: tlb.MustFromDecimal(currency.BalanceControl.DepositWhenAmountLessThan, int(currency.Decimals)),
 			DepositUpToAmount:         tlb.MustFromDecimal(currency.BalanceControl.DepositUpToAmount, int(currency.Decimals)),
@@ -252,7 +260,6 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 		}
 	}
 
-	var balanceControl bool
 	for addr, currency := range cfg.SupportedCoins.Jettons {
 		if !currency.Enabled {
 			continue
@@ -269,11 +276,8 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 		c.JettonClient = s.NewJettonCacher(a)
 		s.knownBalanceTypes[bId] = c
 
-		if currency.BalanceControl != nil {
-			balanceControl = true
-			if err = addBalanceControl(bId, currency); err != nil {
-				return nil, err
-			}
+		if err = addBalanceControl(bId, currency); err != nil {
+			return nil, err
 		}
 	}
 
@@ -289,11 +293,8 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 		bId := payments.GetECBalanceID(id)
 		s.knownBalanceTypes[bId] = convertConfig(currency, bId)
 
-		if currency.BalanceControl != nil {
-			balanceControl = true
-			if err := addBalanceControl(bId, currency); err != nil {
-				return nil, err
-			}
+		if err := addBalanceControl(bId, currency); err != nil {
+			return nil, err
 		}
 	}
 
@@ -301,11 +302,8 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 		bId := payments.GetTONBalanceID()
 		s.knownBalanceTypes[bId] = convertConfig(cfg.SupportedCoins.Ton, bId)
 
-		if cfg.SupportedCoins.Ton.BalanceControl != nil {
-			balanceControl = true
-			if err := addBalanceControl(bId, cfg.SupportedCoins.Ton); err != nil {
-				return nil, err
-			}
+		if err := addBalanceControl(bId, cfg.SupportedCoins.Ton); err != nil {
+			return nil, err
 		}
 	}
 
@@ -320,31 +318,29 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 		return nil, err
 	}
 
-	if balanceControl {
-		handler := s.channelCallback
-		if current := database.GetOnChannelUpdated(); current != nil {
-			handler = func(ctx context.Context, ch *db.Channel, statusChanged bool) {
-				current(ctx, ch, statusChanged)
-				s.channelCallback(ctx, ch, statusChanged)
-			}
+	handler := s.channelCallback
+	if current := database.GetOnChannelUpdated(); current != nil {
+		handler = func(ctx context.Context, ch *db.Channel, statusChanged bool) {
+			current(ctx, ch, statusChanged)
+			s.channelCallback(ctx, ch, statusChanged)
 		}
-		database.SetOnChannelUpdated(handler)
-
-		go func() {
-			// some startup delay for indexing
-			time.Sleep(10 * time.Second)
-
-			channels, err := s.ListChannels(context.Background(), nil, db.ChannelStateActive)
-			if err != nil {
-				log.Error().Err(err).Msg("failed to list active channels")
-				return
-			}
-
-			for _, ch := range channels {
-				s.channelCallback(context.Background(), ch, false)
-			}
-		}()
 	}
+	database.SetOnChannelUpdated(handler)
+
+	go func() {
+		// some startup delay for indexing
+		time.Sleep(10 * time.Second)
+
+		channels, err := s.ListChannels(context.Background(), nil, db.ChannelStateActive)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to list active channels")
+			return
+		}
+
+		for _, ch := range channels {
+			s.channelCallback(context.Background(), ch, false)
+		}
+	}()
 
 	return s, nil
 }
@@ -1740,7 +1736,7 @@ func (s *Service) proposeAction(ctx context.Context, lockId int64, channelAddres
 			// we can retry later, no need to revert
 			return ErrChannelIsBusy
 		}
-		log.Warn().Str("reason", res.Reason).Msg("actions request denied")
+		log.Warn().Str("reason", res.Reason).Msg("actions proposal denied")
 		return ErrDenied
 	}
 
@@ -2122,4 +2118,12 @@ func (s *Service) AcquireChannel(ctx context.Context, addr string, id ...int64) 
 			log.Debug().Str("channel", addr).Int64("id", l.id).Msg("external lock released")
 		}
 	}, nil
+}
+
+func (s *Service) GetKnownBalanceTypes() []*payments.CoinConfig {
+	configs := make([]*payments.CoinConfig, 0, len(s.knownBalanceTypes))
+	for _, cfg := range s.knownBalanceTypes {
+		configs = append(configs, cfg)
+	}
+	return configs
 }

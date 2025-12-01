@@ -838,17 +838,17 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		}
 
 		// calc balance + amount potentially could be received
-		usableBalance := new(big.Int).Add(theirBalance.Available(), theirBalance.ConditionalLocked)
+		usableBalance := new(big.Int).Add(theirBalance.Available(), theirBalance.ConditionalPending)
 
 		if usableBalance.Cmp(totalFee) < 0 {
-			return nil, fmt.Errorf("not enough locked+balance for fee to rent, usable: %s, fee: %s", cc.MustAmount(usableBalance), cc.MustAmount(totalFee))
+			return nil, fmt.Errorf("not enough locked+balance %s for fee to rent, usable: %s, fee: %s", cc.Symbol, cc.MustAmount(usableBalance), cc.MustAmount(totalFee))
 		}
 
 		var actState actions.StateActionSend
 		if err = payments.LoadState(&actState, aState.MustToCell()); err != nil {
 			return nil, fmt.Errorf("failed to load action state: %w", err)
 		}
-		actState.Amount = cc.MustAmount(new(big.Int).Add(actState.Amount.Nano(), totalFee))
+		actState.Amount.Val = new(big.Int).Add(actState.Amount.Nano(), totalFee)
 
 		updatedState, err := tlb.ToCell(actState)
 		if err != nil {
@@ -923,7 +923,8 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		return nil, fmt.Errorf("incorrect their resulting conditionals hash")
 	}
 	if !bytes.Equal(theirActHash, theirSideProposal.ActionStatesHash) {
-		return nil, fmt.Errorf("incorrect their resulting actions hash %s != %s", theirActHash, theirSideProposal.ActionStatesHash)
+		return nil, fmt.Errorf("incorrect their resulting actions hash %s != %s",
+			hex.EncodeToString(theirActHash), hex.EncodeToString(theirSideProposal.ActionStatesHash))
 	}
 	if !bytes.Equal(ourCondHash, ourSideProposal.ConditionalsHash) {
 		return nil, fmt.Errorf("incorrect our resulting conditionals hash")
@@ -1039,7 +1040,6 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 				"confirm-close-virtual-"+base64.StdEncoding.EncodeToString(vch.GetKey()),
 				db.ConfirmCloseVirtualTask{
 					VirtualKey: vch.GetKey(),
-					State:      data.State,
 				}, nil, &tryTill,
 			); err != nil {
 				return fmt.Errorf("failed to create confirm-close-virtual task: %w", err)
@@ -1086,7 +1086,7 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 			return nil, fmt.Errorf("execute action must be applied to other side")
 		}
 
-		if int64(req.Signed.ValidUntil) < time.Now().Unix()-90 {
+		if int64(req.Signed.ValidUntil) < time.Now().Add(90*time.Second).Unix() {
 			return nil, fmt.Errorf("execute action must have at least 90 seconds ttl")
 		}
 
@@ -1237,6 +1237,8 @@ func (s *Service) fetchOnchainBalances(ctx context.Context, addr *address.Addres
 		return nil, fmt.Errorf("failed to get account: %w", err)
 	}
 
+	log.Debug().Str("address", addr.String()).Msg("fetching onchain balances")
+
 	balances := map[string]*big.Int{}
 	if b := s.knownBalanceTypes[payments.GetTONBalanceID()]; b != nil && b.Enabled {
 		balances[payments.GetTONBalanceID()] = acc.Balance.Nano()
@@ -1263,6 +1265,7 @@ func (s *Service) fetchOnchainBalances(ctx context.Context, addr *address.Addres
 				return nil, fmt.Errorf("failed to get jetton %s balance: %w", bt.JettonClient.GetRootAddress().String(), err)
 			}
 			balances[id] = amt
+			log.Debug().Str("address", addr.String()).Str("symbol", bt.Symbol).Str("amount", bt.MustAmount(amt).String()).Msg("fetched jetton balance")
 		}
 	}
 
@@ -1288,6 +1291,10 @@ func calcBalancesDiff(before, after map[string]*big.Int) map[string]*big.Int {
 type tmpFullResolver struct {
 	newActions []payments.Action
 	s          *Service
+}
+
+func (s tmpFullResolver) GetKnownBalanceTypes() []*payments.CoinConfig {
+	return s.s.GetKnownBalanceTypes()
 }
 
 func (s tmpFullResolver) ResolveBalanceType(id string) (*payments.CoinConfig, error) {
@@ -1341,7 +1348,7 @@ func (s *Service) addActionToChannel(ctx context.Context, channel *db.Channel, c
 		}
 
 		if ourAddr.String() != channel.Our.Address || theirAddr.String() != channel.Their.Address {
-			return fmt.Errorf("incorrect addresses")
+			return fmt.Errorf("incorrect addresses %s != %s || %s != %s", ourAddr.String(), channel.Our.Address, theirAddr.String(), channel.Their.Address)
 		}
 		return nil
 	}
@@ -1377,7 +1384,7 @@ func (s *Service) formatDiff(balances map[string]*big.Int) map[string]string {
 		if err != nil {
 			continue
 		}
-		res[cc.Symbol] = b.String()
+		res[cc.Symbol] = cc.MustAmount(b).String()
 	}
 	return res
 }
