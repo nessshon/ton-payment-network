@@ -1231,7 +1231,7 @@ func (s *Service) discoverChannel(channelAddr *address.Address) bool {
 	return true
 }
 
-func (s *Service) fetchOnchainBalances(ctx context.Context, addr *address.Address, blockAfter time.Time) (map[string]*big.Int, error) {
+func (s *Service) fetchChannelSideOnchainBalances(ctx context.Context, addr *address.Address, blockAfter time.Time) (map[string]*big.Int, error) {
 	acc, err := s.ton.GetAccount(ctx, addr, blockAfter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get account: %w", err)
@@ -1241,6 +1241,7 @@ func (s *Service) fetchOnchainBalances(ctx context.Context, addr *address.Addres
 
 	balances := map[string]*big.Int{}
 	if b := s.knownBalanceTypes[payments.GetTONBalanceID()]; b != nil && b.Enabled {
+		// TODO: subtract reserved value?
 		balances[payments.GetTONBalanceID()] = acc.Balance.Nano()
 	}
 

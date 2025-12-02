@@ -415,6 +415,22 @@ func main() {
 		return js.Null()
 	}))
 
+	js.Global().Set("showChannelDetails", js.FuncOf(func(this js.Value, args []js.Value) any {
+		if !started {
+			return js.Null()
+		}
+
+		if len(args) != 1 {
+			println("wrong number of arguments")
+			return js.Null()
+		}
+
+		channel := args[0].String()
+
+		Service.DebugPrintChannelInfo(context.Background(), channel)
+		return js.Null()
+	}))
+
 	js.Global().Set("listChannelsPrintAll", js.FuncOf(func(this js.Value, args []js.Value) any {
 		if !started {
 			return js.Null()

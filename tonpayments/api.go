@@ -1982,7 +1982,7 @@ func (s *Service) validateOutMessages(ctx context.Context, channel *db.Channel, 
 		Amounts:              map[string]*big.Int{},
 		CompletionBodyPrefix: nil,
 		CompletionAddress:    "",
-		LimitDepth:           3, // enough for jetton deduct
+		LimitDepth:           4, // enough for jetton deduct
 	}
 
 	var lowOnchain = map[string]bool{}

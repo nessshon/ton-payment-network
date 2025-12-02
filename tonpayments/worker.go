@@ -940,7 +940,7 @@ func (s *Service) taskExecutor() {
 						return fmt.Errorf("check failed: %w", err)
 					}
 
-					balances, err := s.fetchOnchainBalances(ctx, address.MustParseAddr(side.Address), time.Unix(at, 0))
+					balances, err := s.fetchChannelSideOnchainBalances(ctx, address.MustParseAddr(side.Address), time.Unix(at, 0))
 					if err != nil {
 						return fmt.Errorf("failed to refresh onchain balance: %w", err)
 					}
@@ -994,7 +994,7 @@ func (s *Service) taskExecutor() {
 						return fmt.Errorf("check failed: %w", err)
 					}
 
-					balances, err := s.fetchOnchainBalances(ctx, address.MustParseAddr(ch.Our.Address), time.Unix(at, 0))
+					balances, err := s.fetchChannelSideOnchainBalances(ctx, address.MustParseAddr(ch.Our.Address), time.Unix(at, 0))
 					if err != nil {
 						return fmt.Errorf("failed to refresh onchain balance: %w", err)
 					}
@@ -1052,7 +1052,7 @@ func (s *Service) taskExecutor() {
 						side = &ch.Their
 					}
 
-					balances, err := s.fetchOnchainBalances(ctx, address.MustParseAddr(side.Address), time.Unix(data.BlockAfter, 0))
+					balances, err := s.fetchChannelSideOnchainBalances(ctx, address.MustParseAddr(side.Address), time.Unix(data.BlockAfter, 0))
 					if err != nil {
 						return fmt.Errorf("failed to refresh onchain balance: %w", err)
 					}

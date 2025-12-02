@@ -324,7 +324,10 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
                                       setCreationStarted(true);
                                       window.openChannel();
                                     }}
-                                    className="bg-[#0098ea] text-white px-4 py-2 rounded-xl"
+                                    disabled={paymentAddr === "Loading..."}
+                                    aria-disabled={paymentAddr === "Loading..."}
+                                    title={paymentAddr === "Loading..." ? "Please wait until Your Address is loaded" : undefined}
+                                    className={`px-4 py-2 rounded-xl ${paymentAddr === "Loading..." ? "bg-gray-200 text-gray-500 cursor-not-allowed" : "bg-[#0098ea] text-white"}`}
                                 >
                                   Create Wallet
                                 </Button>
