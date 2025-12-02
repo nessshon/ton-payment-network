@@ -8,7 +8,25 @@ import (
 
 type Migration func(ctx context.Context, db *DB) error
 
-var Migrations = []Migration{}
+var Migrations = []Migration{resetPending}
+
+func resetPending(ctx context.Context, db *DB) error {
+	list, err := db.GetChannels(ctx, nil, ChannelStateActive)
+	if err != nil {
+		return fmt.Errorf("failed to get channels: %w", err)
+	}
+
+	for _, ch := range list {
+		if ch.PendingCommit != nil {
+			ch.PendingCommit = nil
+			if err := db.UpdateChannel(ctx, ch); err != nil {
+				return fmt.Errorf("failed to update channel: %w", err)
+			}
+		}
+	}
+	
+	return nil
+}
 
 func RunMigrations(db *DB) error {
 	version, err := db.GetMigrationVersion(context.Background())

@@ -129,7 +129,6 @@ func (h *HTTP) Connect(ctx context.Context, channelKey ed25519.PublicKey) (*tran
 			return
 		}
 	}, func() {
-		println("DISCONNECTED", connected)
 		if connected {
 			h.peer = nil
 			_ = h.disconnectHandler(context.Background(), peer.transport)
@@ -308,8 +307,16 @@ func (h *HTTP) subscribeSSE(ctx context.Context, url string, onMsg func(ctx cont
 	onError := js.FuncOf(func(this js.Value, args []js.Value) any {
 		js.Global().Get("console").Call("log", args[0])
 
-		log.Error().Msg("sse err")
-		onDisconnect()
+		// EventSource fires an error event on transient reconnect attempts too. Only
+		// trigger disconnect handling when the stream is fully closed so we don't
+		// thrash the connection after successful requests.
+		readyState := eventSource.Get("readyState").Int()
+		if readyState == 2 { // CLOSED
+			log.Error().Msg("sse closed")
+			onDisconnect()
+		}
+
+		// log.Error().Msg("sse err")
 		return nil
 	})
 	eventSource.Call("addEventListener", "error", onError)

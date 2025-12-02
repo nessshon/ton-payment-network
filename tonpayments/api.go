@@ -208,7 +208,7 @@ func (s *Service) CreateSendConditional(ctx context.Context, instructionKey ed25
 			return fmt.Errorf("failed to calc channel balance: %w", err)
 		}
 
-		if balances[cc.BalanceID].Available().Cmp(needAmount) != -1 {
+		if balances[cc.BalanceID].Available().Cmp(needAmount) >= 0 {
 			// we found channel with enough balance
 			channel = ch
 			break

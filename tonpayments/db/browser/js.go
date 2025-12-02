@@ -241,61 +241,6 @@ func (e snapshotExec) Put(_, _ []byte) error { return errors.New("readonly") }
 func (e snapshotExec) Delete(_ []byte) error { return errors.New("readonly") }
 func (e snapshotExec) Error() error          { return nil }
 
-/*func (e snapshotExec) NewIterator(p []byte, forward bool) Iterator {
-	keyRange := js.Undefined()
-
-	if p != nil {
-		upperKey := make([]byte, len(p))
-		copy(upperKey, p)
-
-		for i := len(upperKey) - 1; i >= 0; i-- {
-			if upperKey[i] < 0xFF {
-				upperKey[i]++
-				upperKey = upperKey[:i+1]
-				break
-			}
-		}
-
-		keyRange = js.Global().Get("IDBKeyRange").Call(
-			"bound",
-			bytesToJS(p),
-			bytesToJS(upperKey),
-			false,
-			true,
-		)
-	}
-
-	dir := "prev"
-	if forward {
-		dir = "next"
-	}
-
-	req := e.tx.Call("openCursor", keyRange, dir)
-	chRes := make(chan js.Value, 1)
-	chErr := make(chan error, 1)
-
-	var onOk, onErr js.Func
-	onOk = js.FuncOf(func(this js.Value, args []js.Value) any {
-		cur := args[0].Get("target").Get("result")
-		chRes <- cur
-		return nil
-	})
-	onErr = js.FuncOf(func(this js.Value, args []js.Value) any {
-		chErr <- errors.New(args[0].Get("message").String())
-		return nil
-	})
-	req.Set("onsuccess", onOk)
-	req.Set("onerror", onErr)
-
-	return &sliceIter{
-		prefix: p,
-		onOk:   onOk,
-		onErr:  onErr,
-		chRes:  chRes,
-		chErr:  chErr,
-	}
-}*/
-
 func (e snapshotExec) NewIterator(prefix []byte, forward bool) Iterator {
 	keyRange := js.Undefined()
 	if prefix != nil {
@@ -324,24 +269,39 @@ func (e snapshotExec) NewIterator(prefix []byte, forward bool) Iterator {
 
 	req := e.tx.Call("openCursor", keyRange, dir)
 
-	chRes := make(chan js.Value, 1)
-	chErr := make(chan error, 1)
+	ch := make(chan kvItem, 1)
 
 	var onOk, onErr js.Func
 
 	onOk = js.FuncOf(func(this js.Value, args []js.Value) any {
 		cur := args[0].Get("target").Get("result")
 
-		if !cur.IsNull() {
-			cur.Call("continue")
+		if cur.IsNull() || cur.IsUndefined() {
+			ch <- kvItem{done: true}
+			return nil
 		}
 
-		chRes <- cur
+		key := jsToBytes(cur.Get("key"))
+		val := jsToBytes(cur.Get("value"))
+
+		cur.Call("continue")
+
+		ch <- kvItem{
+			key:   key,
+			value: val,
+		}
 		return nil
 	})
 
 	onErr = js.FuncOf(func(this js.Value, args []js.Value) any {
-		chErr <- errors.New(args[0].Get("message").String())
+		errVal := args[0].Get("target").Get("error")
+		msg := "indexedDB cursor error"
+		if errVal.Truthy() {
+			if errVal.Get("message").Truthy() {
+				msg = errVal.Get("message").String()
+			}
+		}
+		ch <- kvItem{err: errors.New(msg)}
 		return nil
 	})
 
@@ -355,8 +315,7 @@ func (e snapshotExec) NewIterator(prefix []byte, forward bool) Iterator {
 			onOk.Release()
 			onErr.Release()
 		},
-		chRes: chRes,
-		chErr: chErr,
+		ch: ch,
 	}
 }
 
@@ -372,29 +331,37 @@ func (b *batchWrap) Delete(key []byte) error {
 	return nil
 }
 
+type kvItem struct {
+	key   []byte
+	value []byte
+	err   error
+	done  bool
+}
+
 type sliceIter struct {
 	currentKey   []byte
 	currentValue []byte
 	release      func()
-	chRes        chan js.Value
-	chErr        chan error
+	ch           chan kvItem
 }
 
 func (it *sliceIter) Next() bool {
-	for {
-		select {
-		case cur := <-it.chRes:
-			if cur.IsNull() {
-				return false
-			}
-			it.currentKey = jsToBytes(cur.Get("key"))
-			it.currentValue = jsToBytes(cur.Get("value"))
-			// cur.Call("continue")
-			return true
-		case err := <-it.chErr:
-			panic(err.Error())
-		}
+	item, ok := <-it.ch
+	if !ok {
+		return false
 	}
+
+	if item.err != nil {
+		panic(item.err.Error())
+	}
+
+	if item.done {
+		return false
+	}
+
+	it.currentKey = item.key
+	it.currentValue = item.value
+	return true
 }
 
 func (it *sliceIter) Key() []byte {
@@ -406,7 +373,9 @@ func (it *sliceIter) Value() []byte {
 }
 
 func (it *sliceIter) Release() {
-	it.release()
+	if it.release != nil {
+		it.release()
+	}
 }
 
 func (it *sliceIter) Error() error { return nil }

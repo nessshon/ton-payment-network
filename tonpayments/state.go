@@ -392,7 +392,8 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 				return fmt.Errorf("failed to create channel our cap rent event: %w", err)
 			}
 
-			log.Info().Str("action_id", base64.StdEncoding.EncodeToString(act.ActionID)).Msg("commit proposal accepted")
+			log.Info().Str("channel", channel.Our.Address).Uint64("seqno", req.Signed.Seqno).
+				Str("action_id", base64.StdEncoding.EncodeToString(act.ActionID)).Msg("commit proposal accepted")
 			return nil
 		}
 	case transport.SwapAction:

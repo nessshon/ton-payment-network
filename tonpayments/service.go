@@ -426,7 +426,9 @@ func (s *Service) balanceControlCallback(ctx context.Context, ch *db.Channel, _ 
 		if bc == nil {
 			continue
 		}
+		// no onchain actions for pending balance
 		balance := new(big.Int).Add(balanceInfo.Available(), balanceInfo.OnHold)
+		balance.Add(balance, balanceInfo.ConditionalLocked)
 
 		if ch.Status != db.ChannelStateActive {
 			bc.mx.Lock()
@@ -833,10 +835,7 @@ func (s *Service) processSideUpdate(ctx context.Context, ch *db.Channel, isOur b
 		pendingCommit := side.PendingOnchainTransfers[pendingCommitKey]
 
 		if side.LatestCommitedSeqno < upd.LatestChannel.Storage.CommittedSeqno && pendingCommit != nil {
-			if !isOur {
-				// their commit = our coins to receive
-				ch.PendingCommit = nil
-			}
+			ch.PendingCommit = nil
 
 			err := s.db.CreateTask(ctx, PaymentsTaskPool, "wait-pending-tx-completion", side.Address+"-chain-balance",
 				"wait-pending-tx-completion-"+side.Address+"-"+pendingCommitKey,

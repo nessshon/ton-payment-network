@@ -890,6 +890,7 @@ func (s *Service) taskExecutor() {
 					}
 
 					if ch.Our.LatestCommitedSeqno >= req.Signed.Seqno || ch.Their.LatestCommitedSeqno >= req.Signed.Seqno {
+						log.Info().Str("channel", ch.Our.Address).Msg("already committed, skipping")
 						return nil
 					}
 
@@ -1397,7 +1398,7 @@ func (s *Service) rentCapacityIfNeeded(ctx context.Context, channel *db.Channel,
 		toGet := new(big.Int).Abs(available)
 
 		ld := channel.Their.LockedDeposits[cc.BalanceID]
-		if ld == nil || ld.Available().Cmp(theirBalance.OnHold) < 0 {
+		if ld == nil || ld.Available().Cmp(theirBalance.ConditionalLocked) < 0 {
 			reqAmount := cc.MinCapacityRequest.Nano()
 			if toGet.Cmp(reqAmount) > 0 {
 				reqAmount = new(big.Int).Set(toGet)
