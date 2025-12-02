@@ -41,12 +41,19 @@ function App() {
       ...Object.keys(ev.pendingIn || {}),
     ]));
 
-    if (currencies.length === 0) {
+    // Ensure deterministic order: TON first, then alphabetically by symbol
+    const currenciesSorted = currencies.sort((a, b) => {
+      if (a === 'TON' && b !== 'TON') return -1;
+      if (b === 'TON' && a !== 'TON') return 1;
+      return a.localeCompare(b);
+    });
+
+    if (currenciesSorted.length === 0) {
       setSupportedCurrencies(["TON"]);
       return;
     }
 
-    setSupportedCurrencies(currencies);
+    setSupportedCurrencies(currenciesSorted);
 
     window.getChannelHistory(5).then(history => {
       setHistory(history);
@@ -233,7 +240,12 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
 
   const formatAmounts = (map?: Record<string, string>) => {
     if (!map) return "";
-    return Object.entries(map)
+    const entries = Object.entries(map).sort(([a], [b]) => {
+      if (a === 'TON' && b !== 'TON') return -1;
+      if (b === 'TON' && a !== 'TON') return 1;
+      return a.localeCompare(b);
+    });
+    return entries
         .map(([symbol, amount]) => `${symbol}: ${amount}`)
         .join(", ");
   };
