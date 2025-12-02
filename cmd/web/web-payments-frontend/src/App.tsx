@@ -2,7 +2,7 @@ import React, {useEffect, useMemo, useState} from 'react';
 import './App.css';
 import {TonConnectButton, useTonAddress, useTonConnectUI, useTonWallet} from "@tonconnect/ui-react";
 
-import {Send, ArrowDown, ArrowUp, RefreshCw, Copy, PlusCircle, MinusCircle, Activity, Check, Plus} from "lucide-react";
+import {Send, ArrowDown, ArrowUp, RefreshCw, Copy, PlusCircle, MinusCircle, Activity, Check, Plus, Repeat} from "lucide-react";
 import {Card, CardContent} from "./components/ui/card";
 import {Input} from "./components/ui/input";
 import {Button} from "./components/ui/button";
@@ -180,8 +180,15 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
   const [modalAmount, setModalAmount] = useState("");
   const [withdrawTarget, setWithdrawTarget] = useState("");
   const [transferStatus, setTransferStatus] = useState<"loading" | "success" | null>(null);
+  const [swapModalOpen, setSwapModalOpen] = useState(false);
+  const [swapFromCurrency, setSwapFromCurrency] = useState("TON");
+  const [swapToCurrency, setSwapToCurrency] = useState("USDX");
+  const [swapFromAmount, setSwapFromAmount] = useState("");
+  const [swapToAmount, setSwapToAmount] = useState("");
 
   const availableCurrencies = useMemo(() => currencies.length ? currencies : ["TON"], [currencies]);
+  const swapPairs = useMemo(() => [{ from: "TON", to: "USDX", coeff: 2 }], []);
+  const activeSwapPair = useMemo(() => swapPairs.find(p => p.from === swapFromCurrency && p.to === swapToCurrency) ?? swapPairs[0], [swapPairs, swapFromCurrency, swapToCurrency]);
 
   useEffect(() => {
     if (!availableCurrencies.includes(sendCurrency)) {
@@ -191,6 +198,12 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
       setModalCurrency(availableCurrencies[0]);
     }
   }, [availableCurrencies]);
+
+  useEffect(() => {
+    if (swapFromAmount && activeSwapPair) {
+      updateSwapPreview(swapFromAmount, activeSwapPair.coeff);
+    }
+  }, [activeSwapPair]);
 
   const handleCopy = () => {
     if (!paymentAddr) return;
@@ -234,6 +247,52 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
 
     const fee = window.estimateTransfer(amount, recipient, currency);
     setSendFeeAmount(fee);
+  };
+
+  const updateSwapPreview = (amount: string, coefficient?: number) => {
+    const coeff = coefficient ?? activeSwapPair?.coeff ?? 1;
+    setSwapFromAmount(amount);
+    const numeric = parseFloat(amount);
+    if (isNaN(numeric)) {
+      setSwapToAmount("");
+      return;
+    }
+    setSwapToAmount((numeric * coeff).toString());
+  };
+
+  const handleSwapPairChange = (from: string) => {
+    const nextPair = swapPairs.find(p => p.from === from) ?? swapPairs[0];
+    setSwapFromCurrency(nextPair.from);
+    setSwapToCurrency(nextPair.to);
+    updateSwapPreview(swapFromAmount, nextPair.coeff);
+  };
+
+  const confirmSwap = () => {
+    const pair = activeSwapPair;
+    if (!pair) {
+      alert("Selected swap pair is not available");
+      return;
+    }
+    if (!swapFromAmount || parseFloat(swapFromAmount) <= 0) {
+      alert("Please enter amount to swap");
+      return;
+    }
+    if (!availableCurrencies.includes(pair.from) || !availableCurrencies.includes(pair.to)) {
+      alert("Selected currencies are not available");
+      return;
+    }
+
+    setTransferStatus("loading");
+    window.executeSwap(pair.from, pair.to, swapFromAmount, pair.coeff).then(() => {
+      setTransferStatus("success");
+      setSwapModalOpen(false);
+      setSwapFromAmount("");
+      setSwapToAmount("");
+    }).catch(err => {
+      setTransferStatus(null);
+      alert(err);
+      console.error(err);
+    });
   };
 
   return (
@@ -392,6 +451,27 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
             </CardContent>
           </Card>
 
+          <Card className="bg-[#f9fcff] shadow-md rounded-2xl">
+            <CardContent className="p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-semibold">Swap</h2>
+                {activeSwapPair && (
+                    <span className="text-sm text-gray-600">Rate: 1 {activeSwapPair.from} = {activeSwapPair.coeff} {activeSwapPair.to}</span>
+                )}
+              </div>
+              <p className="text-sm text-gray-600">Swap TON to USDX using the fixed rate.</p>
+              <Button className="bg-[#0098ea] text-white px-4 py-2 rounded-xl flex items-center gap-2" onClick={() => {
+                const pair = swapPairs[0];
+                setSwapModalOpen(true);
+                setSwapFromCurrency(pair.from);
+                setSwapToCurrency(pair.to);
+                updateSwapPreview("", pair.coeff);
+              }}>
+                <Repeat size={16} /> Start Swap
+              </Button>
+            </CardContent>
+          </Card>
+
           {transactions && (
               <Card className="bg-[#f9fcff] shadow-md rounded-2xl">
                 <CardContent className="p-6 space-y-4">
@@ -475,6 +555,20 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
                 onCancel={closeModal}
             />
         )}
+        {swapModalOpen && activeSwapPair && (
+            <SwapModal
+                fromCurrency={swapFromCurrency}
+                toCurrency={swapToCurrency}
+                fromAmount={swapFromAmount}
+                toAmount={swapToAmount}
+                pairs={swapPairs}
+                coefficient={activeSwapPair.coeff}
+                onFromCurrencyChange={handleSwapPairChange}
+                onAmountChange={(val) => updateSwapPreview(val)}
+                onConfirm={confirmSwap}
+                onCancel={() => setSwapModalOpen(false)}
+            />
+        )}
         {transferStatus && (
             <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
               <div className="bg-white p-6 rounded-2xl shadow-xl w-80 space-y-4">
@@ -543,6 +637,59 @@ const ModalAmount: React.FC<{
                 onChange={(e) => onWithdrawTargetChange && onWithdrawTargetChange(e.target.value)}
             />
         )}
+        <div className="flex justify-between gap-4">
+          <Button onClick={onConfirm} className="bg-[#0098ea] text-white w-full">Confirm</Button>
+          <Button onClick={onCancel} className="bg-gray-200 text-gray-700 w-full">Cancel</Button>
+        </div>
+      </div>
+    </div>
+);
+
+const SwapModal: React.FC<{
+  fromCurrency: string;
+  toCurrency: string;
+  fromAmount: string;
+  toAmount: string;
+  pairs: { from: string, to: string, coeff: number }[];
+  coefficient: number;
+  onFromCurrencyChange: (value: string) => void;
+  onAmountChange: (value: string) => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+}> = ({ fromCurrency, toCurrency, fromAmount, toAmount, pairs, coefficient, onFromCurrencyChange, onAmountChange, onConfirm, onCancel }) => (
+    <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
+      <div className="bg-white p-6 rounded-2xl shadow-xl w-80 space-y-4">
+        <h2 className="text-lg font-semibold capitalize text-center">Swap</h2>
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-gray-600">From</span>
+          <select
+              className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white"
+              value={fromCurrency}
+              onChange={(e) => onFromCurrencyChange(e.target.value)}
+          >
+            {pairs.map((p) => (
+                <option key={`swap-from-${p.from}`} value={p.from}>{p.from}</option>
+            ))}
+          </select>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-gray-600">To</span>
+          <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-gray-100" value={toCurrency} disabled />
+        </div>
+        <Input
+            type="number"
+            step="0.000000001"
+            placeholder={`Enter amount in ${fromCurrency}`}
+            value={fromAmount}
+            onChange={(e) => onAmountChange(e.target.value)}
+        />
+        <Input
+            disabled
+            value={toAmount}
+            placeholder={`You will receive in ${toCurrency}`}
+            className="bg-gray-100"
+        />
+        <div className="text-sm text-gray-600 text-center">Rate: 1 {fromCurrency} = {coefficient} {toCurrency}</div>
         <div className="flex justify-between gap-4">
           <Button onClick={onConfirm} className="bg-[#0098ea] text-white w-full">Confirm</Button>
           <Button onClick={onCancel} className="bg-gray-200 text-gray-700 w-full">Cancel</Button>

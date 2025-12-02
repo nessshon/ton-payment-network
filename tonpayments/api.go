@@ -1790,7 +1790,7 @@ func (s *Service) executeSettleFinalize(ctx context.Context, channelAddr string,
 }
 
 func (s *Service) ExecuteTopup(ctx context.Context, channelAddr, balanceId string, amount tlb.Coins, unlockBalanceControlOnDone bool) error {
-	log.Info().Str("address", channelAddr).Msg("executing topup...")
+	log.Info().Str("balance_id", balanceId).Str("address", channelAddr).Msg("executing topup...")
 
 	if amount.Nano().Sign() <= 0 {
 		// zero

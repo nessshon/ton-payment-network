@@ -453,73 +453,8 @@ func (s *Service) taskExecutor() {
 
 					for _, cc := range vch.GetAction().GetAffectedCoins() {
 						// TODO: check if we really need this capacity, in case of 2+ affected coins
-
-						theirBalance := theirBalances[cc.BalanceID]
-						if theirBalance == nil {
-							theirBalance = payments.NewBalanceInfo(cc)
-						}
-
-						// if balance is negative we should rent capacity
-						if available := theirBalance.Available(); available.Sign() < 0 {
-							toGet := new(big.Int).Abs(available)
-
-							ld := channel.Their.LockedDeposits[cc.BalanceID]
-							if ld == nil || ld.Available().Cmp(theirBalance.OnHold) < 0 {
-								reqAmount := cc.MinCapacityRequest.Nano()
-								if toGet.Cmp(reqAmount) > 0 {
-									reqAmount = new(big.Int).Set(toGet)
-								}
-
-								maxRentPerAction := cc.VirtualTunnelConfig.MaxCapacityToRentPerTx
-								if maxRentPerAction.Nano().Cmp(reqAmount) < 0 {
-									// should rent in several actions
-									reqAmount = maxRentPerAction.Nano()
-								}
-
-								err = func() error {
-									channel, lockId, unlock, err := s.AcquireChannel(ctx, channel.Our.Address)
-									if err != nil {
-										return fmt.Errorf("failed to acquire channel: %w", err)
-									}
-									defer unlock()
-
-									if channel.Status != db.ChannelStateActive {
-										// not needed anymore
-										return fmt.Errorf("channel is not active")
-									}
-
-									till := time.Now().Add(30 * 24 * time.Hour)
-
-									if ld != nil && ld.Till.After(time.Now()) {
-										reqAmount.Add(reqAmount, ld.Amount)
-									}
-
-									bid, _ := hex.DecodeString(cc.BalanceID)
-									// TheirLockedDeposit will be updated when action proposed successfully
-									if err = s.proposeAction(ctx, lockId, channel.Our.Address, transport.RentCapacityAction{
-										Till:      uint64(till.Unix()),
-										Amount:    reqAmount.Bytes(),
-										BalanceID: bid,
-									}, nil); err != nil {
-										return fmt.Errorf("failed to propose rent capacity action: %w", err)
-									}
-
-									return nil
-								}()
-								if err != nil {
-									return fmt.Errorf("failed to rent capacity: %w", err)
-								}
-							}
-
-							// enough capacity rented, waiting for actual topup from their side
-							log.Warn().
-								Str("channel", channel.Our.Address).
-								Str("locked", cc.MustAmount(ld.Available()).String()).
-								Str("need", cc.MustAmount(toGet).String()).
-								Str("has", cc.MustAmount(available).String()).
-								Str("key", base64.StdEncoding.EncodeToString(data.ID)).
-								Msg("not enough capacity to close conditional, it was rented, waiting for actual topup")
-							return ErrWaitingForCapacity
+						if err = s.rentCapacityIfNeeded(ctx, channel, cc, theirBalances); err != nil {
+							return err
 						}
 					}
 
@@ -1447,6 +1382,76 @@ func (s *Service) createChannelBalanceChangedEvent(ctx context.Context, ch *db.C
 		Data:   jsonData,
 	}); err != nil {
 		return fmt.Errorf("failed to create withdraw channel event %d: %w", db.ChannelHistoryActionBalanceChanged, err)
+	}
+	return nil
+}
+
+func (s *Service) rentCapacityIfNeeded(ctx context.Context, channel *db.Channel, cc *payments.CoinConfig, theirBalances map[string]*payments.BalanceInfo) error {
+	theirBalance := theirBalances[cc.BalanceID]
+	if theirBalance == nil {
+		theirBalance = payments.NewBalanceInfo(cc)
+	}
+
+	// if balance is negative we should rent capacity
+	if available := theirBalance.Available(); available.Sign() < 0 {
+		toGet := new(big.Int).Abs(available)
+
+		ld := channel.Their.LockedDeposits[cc.BalanceID]
+		if ld == nil || ld.Available().Cmp(theirBalance.OnHold) < 0 {
+			reqAmount := cc.MinCapacityRequest.Nano()
+			if toGet.Cmp(reqAmount) > 0 {
+				reqAmount = new(big.Int).Set(toGet)
+			}
+
+			maxRentPerAction := cc.VirtualTunnelConfig.MaxCapacityToRentPerTx
+			if maxRentPerAction.Nano().Cmp(reqAmount) < 0 {
+				// should rent in several actions
+				reqAmount = maxRentPerAction.Nano()
+			}
+
+			err := func() error {
+				channel, lockId, unlock, err := s.AcquireChannel(ctx, channel.Our.Address)
+				if err != nil {
+					return fmt.Errorf("failed to acquire channel: %w", err)
+				}
+				defer unlock()
+
+				if channel.Status != db.ChannelStateActive {
+					// not needed anymore
+					return fmt.Errorf("channel is not active")
+				}
+
+				till := time.Now().Add(30 * 24 * time.Hour)
+
+				if ld != nil && ld.Till.After(time.Now()) {
+					reqAmount.Add(reqAmount, ld.Amount)
+				}
+
+				bid, _ := hex.DecodeString(cc.BalanceID)
+				// TheirLockedDeposit will be updated when action proposed successfully
+				if err = s.proposeAction(ctx, lockId, channel.Our.Address, transport.RentCapacityAction{
+					Till:      uint64(till.Unix()),
+					Amount:    reqAmount.Bytes(),
+					BalanceID: bid,
+				}, nil); err != nil {
+					return fmt.Errorf("failed to propose rent capacity action: %w", err)
+				}
+
+				return nil
+			}()
+			if err != nil {
+				return fmt.Errorf("failed to rent capacity: %w", err)
+			}
+		}
+
+		// enough capacity rented, waiting for actual topup from their side
+		log.Warn().
+			Str("channel", channel.Our.Address).
+			Str("locked", cc.MustAmount(ld.Available()).String()).
+			Str("need", cc.MustAmount(toGet).String()).
+			Str("has", cc.MustAmount(available).String()).
+			Msg("not enough capacity, it was rented, waiting for actual topup")
+		return ErrWaitingForCapacity
 	}
 	return nil
 }

@@ -40,6 +40,7 @@ declare global {
         topupChannel: (amount: string, currency: string) => void;
         sendTransfer: (amount: string, to: string, currency?: string) => Promise<string>;
         estimateTransfer: (amount: string, to: string, currency?: string) => string;
+        executeSwap: (fromCurrency: string, toCurrency: string, amount: string, coeff: number) => Promise<void>;
         getChannelHistory: (limit: number) => Promise<PaymentChannelHistoryItem[] | null>;
         openChannel: () => void;
         withdrawChannel: (amount: string, currency: string, target: string) => void;

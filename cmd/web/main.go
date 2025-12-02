@@ -177,6 +177,90 @@ func main() {
 		return js.ValueOf(tlb.MustFromNano(fullAmt.Sub(fullAmt, amt.Nano()), int(cc.Decimals)).String())
 	}))
 
+	js.Global().Set("executeSwap", js.FuncOf(func(this js.Value, args []js.Value) any {
+		promiseCtor := js.Global().Get("Promise")
+
+		return promiseCtor.New(js.FuncOf(func(this js.Value, prArgs []js.Value) any {
+			resolve := prArgs[0]
+			reject := prArgs[1]
+
+			go func() {
+				if !started {
+					reject.Invoke("not started")
+					return
+				}
+
+				if len(args) != 4 {
+					reject.Invoke("wrong number of arguments")
+					return
+				}
+
+				fromSymbol := args[0].String()
+				toSymbol := args[1].String()
+				coeff := args[3].Float()
+
+				if coeff <= 0 {
+					reject.Invoke("invalid coefficient")
+					return
+				}
+
+				fromCC, err := Service.ResolveCoinConfigBySymbol(fromSymbol)
+				if err != nil {
+					reject.Invoke("failed to get from coin config: " + err.Error())
+					return
+				}
+
+				toCC, err := Service.ResolveCoinConfigBySymbol(toSymbol)
+				if err != nil {
+					reject.Invoke("failed to get to coin config: " + err.Error())
+					return
+				}
+
+				fromAmt, err := tlb.FromDecimal(args[2].String(), int(fromCC.Decimals))
+				if err != nil {
+					reject.Invoke("failed to parse from amount: " + err.Error())
+					return
+				}
+
+				if fromAmt.Nano().Sign() <= 0 {
+					reject.Invoke("amount must be greater than zero")
+					return
+				}
+
+				fromFloat, ok := new(big.Float).SetString(args[2].String())
+				if !ok {
+					reject.Invoke("failed to parse from amount")
+					return
+				}
+
+				toFloat := new(big.Float).Mul(fromFloat, big.NewFloat(coeff))
+				toAmtStr := toFloat.Text('f', int(toCC.Decimals))
+
+				toAmt, err := tlb.FromDecimal(toAmtStr, int(toCC.Decimals))
+				if err != nil {
+					reject.Invoke("failed to calculate target amount: " + err.Error())
+					return
+				}
+
+				ch, err := getPrimaryChanel(sPub)
+				if err != nil {
+					reject.Invoke("failed to get primary channel: " + err.Error())
+					return
+				}
+
+				if err = Service.InitiateSwap(context.Background(), ch, fromCC, toCC, fromAmt, toAmt); err != nil {
+					reject.Invoke("failed to initiate swap: " + err.Error())
+					return
+				}
+
+				resolve.Invoke(js.Null())
+				return
+			}()
+
+			return nil
+		}))
+	}))
+
 	js.Global().Set("sendTransferWithPath", js.FuncOf(func(this js.Value, args []js.Value) any {
 		if !started {
 			return js.Null()

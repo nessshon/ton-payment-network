@@ -129,6 +129,7 @@ func (h *HTTP) Connect(ctx context.Context, channelKey ed25519.PublicKey) (*tran
 			return
 		}
 	}, func() {
+		println("DISCONNECTED", connected)
 		if connected {
 			h.peer = nil
 			_ = h.disconnectHandler(context.Background(), peer.transport)
@@ -165,6 +166,9 @@ func (p *PeerConnection) Query(ctx context.Context, msg, res tl.Serializable) er
 
 	resBytes, err := p.pushJSON(ctx, "/web-channel/api/v1/push", e)
 	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			p.close()
+		}
 		return err
 	}
 
@@ -234,6 +238,8 @@ func await(p js.Value) (js.Value, error) {
 	return res, err
 }
 
+var ErrUnauthorized = errors.New("unauthorized")
+
 func (p *PeerConnection) pushJSON(ctx context.Context, url string, body any) ([]byte, error) {
 	reqData, err := json.Marshal(body)
 	if err != nil {
@@ -261,8 +267,13 @@ func (p *PeerConnection) pushJSON(ctx context.Context, url string, body any) ([]
 	}
 
 	if !resp.Get("ok").Bool() {
+		status := resp.Get("status").Int()
+		if status == 401 {
+			return nil, ErrUnauthorized
+		}
+
 		txt, _ := await(resp.Call("text"))
-		return nil, fmt.Errorf("http %d: %s", resp.Get("status").Int(), txt.String())
+		return nil, fmt.Errorf("http %d: %s", status, txt.String())
 	}
 
 	jsData, err := await(resp.Call("json"))
@@ -298,6 +309,7 @@ func (h *HTTP) subscribeSSE(ctx context.Context, url string, onMsg func(ctx cont
 		js.Global().Get("console").Call("log", args[0])
 
 		log.Error().Msg("sse err")
+		onDisconnect()
 		return nil
 	})
 	eventSource.Call("addEventListener", "error", onError)
