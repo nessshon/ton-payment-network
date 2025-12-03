@@ -364,7 +364,7 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		if _, err = s.db.GetVirtualChannelMeta(ctx, cond.GetKey()); err != nil && !errors.Is(err, db.ErrNotFound) {
 			return nil, fmt.Errorf("failed to load virtual channel meta: %w", err)
 		} else if err == nil {
-			return nil, fmt.Errorf("this conditional key was already used before")
+			return nil, fmt.Errorf("this conditional key %s was already used before", base64.StdEncoding.EncodeToString(cond.GetKey()))
 		}
 
 		id := cell.BeginCell().MustStoreSlice(srz.Hash(), 256).EndCell()
@@ -402,7 +402,7 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 				"ask-remove-cond-"+base64.StdEncoding.EncodeToString(srz.Hash())+"-timeout",
 				db.AskRemoveVirtualTask{
 					ChannelAddress: channel.Our.Address,
-					ID:             srz.Hash(),
+					Key:            cond.GetKey(),
 				}, &dl, nil,
 			)
 			if err != nil {
@@ -1002,7 +1002,7 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 		if err = s.db.CreateTask(context.Background(), PaymentsTaskPool, "remove-virtual", channel.Our.Address,
 			"remove-virtual-"+base64.StdEncoding.EncodeToString(vch.GetKey())+"-requested",
 			db.RemoveVirtualTask{
-				ID: data.ID,
+				Key: vch.GetKey(),
 			}, nil, nil,
 		); err != nil {
 			return nil, fmt.Errorf("failed to create remove-virtual task: %w", err)

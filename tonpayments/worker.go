@@ -295,7 +295,7 @@ func (s *Service) taskExecutor() {
 										"ask-remove-cond-"+base64.StdEncoding.EncodeToString(cond.GetKey()),
 										db.AskRemoveVirtualTask{
 											ChannelAddress: data.PrevChannelAddress,
-											ID:             cond.GetKey(),
+											Key:            cond.GetKey(),
 										}, nil, nil,
 									)
 									if err != nil {
@@ -379,7 +379,7 @@ func (s *Service) taskExecutor() {
 						return nil
 					}
 
-					meta, err := s.db.GetVirtualChannelMeta(ctx, data.ID)
+					meta, err := s.db.GetVirtualChannelMeta(ctx, data.Key)
 					if err != nil {
 						if errors.Is(err, db.ErrNotFound) {
 							return nil
@@ -387,13 +387,14 @@ func (s *Service) taskExecutor() {
 						return fmt.Errorf("failed to load conditional meta: %w", err)
 					}
 
-					if meta.Status == db.ConditionalStateRemoved || meta.Status == db.ConditionalStateClosed {
+					if meta.Status == db.ConditionalStateRemoved || meta.Status == db.ConditionalStateClosed ||
+						meta.Incoming == nil || meta.Incoming.ChannelAddress != data.ChannelAddress {
 						return nil
 					}
 
-					log.Debug().Str("channel", channel.Our.Address).Str("key", base64.StdEncoding.EncodeToString(data.ID)).Msg("asking to remove virtual channel")
+					log.Debug().Str("channel", channel.Our.Address).Str("key", base64.StdEncoding.EncodeToString(data.Key)).Msg("asking to remove virtual channel")
 					_, err = s.requestAction(ctx, channel.Our.Address, transport.RequestRemoveConditionalAction{
-						ID: data.ID,
+						ID: meta.Incoming.Conditional.Hash(),
 					})
 					if err != nil && !errors.Is(err, ErrDenied) {
 						return fmt.Errorf("request to remove virtual action failed: %w", err)
@@ -475,7 +476,7 @@ func (s *Service) taskExecutor() {
 						return fmt.Errorf("invalid json: %w", err)
 					}
 
-					meta, err := s.db.GetVirtualChannelMeta(ctx, data.ID)
+					meta, err := s.db.GetVirtualChannelMeta(ctx, data.Key)
 					if err != nil {
 						if errors.Is(err, db.ErrNotFound) {
 							return nil
@@ -494,8 +495,9 @@ func (s *Service) taskExecutor() {
 						return nil
 					}
 
+					id := meta.Outgoing.Conditional.Hash()
 					if err = s.proposeAction(ctx, lockId, meta.Outgoing.ChannelAddress, transport.RemoveConditionalAction{
-						ID: data.ID,
+						ID: id,
 					}, nil); err != nil {
 						if !errors.Is(err, ErrNotPossible) {
 							// We start uncooperative close at specific moment to have time
@@ -506,10 +508,10 @@ func (s *Service) taskExecutor() {
 							// Creating aggressive onchain close task, for the future,
 							// in case we will not be able to communicate with party
 							if err = s.db.CreateTask(ctx, PaymentsTaskPool, "uncooperative-close", meta.Outgoing.ChannelAddress+"-uncoop",
-								"uncooperative-close-"+meta.Outgoing.ChannelAddress+"-vc-"+base64.StdEncoding.EncodeToString(data.ID),
+								"uncooperative-close-"+meta.Outgoing.ChannelAddress+"-vc-"+base64.StdEncoding.EncodeToString(id),
 								db.ChannelUncooperativeCloseTask{
 									Address:              meta.Outgoing.ChannelAddress,
-									CheckCondStillExists: data.ID,
+									CheckCondStillExists: id,
 								}, &uncooperativeAfter, nil,
 							); err != nil {
 								log.Warn().Err(err).Str("channel", meta.Outgoing.ChannelAddress).Msg("failed to create uncooperative close task")
@@ -538,7 +540,7 @@ func (s *Service) taskExecutor() {
 							return fmt.Errorf("failed to load 'from' channel: %w", err)
 						}
 
-						_, vch, err := payments.FindConditional(ctx, channel.Their.Data.Conditionals, data.ID, s)
+						_, vch, err := payments.FindConditional(ctx, channel.Their.Data.Conditionals, data.Key, s)
 						if err != nil {
 							if errors.Is(err, payments.ErrNotFound) {
 								return nil
@@ -550,10 +552,10 @@ func (s *Service) taskExecutor() {
 						// consider conditional unsuccessful and gracefully removed
 						// and notify previous party that we are ready to release locked coins.
 						err = s.db.CreateTask(ctx, PaymentsTaskPool, "ask-remove-cond", meta.Incoming.ChannelAddress,
-							"ask-remove-cond-"+base64.StdEncoding.EncodeToString(data.ID),
+							"ask-remove-cond-"+base64.StdEncoding.EncodeToString(data.Key),
 							db.AskRemoveVirtualTask{
 								ChannelAddress: meta.Incoming.ChannelAddress,
-								ID:             data.ID,
+								Key:            vch.GetKey(),
 							}, nil, &tryTill,
 						)
 						if err != nil {

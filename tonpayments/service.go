@@ -1864,7 +1864,7 @@ func (s *Service) RequestRemoveVirtual(ctx context.Context, key ed25519.PublicKe
 		"ask-remove-cond-"+base64.StdEncoding.EncodeToString(meta.Key)+"-desire",
 		db.AskRemoveVirtualTask{
 			ChannelAddress: meta.Incoming.ChannelAddress,
-			ID:             meta.Key,
+			Key:            meta.Key,
 		}, nil, nil,
 	)
 	if err != nil {

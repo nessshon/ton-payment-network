@@ -149,7 +149,7 @@ type SwapTask struct {
 }
 
 type AskRemoveVirtualTask struct {
-	ID             []byte
+	Key            []byte
 	ChannelAddress string
 }
 
@@ -164,5 +164,5 @@ type IncrementStatesTask struct {
 }
 
 type RemoveVirtualTask struct {
-	ID []byte
+	Key []byte
 }

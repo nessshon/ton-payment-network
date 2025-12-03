@@ -13,6 +13,7 @@ import (
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 	"math/rand"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -199,7 +200,7 @@ func (t *Transport) handleQuery(ctx context.Context, peer *Peer, msg any) (any, 
 		if err != nil {
 			reason = err.Error()
 			ok = false
-			log.Debug().Str("addr", address.NewAddress(0, 0, q.ChannelAddr).String()).Str("reason", reason).Msg("failed to process action")
+			log.Debug().Str("action", reflect.TypeOf(q.Action).String()).Str("addr", address.NewAddress(0, 0, q.ChannelAddr).String()).Str("reason", reason).Msg("failed to process action")
 		} else {
 			if updCell, err = tlb.ToCell(updateProof); err != nil {
 				return nil, fmt.Errorf("failed to serialize state cell: %w", err)
