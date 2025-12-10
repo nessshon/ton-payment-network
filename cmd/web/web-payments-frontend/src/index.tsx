@@ -7,10 +7,10 @@ import {THEME, TonConnectUIProvider} from "@tonconnect/ui-react";
 
 interface PaymentChannelEvent {
     active: boolean;
-    balance: string;
-    capacity: string;
-    locked: string;
-    pendingIn: string;
+    balances: Record<string, string>;
+    capacities: Record<string, string>;
+    locked: Record<string, string>;
+    pendingIn: Record<string, string>;
     address: string;
 }
 
@@ -18,8 +18,9 @@ export interface PaymentChannelHistoryItem {
     id: string;
     action: number;
     timestamp: string;
-    amount: string | undefined;
-    party: string | undefined;
+    amounts?: Record<string, string>;
+    party?: string;
+    isTheir?: boolean;
 }
 
 export interface TxMessage {
@@ -36,12 +37,13 @@ declare global {
         onPaymentNetworkLoaded: (addr: string) => void;
         onPaymentChannelUpdated: (ev: PaymentChannelEvent) => void;
         onPaymentChannelHistoryUpdated: () => void;
-        topupChannel: (amount: string) => void;
-        sendTransfer: (amount: string, to: string) => Promise<string>;
-        estimateTransfer: (amount: string, to: string) => string;
+        topupChannel: (amount: string, currency: string) => void;
+        sendTransfer: (amount: string, to: string, currency?: string) => Promise<string>;
+        estimateTransfer: (amount: string, to: string, currency?: string) => string;
+        executeSwap: (fromCurrency: string, toCurrency: string, amount: string, coeff: number) => Promise<void>;
         getChannelHistory: (limit: number) => Promise<PaymentChannelHistoryItem[] | null>;
         openChannel: () => void;
-        withdrawChannel: (amount: string) => void;
+        withdrawChannel: (amount: string, currency: string, target: string) => void;
         doTransaction: (reason: string, messages: TxMessage[]) => Promise<string>;
     }
 }

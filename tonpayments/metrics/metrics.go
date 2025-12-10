@@ -7,12 +7,11 @@ import (
 )
 
 var (
-	WalletBalance                 *prometheus.GaugeVec
-	ChannelBalance                *prometheus.GaugeVec
-	ActiveVirtualChannels         *prometheus.GaugeVec
-	ActiveVirtualChannelsCapacity *prometheus.GaugeVec
-	ActiveVirtualChannelsFee      *prometheus.GaugeVec
-	QueuedTasks                   *prometheus.GaugeVec
+	WalletBalance      *prometheus.GaugeVec
+	ChannelBalance     *prometheus.GaugeVec
+	ActiveConditionals *prometheus.GaugeVec
+	ActiveActions      *prometheus.GaugeVec
+	QueuedTasks        *prometheus.GaugeVec
 )
 
 var Registered = false
@@ -43,34 +42,24 @@ func RegisterMetrics(namespace string) {
 		[]string{"peer", "coin", "is_our", "balance_type"},
 	)
 
-	ActiveVirtualChannels = prometheus.NewGaugeVec(
+	ActiveConditionals = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name:      "virtual_channels",
+			Name:      "conditionals_num",
 			Namespace: namespace,
 			Subsystem: "payments",
-			Help:      "Active virtual channels count.",
+			Help:      "Active conditionals count.",
 		},
-		[]string{"peer", "coin", "is_out", "want_remove"},
+		[]string{"peer", "coin", "is_out"},
 	)
 
-	ActiveVirtualChannelsCapacity = prometheus.NewGaugeVec(
+	ActiveActions = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name:      "virtual_channels_capacity",
+			Name:      "actions_num",
 			Namespace: namespace,
 			Subsystem: "payments",
-			Help:      "Active virtual channels capacity.",
+			Help:      "Active actions count.",
 		},
-		[]string{"peer", "coin", "is_out", "want_remove"},
-	)
-
-	ActiveVirtualChannelsFee = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name:      "virtual_channels_fee",
-			Namespace: namespace,
-			Subsystem: "payments",
-			Help:      "Active virtual channels fee.",
-		},
-		[]string{"peer", "coin", "is_out", "want_remove"},
+		[]string{"peer", "coin", "is_out"},
 	)
 
 	QueuedTasks = prometheus.NewGaugeVec(
@@ -84,9 +73,8 @@ func RegisterMetrics(namespace string) {
 	)
 
 	prometheus.MustRegister(ChannelBalance)
-	prometheus.MustRegister(ActiveVirtualChannels)
+	prometheus.MustRegister(ActiveConditionals)
+	prometheus.MustRegister(ActiveActions)
 	prometheus.MustRegister(QueuedTasks)
-	prometheus.MustRegister(ActiveVirtualChannelsCapacity)
-	prometheus.MustRegister(ActiveVirtualChannelsFee)
 	prometheus.MustRegister(WalletBalance)
 }

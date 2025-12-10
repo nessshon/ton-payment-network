@@ -8,16 +8,12 @@ import (
 	"encoding/base64"
 	"fmt"
 	"github.com/xssnick/ton-payment-network/pkg/log"
-	"github.com/xssnick/ton-payment-network/pkg/payments"
-	"github.com/xssnick/ton-payment-network/tonpayments/config"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
-	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"github.com/xssnick/tonutils-go/tl"
-	"github.com/xssnick/tonutils-go/tvm/cell"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,14 +29,6 @@ type PeerConnection struct {
 	lastQuery int64
 
 	mx sync.Mutex
-}
-
-type Service interface {
-	ReviewChannelConfig(prop transport.ProposeChannelConfig) (*address.Address, config.CoinConfig, error)
-	ProcessAction(ctx context.Context, key ed25519.PublicKey, lockId int64, channelAddr *address.Address, signedState payments.SignedSemiChannel, action transport.Action, updateProof *cell.Cell, fromWeb bool) (*payments.SignedSemiChannel, error)
-	ProcessActionRequest(ctx context.Context, key ed25519.PublicKey, channelAddr *address.Address, action transport.Action) ([]byte, error)
-	ProcessExternalChannelLock(ctx context.Context, key ed25519.PublicKey, addr *address.Address, id int64, lock bool) error
-	ProcessIsChannelLocked(ctx context.Context, key ed25519.PublicKey, addr *address.Address, id int64) error
 }
 
 type Server struct {
@@ -69,7 +57,7 @@ func NewServer(dht *dht.Client, gate *adnl.Gateway, key, channelKey ed25519.Priv
 	s.closeCtx, s.closer = context.WithCancel(context.Background())
 	s.gate.SetConnectionHandler(s.bootstrapPeerWrap)
 
-	go func() {
+	/*go func() {
 		for {
 			select {
 			case <-s.closeCtx.Done():
@@ -84,13 +72,14 @@ func NewServer(dht *dht.Client, gate *adnl.Gateway, key, channelKey ed25519.Priv
 
 						log.Debug().Str("source", "server").
 							Str("peer", base64.StdEncoding.EncodeToString(p.adnl.GetID())).
-							Msg("peer was not queried for 10 minutes, will be disconnected")
+							Msg("peer was not queried for 5 minutes, will be disconnected")
 					}
 				}
 				s.mx.Unlock()
 			}
 		}
-	}()
+	}()*/
+	// TODO: disconnect only when no active channels
 
 	if serverMode {
 		go func() {

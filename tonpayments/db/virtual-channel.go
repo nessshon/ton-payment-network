@@ -8,7 +8,7 @@ import (
 	"fmt"
 )
 
-func (d *DB) CreateVirtualChannelMeta(ctx context.Context, meta *VirtualChannelMeta) error {
+func (d *DB) CreateVirtualChannelMeta(ctx context.Context, meta *ConditionalMeta) error {
 	key := []byte("vch:" + base64.StdEncoding.EncodeToString(meta.Key))
 
 	return d.Transaction(ctx, func(ctx context.Context) error {
@@ -34,7 +34,7 @@ func (d *DB) CreateVirtualChannelMeta(ctx context.Context, meta *VirtualChannelM
 	})
 }
 
-func (d *DB) UpdateVirtualChannelMeta(ctx context.Context, meta *VirtualChannelMeta) error {
+func (d *DB) UpdateVirtualChannelMeta(ctx context.Context, meta *ConditionalMeta) error {
 	key := []byte("vch:" + base64.StdEncoding.EncodeToString(meta.Key))
 
 	return d.Transaction(ctx, func(ctx context.Context) error {
@@ -60,7 +60,7 @@ func (d *DB) UpdateVirtualChannelMeta(ctx context.Context, meta *VirtualChannelM
 	})
 }
 
-func (d *DB) GetVirtualChannelMeta(ctx context.Context, key []byte) (*VirtualChannelMeta, error) {
+func (d *DB) GetVirtualChannelMeta(ctx context.Context, key []byte) (*ConditionalMeta, error) {
 	tx := d.storage.GetExecutor(ctx)
 
 	data, err := tx.Get([]byte("vch:" + base64.StdEncoding.EncodeToString(key)))
@@ -71,7 +71,7 @@ func (d *DB) GetVirtualChannelMeta(ctx context.Context, key []byte) (*VirtualCha
 		return nil, fmt.Errorf("failed to get from db: %w", err)
 	}
 
-	var vc *VirtualChannelMeta
+	var vc *ConditionalMeta
 	if err = json.Unmarshal(data, &vc); err != nil {
 		return nil, fmt.Errorf("failed to decode json data: %w", err)
 	}

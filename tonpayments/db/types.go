@@ -1,15 +1,15 @@
 package db
 
 import (
-	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
-	"github.com/xssnick/ton-payment-network/tonpayments/config"
-	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 	"math/big"
 	"strconv"
@@ -31,31 +31,33 @@ type VirtualChannelEvent struct {
 }
 
 type ChannelHistoryActionTransferInData struct {
-	Amount string
-	From   []byte
+	Amounts map[string]string
+	From    []byte
 }
 
 type ChannelHistoryActionTransferOutData struct {
-	Amount string
-	To     []byte
+	Amounts map[string]string
+	To      []byte
 }
 
 type ChannelHistoryActionAmountData struct {
-	Amount string
+	IsTheir bool
+	Amounts map[string]string
 }
 
 type ChannelHistoryActionRentCapData struct {
-	Amount string
-	Fee    string
-	Till   int64
+	BalanceID string
+	Amount    string
+	Fee       string
+	Till      int64
 }
 
 type ChannelHistoryActionTxRequest struct {
-	Fee string
+	Fees map[string]string
 }
 
 type ChannelStatus uint8
-type VirtualChannelStatus uint8
+type ConditionalStatus uint8
 type ChannelHistoryEventType uint8
 
 const (
@@ -66,10 +68,7 @@ const (
 )
 
 const (
-	ChannelHistoryActionTopup ChannelHistoryEventType = iota + 1
-	ChannelHistoryActionTopupCapacity
-	ChannelHistoryActionWithdraw
-	ChannelHistoryActionWithdrawCapacity
+	ChannelHistoryActionBalanceChanged ChannelHistoryEventType = iota + 1
 	ChannelHistoryActionTransferIn
 	ChannelHistoryActionTransferOut
 	ChannelHistoryActionUncooperativeCloseStarted
@@ -80,34 +79,33 @@ const (
 )
 
 const (
-	VirtualChannelStateActive VirtualChannelStatus = iota + 1
-	VirtualChannelStateWantClose
-	VirtualChannelStateClosed
-	VirtualChannelStateWantRemove
-	VirtualChannelStateRemoved
-	VirtualChannelStatePending
+	ConditionalStateActive ConditionalStatus = iota + 1
+	ConditionalStateWantClose
+	ConditionalStateClosed
+	ConditionalStateWantRemove
+	ConditionalStateRemoved
+	ConditionalStatePending
 )
 
 var ErrAlreadyExists = errors.New("already exists")
 var ErrNotFound = errors.New("not found")
 var ErrChannelBusy = fmt.Errorf("channel is busy")
 
-type VirtualChannelMetaSide struct {
+type ConditionalMetaSide struct {
 	ChannelAddress        string
-	Capacity              string
-	Fee                   string
+	Conditional           *cell.Cell
 	UncooperativeDeadline time.Time
 	SafeDeadline          time.Time
 	SenderKey             []byte
 }
 
-type VirtualChannelMeta struct {
+type ConditionalMeta struct {
 	Key              []byte
-	Status           VirtualChannelStatus
-	Incoming         *VirtualChannelMetaSide
-	Outgoing         *VirtualChannelMetaSide
-	LastKnownResolve []byte
-	FinalDestination ed25519.PublicKey // known only to first initiator
+	Status           ConditionalStatus
+	Incoming         *ConditionalMetaSide
+	Outgoing         *ConditionalMetaSide
+	LastKnownResolve *cell.Cell
+	FinalDestination ed25519.PublicKey // known only to the first initiator
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -119,36 +117,60 @@ type ChannelHistoryItem struct {
 	Data   json.RawMessage
 }
 
+type PendingChannelState struct {
+	Seqno     uint64
+	OurData   AgreedData
+	TheirData AgreedData
+}
+
+type Side struct {
+	Address                 string
+	OnchainBalances         map[string]*big.Int
+	OnchainInfo             OnchainState
+	Data                    AgreedData
+	LockedDeposits          map[string]*payments.LockedDepositInfo
+	PendingOnchainTransfers map[string]*payments.PendingMessageInfo
+	LatestProcessedLT       uint64
+	LatestWalletSeqno       uint32
+	LatestCommitedSeqno     uint64
+	LastProcessedTxAt       time.Time
+	ActiveOnchain           bool
+	IsSettlementFinalized   bool
+}
+
+type PendingCommit struct {
+	Seqno   uint64
+	Message *cell.Cell
+}
+
+type PendingDeposit struct {
+	Amount     *big.Int
+	ExpectFrom *address.Address
+}
+
 type Channel struct {
 	ID                     []byte
-	Address                string
-	ExtraCurrencyID        uint32
-	JettonAddress          string
 	Status                 ChannelStatus
 	WeLeft                 bool
-	OurOnchain             OnchainState
-	TheirOnchain           OnchainState
 	SafeOnchainClosePeriod int64
 
-	AcceptingActions bool
-	WebPeer          bool
-	ActiveOnchain    bool
-	UrgentForUs      bool
+	AcceptingActions   bool
+	WebPeer            bool
+	UrgentForUs        bool
+	UncoopCloseStarted bool
 
-	Our   Side
-	Their Side
-
-	OurLockedDeposit   *LockedDepositInfo
-	TheirLockedDeposit *LockedDepositInfo
+	SignedState *cell.Cell
+	Our         Side
+	Their       Side
 
 	// InitAt - initialization or reinitialization time
-	InitAt          time.Time
-	CreatedAt       time.Time
-	LastProcessedLT uint64
+	InitAt    time.Time
+	CreatedAt time.Time
 
 	CodeHash        []byte
 	InitMessageBody *cell.Cell
 	InitialData     *cell.Cell
+	PendingCommit   *PendingCommit
 
 	DBVersion int64
 
@@ -156,94 +178,24 @@ type Channel struct {
 }
 
 type OnchainState struct {
-	Key            ed25519.PublicKey
-	CommittedSeqno uint64
-	WalletAddress  string
-	Deposited      *big.Int
-	Withdrawn      *big.Int
-	Sent           *big.Int
+	Key ed25519.PublicKey
 }
 
-type LockedDepositInfo struct {
-	Amount *big.Int
-	Till   time.Time
-	Used   *big.Int
-}
-
-type Side struct {
-	payments.SignedSemiChannel
-	Conditionals    *cell.Dictionary
-	PendingWithdraw *big.Int
+type AgreedData struct {
+	Conditionals *cell.Dictionary
+	ActionStates *cell.Dictionary
 }
 
 var ErrNewerStateIsKnown = errors.New("newer state is already known")
 
-func (ld *LockedDepositInfo) Available() *big.Int {
-	if ld == nil || ld.Till.Before(time.Now()) || ld.Amount.Cmp(ld.Used) <= 0 {
-		return big.NewInt(0)
-	}
-	return new(big.Int).Sub(ld.Amount, ld.Used)
-}
-
-func NewSide(channelId []byte, seqno, counterpartySeqno uint64) Side {
-	return Side{
-		SignedSemiChannel: payments.SignedSemiChannel{
-			Signature: payments.Signature{
-				Value: make([]byte, 64),
-			},
-			State: payments.SemiChannel{
-				ChannelID: channelId,
-				Data: payments.SemiChannelBody{
-					Seqno:            seqno,
-					Sent:             tlb.ZeroCoins,
-					ConditionalsHash: make([]byte, 32),
-				},
-				CounterpartyData: &payments.SemiChannelBody{
-					Seqno:            counterpartySeqno,
-					Sent:             tlb.ZeroCoins,
-					ConditionalsHash: make([]byte, 32),
-				},
-			},
-		},
-		PendingWithdraw: big.NewInt(0),
+func NewAgreedData() AgreedData {
+	return AgreedData{
+		Conditionals: cell.NewDict(256),
+		ActionStates: cell.NewDict(256),
 	}
 }
 
-func (s *Side) IsReady() bool {
-	return !bytes.Equal(s.Signature.Value, make([]byte, 64))
-}
-
-func (s *Side) Copy() *Side {
-	sd := &Side{
-		SignedSemiChannel: payments.SignedSemiChannel{
-			Signature: payments.Signature{
-				Value: append([]byte{}, s.Signature.Value...),
-			},
-			State: payments.SemiChannel{
-				ChannelID: append([]byte{}, s.State.ChannelID...),
-				Data: payments.SemiChannelBody{
-					Seqno:            s.State.Data.Seqno,
-					Sent:             s.State.Data.Sent,
-					ConditionalsHash: s.State.Data.ConditionalsHash,
-				},
-			},
-		},
-		Conditionals:    s.Conditionals.Copy(),
-		PendingWithdraw: s.PendingWithdraw,
-	}
-
-	if s.State.CounterpartyData != nil {
-		sd.State.CounterpartyData = &payments.SemiChannelBody{
-			Seqno:            s.State.CounterpartyData.Seqno,
-			Sent:             s.State.CounterpartyData.Sent,
-			ConditionalsHash: s.State.CounterpartyData.ConditionalsHash,
-		}
-	}
-
-	return sd
-}
-
-func (s *Side) UnmarshalJSON(bytes []byte) error {
+func (s *AgreedData) UnmarshalJSON(bytes []byte) error {
 	str, err := strconv.Unquote(string(bytes))
 	if err != nil {
 		return err
@@ -260,100 +212,173 @@ func (s *Side) UnmarshalJSON(bytes []byte) error {
 	}
 
 	sl := cl.BeginParse()
-	ssc, err := sl.LoadRef()
+
+	s.Conditionals, err = sl.LoadDict(256)
 	if err != nil {
 		return err
 	}
 
-	s.Conditionals, err = sl.LoadDict(32)
+	s.ActionStates, err = sl.LoadDict(256)
 	if err != nil {
 		return err
 	}
 
-	s.PendingWithdraw, err = sl.LoadBigCoins()
-	if err != nil {
-		return err
-	}
-
-	return tlb.LoadFromCell(&s.SignedSemiChannel, ssc)
+	return nil
 }
 
-func (s *Side) MarshalJSON() ([]byte, error) {
-	bts, err := tlb.ToCell(s.SignedSemiChannel)
+func (s *AgreedData) MarshalJSON() ([]byte, error) {
+	c := cell.BeginCell().
+		MustStoreDict(s.Conditionals).
+		MustStoreDict(s.ActionStates).
+		EndCell()
+
+	return []byte(strconv.Quote(base64.StdEncoding.EncodeToString(c.ToBOC()))), nil
+}
+
+func (ch *Channel) SideA() *Side {
+	if ch.WeLeft {
+		return &ch.Our
+	}
+	return &ch.Their
+}
+
+func (ch *Channel) SideB() *Side {
+	if ch.WeLeft {
+		return &ch.Their
+	}
+	return &ch.Our
+}
+
+func (ch *Channel) LoadSignedState() *payments.StateBodySigned {
+	if ch.SignedState == nil {
+		return &payments.StateBodySigned{
+			SignatureA: payments.Signature{
+				Value: make([]byte, 64),
+			},
+			SignatureB: payments.Signature{
+				Value: make([]byte, 64),
+			},
+			Body: payments.StateBody{
+				ChannelID: ch.ID,
+				Seqno:     ch.Our.LatestCommitedSeqno,
+				A: payments.StateSide{
+					ConditionalsHash: make([]byte, 32),
+					ActionStatesHash: make([]byte, 32),
+				},
+				B: payments.StateSide{
+					ConditionalsHash: make([]byte, 32),
+					ActionStatesHash: make([]byte, 32),
+				},
+			},
+		}
+	}
+
+	var state payments.StateBodySigned
+	if err := payments.LoadState(&state, ch.SignedState); err != nil {
+		panic("corrupted state:" + err.Error())
+	}
+
+	return &state
+}
+
+func (ch *Channel) CalcBalance(ctx context.Context, isTheir bool, resolver payments.FullResolver) (map[string]*payments.BalanceInfo, error) {
+	ch.mx.RLock()
+	defer ch.mx.RUnlock()
+
+	s1, s2 := ch.Our, ch.Their
+	if isTheir {
+		s1, s2 = s2, s1
+	}
+
+	// TODO: cache and precalc
+	balances := make(map[string]*payments.BalanceInfo)
+	for _, config := range resolver.GetKnownBalanceTypes() {
+		balances[config.BalanceID] = payments.NewBalanceInfo(config)
+	}
+
+	if s1.ActiveOnchain {
+		for id, b := range s1.OnchainBalances {
+			balances[id].Onchain = new(big.Int).Set(b)
+		}
+	}
+
+	s1Actions, err := s1.Data.ActionStates.LoadAll()
 	if err != nil {
 		return nil, err
 	}
 
-	c := cell.BeginCell().MustStoreRef(bts).MustStoreDict(s.Conditionals).MustStoreBigCoins(s.PendingWithdraw).EndCell()
-	return []byte(strconv.Quote(base64.StdEncoding.EncodeToString(c.ToBOC()))), nil
-}
-
-func (ch *Channel) UpdatePendingWithdraw(isTheir bool, value *big.Int) error {
-	s := &ch.Our
-	sOnchain := &ch.OurOnchain
-	if isTheir {
-		s = &ch.Their
-		sOnchain = &ch.TheirOnchain
-	}
-
-	if value.Cmp(s.PendingWithdraw) < 0 || value.Cmp(sOnchain.Withdrawn) < 0 {
-		return fmt.Errorf("new pending withdraw is less than current")
-	}
-	s.PendingWithdraw.Set(value)
-	return nil
-}
-
-func (ch *Channel) CalcBalance(isTheir bool) (*big.Int, *big.Int, error) {
-	// TODO: cache calculated
-
-	ch.mx.RLock()
-	defer ch.mx.RUnlock()
-
-	s1, s1chain, s2, s2chain := ch.Our, ch.OurOnchain, ch.Their, ch.TheirOnchain
-	if isTheir {
-		s1, s2 = s2, s1
-		s1chain, s2chain = s2chain, s1chain
-	}
-
-	maxWithdraw := s1chain.Withdrawn
-	if maxWithdraw.Cmp(s1.PendingWithdraw) < 0 {
-		maxWithdraw = s1.PendingWithdraw
-	}
-
-	balance := new(big.Int).Add(s2.State.Data.Sent.Nano(), new(big.Int).Sub(s1chain.Deposited, maxWithdraw))
-	balance = balance.Sub(balance, s1.State.Data.Sent.Nano())
-
-	locked := big.NewInt(0)
-	if s1.PendingWithdraw.Sign() > 0 && s1.PendingWithdraw.Cmp(s1chain.Withdrawn) > 0 {
-		locked = locked.Sub(s1.PendingWithdraw, s1chain.Withdrawn)
-	}
-
-	if s1.Conditionals.IsEmpty() {
-		return balance, locked, nil
-	}
-
-	all, err := s1.Conditionals.LoadAll()
+	s1Conditionals, err := s1.Data.Conditionals.LoadAll()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load conditions: %w", err)
+		return nil, err
 	}
 
-	for _, kv := range all {
-		vch, err := payments.ParseVirtualChannelCond(kv.Value)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to parse condition %d: %w", kv.Key.MustLoadUInt(32), err)
+	s2Actions, err := s2.Data.ActionStates.LoadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	s2Conditionals, err := s2.Data.Conditionals.LoadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, tr := range s1.PendingOnchainTransfers {
+		for bid, amt := range tr.Amounts {
+			b := balances[bid]
+			b.OnHold.Add(b.OnHold, amt)
 		}
-		balance = balance.Sub(balance, vch.Capacity)
-		balance = balance.Sub(balance, vch.Fee)
-		balance = balance.Add(balance, vch.Prepay)
-
-		locked = locked.Add(locked, vch.Capacity)
-		locked = locked.Add(locked, vch.Fee)
-		locked = locked.Sub(locked, vch.Prepay)
 	}
-	return balance, locked, nil
+
+	for _, v := range s1Actions {
+		actId := v.Key.MustLoadSlice(256)
+		act, err := resolver.ResolveAction(ctx, actId)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve s1 action %s: %w", hex.EncodeToString(actId), err)
+		}
+
+		if err = act.EmulateBalance(v.Value.MustToCell(), balances, true); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, v := range s2Actions {
+		actId := v.Key.MustLoadSlice(256)
+		act, err := resolver.ResolveAction(ctx, actId)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve s2 action %s: %w", hex.EncodeToString(actId), err)
+		}
+
+		if err = act.EmulateBalance(v.Value.MustToCell(), balances, false); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, v := range s1Conditionals {
+		c, err := payments.CodeToConditional(ctx, v.Value.MustToCell(), resolver)
+		if err != nil {
+			return nil, err
+		}
+
+		if err = c.EmulateBalance(balances, true); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, v := range s2Conditionals {
+		c, err := payments.CodeToConditional(ctx, v.Value.MustToCell(), resolver)
+		if err != nil {
+			return nil, err
+		}
+
+		if err = c.EmulateBalance(balances, false); err != nil {
+			return nil, err
+		}
+	}
+
+	return balances, nil
 }
 
-func (ch *Channel) CalcDepositFee(cc *config.CoinConfig, newAmount *big.Int, till time.Time, isTheir bool) *big.Int {
+func (ch *Channel) CalcDepositFee(cc *payments.CoinConfig, newAmount *big.Int, till time.Time, isTheir bool) *big.Int {
 	const periodSec = 30 * 24 * 60 * 60 // 30 days in seconds
 
 	now := time.Now()
@@ -363,10 +388,11 @@ func (ch *Channel) CalcDepositFee(cc *config.CoinConfig, newAmount *big.Int, til
 	}
 
 	// select whose deposit info to use
-	ld := ch.TheirLockedDeposit
+	dep := ch.Their.LockedDeposits
 	if !isTheir {
-		ld = ch.OurLockedDeposit
+		dep = ch.Our.LockedDeposits
 	}
+	ld := dep[cc.BalanceID]
 
 	// determine the old locked amount and its "used" and "until"
 	oldAmount := big.NewInt(0)
@@ -382,9 +408,6 @@ func (ch *Channel) CalcDepositFee(cc *config.CoinConfig, newAmount *big.Int, til
 	if delta.Sign() <= 0 {
 		return big.NewInt(0)
 	}
-
-	// fixed deposit fee
-	depFee := cc.MustAmountDecimal(cc.VirtualTunnelConfig.CapacityDepositFee).Nano()
 
 	// fee percent per 30 days
 	percentRat := new(big.Rat).SetFloat64(cc.VirtualTunnelConfig.CapacityFeePercentPer30Days / 100.0)
@@ -428,58 +451,20 @@ func (ch *Channel) CalcDepositFee(cc *config.CoinConfig, newAmount *big.Int, til
 	capFee := new(big.Int).Quo(numAdd, den)
 
 	// add fixed deposit fee
-	result := new(big.Int).Add(capFee, depFee)
+	result := new(big.Int).Add(capFee, cc.VirtualTunnelConfig.CapacityDepositFee.Nano())
 	return result
 }
 
-func (ch *VirtualChannelMeta) GetKnownResolve() *payments.VirtualChannelState {
-	if ch.LastKnownResolve == nil {
-		return nil
+func (ch *ConditionalMeta) AddKnownResolve(cond payments.Conditional, state *cell.Cell) error {
+	if cond.GetDeadline().Before(time.Now()) {
+		return fmt.Errorf("conditional has expired")
 	}
 
-	cll, err := cell.FromBOC(ch.LastKnownResolve)
-	if err != nil {
-		return nil
+	if err := cond.ValidateState(ch.LastKnownResolve, state); err != nil {
+		return fmt.Errorf("failed to validate add state: %w", err)
 	}
 
-	var st payments.VirtualChannelState
-	if err = tlb.LoadFromCell(&st, cll.BeginParse()); err != nil {
-		return nil
-	}
-
-	if !st.Verify(ch.Key) {
-		return nil
-	}
-	return &st
-}
-
-func (ch *VirtualChannelMeta) AddKnownResolve(state *payments.VirtualChannelState) error {
-	if !state.Verify(ch.Key) {
-		return fmt.Errorf("incorrect signature")
-	}
-
-	if ch.LastKnownResolve != nil {
-		cl, err := cell.FromBOC(ch.LastKnownResolve)
-		if err != nil {
-			return err
-		}
-
-		var oldState payments.VirtualChannelState
-		if err = tlb.LoadFromCell(&oldState, cl.BeginParse()); err != nil {
-			return fmt.Errorf("failed to parse old start: %w", err)
-		}
-
-		if oldState.Amount.Cmp(state.Amount) > 0 {
-			return ErrNewerStateIsKnown
-		}
-	}
-
-	cl, err := tlb.ToCell(state)
-	if err != nil {
-		return err
-	}
-
-	ch.LastKnownResolve = cl.ToBOC()
+	ch.LastKnownResolve = state
 	return nil
 }
 
@@ -487,10 +472,7 @@ func (h *ChannelHistoryItem) ParseData() any {
 	var dst any
 
 	switch h.Action {
-	case ChannelHistoryActionTopup,
-		ChannelHistoryActionTopupCapacity,
-		ChannelHistoryActionWithdraw,
-		ChannelHistoryActionWithdrawCapacity:
+	case ChannelHistoryActionBalanceChanged:
 		dst = &ChannelHistoryActionAmountData{}
 	case ChannelHistoryActionTransferIn:
 		dst = &ChannelHistoryActionTransferInData{}

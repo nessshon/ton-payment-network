@@ -5,6 +5,7 @@ import (
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
+	"math/big"
 )
 
 type Account struct {
@@ -124,62 +125,27 @@ func (a *Account) MarshalJSON() ([]byte, error) {
 }
 
 type Transaction struct {
-	Hash           []byte
-	PrevTxHash     []byte
-	LT             uint64
-	PrevTxLT       uint64
-	At             int64
-	Success        bool
-	InternalInBody *cell.Cell
+	Hash       []byte
+	PrevTxHash []byte
+	LT         uint64
+	PrevTxLT   uint64
+	At         int64
+	Success    bool
+
+	In  MsgInfo
+	Out []MsgInfo
 }
 
-type transactionRaw struct {
-	Hash           []byte
-	PrevTxHash     []byte
-	LT             uint64
-	PrevTxLT       uint64
-	At             int64
-	Success        bool
-	InternalInBody []byte
+type MsgInfo struct {
+	Type    tlb.MsgType
+	From    string
+	To      string
+	MsgHash []byte
+	Body    *cell.Cell
 }
 
-func (t *Transaction) UnmarshalJSON(bytes []byte) error {
-	var temp transactionRaw
-	var err error
-	if err = json.Unmarshal(bytes, &temp); err != nil {
-		return err
-	}
-
-	t.Hash = temp.Hash
-	t.PrevTxHash = temp.PrevTxHash
-	t.LT = temp.LT
-	t.PrevTxLT = temp.PrevTxLT
-	t.At = temp.At
-	t.Success = temp.Success
-
-	if len(temp.InternalInBody) != 0 {
-		t.InternalInBody, err = cell.FromBOC(temp.InternalInBody)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (t *Transaction) MarshalJSON() ([]byte, error) {
-	return json.Marshal(&transactionRaw{
-		Hash:       t.Hash,
-		PrevTxHash: t.PrevTxHash,
-		LT:         t.LT,
-		PrevTxLT:   t.PrevTxLT,
-		At:         t.At,
-		Success:    t.Success,
-		InternalInBody: func() []byte {
-			if t.InternalInBody != nil {
-				return t.InternalInBody.ToBOC()
-			}
-			return nil
-		}(),
-	})
+type AccountBalances struct {
+	Ton     *big.Int
+	EC      map[uint32]*big.Int
+	Jettons map[string]*big.Int
 }

@@ -59,6 +59,12 @@ func (e *Event) Time(k string, t time.Time) *Event {
 }
 func (e *Event) Dur(k string, d time.Duration) *Event { e.fields[k] = d.String(); return e }
 func (e *Event) Bytes(k string, b []byte) *Event      { e.fields[k] = hex.EncodeToString(b); return e }
+func (e *Event) Fields(list map[string]any) *Event {
+	for s, a := range list {
+		e.fields[s] = a
+	}
+	return e
+}
 
 var console = js.Global().Get("console")
 

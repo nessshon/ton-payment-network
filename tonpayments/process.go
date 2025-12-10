@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
+	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/address"
@@ -21,18 +22,19 @@ import (
 	"time"
 )
 
-// Channel flow:
-// 1. User calls ProposeAction with open virtual channel to node
+// Tunnel channel flow:
+// 1. User calls ProposeAction with add conditional to node (action must be added before)
 // 2. Node triggers ProcessAction and then ProposeAction to receiver
 // 3. Receiver triggers ProcessAction, now channel is open
 //
-// 1. When receiver wants to close channel, he calls RequestActions using CloseVirtualAction with channel and state
-// 2. Node triggers ProcessActionRequest, validates data, and responds with ProposeAction with remove condition and coins transfer.
+// 1. When receiver wants to execute (close) conditional, he calls RequestActions using ExecuteConditionalAction with channel and state
+// 2. Node triggers ProcessActionRequest, validates data, and responds with ProposeAction with "execute conditional"
+//		and hash of state with removed condition and transferred coins.
 // 3. Receiver triggers ProcessAction and approves
 // 4. Node in chain repeats this steps in background, if it is not initial sender.
 
 func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lockId int64, channelAddr *address.Address,
-	signedState payments.SignedSemiChannel, action transport.Action, updateProof *cell.Cell, fromWeb bool) (*payments.SignedSemiChannel, error) {
+	proposedState payments.StateBodySigned, action transport.Action, fromWeb bool) (*payments.StateBodySigned, error) {
 	lockId = -lockId // force negate, to not collide with our locks
 
 	channel, _, unlock, err := s.AcquireChannel(ctx, channelAddr.String(), lockId)
@@ -53,7 +55,7 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 	}
 	defer unlock()
 
-	if channel.Status != db.ChannelStateActive {
+	if channel.Status == db.ChannelStateInactive {
 		if s.discoveryMx.TryLock() {
 			go func() {
 				// our party proposed action with channel we don't know,
@@ -69,65 +71,72 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		return nil, fmt.Errorf("channel is currently not accepting new actions")
 	}
 
-	if !bytes.Equal(key, channel.TheirOnchain.Key) {
+	if !bytes.Equal(key, channel.Their.OnchainInfo.Key) {
 		return nil, fmt.Errorf("incorrect channel key")
 	}
 
-	if err = signedState.Verify(channel.TheirOnchain.Key); err != nil {
+	currentState := channel.LoadSignedState()
+
+	var theirSideProposal, ourSideProposal payments.StateSide
+	var keyA, keyB ed25519.PublicKey
+	if channel.WeLeft {
+		keyB = channel.Their.OnchainInfo.Key
+		theirSideProposal = proposedState.Body.B
+		ourSideProposal = proposedState.Body.A
+	} else {
+		keyA = channel.Their.OnchainInfo.Key
+		theirSideProposal = proposedState.Body.A
+		ourSideProposal = proposedState.Body.B
+	}
+
+	// verify their side signature
+	if err = proposedState.Verify(keyA, keyB); err != nil {
 		return nil, fmt.Errorf("failed to verify passed state: %w", err)
 	}
 
-	if signedState.State.Data.Sent.Nano().Cmp(channel.Their.State.Data.Sent.Nano()) == -1 {
-		return nil, fmt.Errorf("amount decrease is not allowed")
-	}
-
-	if updateProof == nil && !bytes.Equal(signedState.State.Data.ConditionalsHash, make([]byte, 32)) {
-		return nil, fmt.Errorf("update proof can be empty only when hash is zero")
-	}
-
-	condProposal := cell.NewDict(32)
-	if updateProof != nil {
-		proofBody, err := cell.UnwrapProof(updateProof, signedState.State.Data.ConditionalsHash)
-		if err != nil {
-			return nil, fmt.Errorf("incorrect update proof: %w", err)
-		}
-		condProposal, err = proofBody.BeginParse().ToDict(32)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load update proof dict: %w", err)
-		}
-	}
-
-	cc, err := s.ResolveCoinConfig(channel.JettonAddress, channel.ExtraCurrencyID, true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve coin config: %w", err)
-	}
-
 	var toExecute func(ctx context.Context) error
-	if signedState.State.Data.Seqno == channel.Their.State.Data.Seqno {
-		// idempotency check
-		channel.Their.Signature = signedState.Signature
-		if err = channel.Their.Verify(channel.TheirOnchain.Key); err != nil {
-			return nil, fmt.Errorf("inconsistent state, this seqno with different content was already committed")
+	if proposedState.Body.Seqno == currentState.Body.Seqno {
+		// idempotency check, set his signature to our state and verify
+		if channel.WeLeft {
+			currentState.SignatureB = proposedState.SignatureB
+		} else {
+			currentState.SignatureA = proposedState.SignatureA
 		}
-		return &channel.Our.SignedSemiChannel, nil
+		if err = currentState.Verify(channel.SideA().OnchainInfo.Key, channel.SideB().OnchainInfo.Key); err != nil {
+			log.Debug().Str("a_actions_hash", base64.StdEncoding.EncodeToString(currentState.Body.A.ActionStatesHash)).
+				Str("b_actions_hash", base64.StdEncoding.EncodeToString(currentState.Body.B.ActionStatesHash)).
+				Str("a_cond_hash", base64.StdEncoding.EncodeToString(currentState.Body.A.ConditionalsHash)).
+				Str("b_cond_hash", base64.StdEncoding.EncodeToString(currentState.Body.B.ConditionalsHash)).
+				Str("seqno", fmt.Sprint(currentState.Body.Seqno)).
+				Msg("cur state")
+
+			log.Debug().Str("a_actions_hash", base64.StdEncoding.EncodeToString(proposedState.Body.A.ActionStatesHash)).
+				Str("b_actions_hash", base64.StdEncoding.EncodeToString(proposedState.Body.B.ActionStatesHash)).
+				Str("a_cond_hash", base64.StdEncoding.EncodeToString(proposedState.Body.A.ConditionalsHash)).
+				Str("b_cond_hash", base64.StdEncoding.EncodeToString(proposedState.Body.B.ConditionalsHash)).
+				Str("seqno", fmt.Sprint(proposedState.Body.Seqno)).
+				Msg("prop state")
+			return nil, fmt.Errorf("inconsistent state, seqno %d with different content was already committed: %w", proposedState.Body.Seqno, err)
+		}
+		return currentState, nil
 	}
 
-	if signedState.State.Data.Seqno != channel.Their.State.Data.Seqno+1 {
-		return nil, fmt.Errorf("incorrect state seqno %d, want %d", signedState.State.Data.Seqno, channel.Their.State.Data.Seqno+1)
+	if proposedState.Body.Seqno != currentState.Body.Seqno+1 {
+		return nil, fmt.Errorf("incorrect state seqno %d, want %d", proposedState.Body.Seqno, currentState.Body.Seqno+1)
 	}
 
 	log.Debug().Str("action", reflect.TypeOf(action).String()).Msg("action process")
 
 	switch data := action.(type) {
+	case transport.RemoveActionAction:
+		return nil, fmt.Errorf("not implemented")
 	case transport.IncrementStatesAction:
-		hasStates := channel.Our.IsReady() && channel.Their.IsReady()
-
 		toExecute = func(ctx context.Context) error {
 			if data.WantResponse {
-				err = s.db.CreateTask(ctx, PaymentsTaskPool, "increment-state", channel.Address,
-					"increment-state-"+channel.Address+"-"+fmt.Sprint(channel.Our.State.Data.Seqno),
+				err = s.db.CreateTask(ctx, PaymentsTaskPool, "increment-state", channel.Our.Address,
+					"increment-state-"+channel.Our.Address+"-"+fmt.Sprint(proposedState.Body.Seqno),
 					db.IncrementStatesTask{
-						ChannelAddress: channel.Address,
+						ChannelAddress: channel.Our.Address,
 						WantResponse:   false,
 					}, nil, nil,
 				)
@@ -136,140 +145,108 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 				}
 			}
 
-			if !hasStates {
-				log.Info().Str("address", channel.Address).
-					Str("with", base64.StdEncoding.EncodeToString(channel.TheirOnchain.Key)).
+			if channel.SignedState == nil {
+				log.Info().Str("address", channel.Our.Address).
+					Str("with", base64.StdEncoding.EncodeToString(channel.Their.OnchainInfo.Key)).
 					Msg("channel states exchanged, ready to use")
 			}
 			return nil
 		}
-	case transport.RemoveVirtualAction:
-		_, _, err = payments.FindVirtualChannel(condProposal, data.Key)
-		if err != nil && !errors.Is(err, payments.ErrNotFound) {
-			return nil, fmt.Errorf("failed to find virtual channel in their new state: %w", err)
-		}
-		if err == nil {
-			return nil, fmt.Errorf("condition should be removed to unlock")
-		}
-
-		index, vch, err := payments.FindVirtualChannel(channel.Their.Conditionals, data.Key)
+	case transport.RemoveConditionalAction:
+		index, vch, err := payments.FindConditional(ctx, channel.Their.Data.Conditionals, data.ID, s)
 		if err != nil {
 			if errors.Is(err, payments.ErrNotFound) {
 				// idempotency
-				return &channel.Our.SignedSemiChannel, nil
+				break
 			}
 			return nil, fmt.Errorf("failed to find virtual channel in their prev state: %w", err)
 		}
 
-		meta, err := s.db.GetVirtualChannelMeta(context.Background(), vch.Key)
+		meta, err := s.db.GetVirtualChannelMeta(context.Background(), vch.GetKey())
 		if err != nil {
 			return nil, fmt.Errorf("failed to load virtual channel meta: %w", err)
 		}
 
-		if vch.Deadline >= time.Now().UTC().Unix() && meta.Status != db.VirtualChannelStateWantRemove {
+		if vch.GetDeadline().Before(time.Now()) && meta.Status != db.ConditionalStateWantRemove {
 			return nil, fmt.Errorf("virtual channel is not expired")
 		}
 
-		if err = channel.Their.Conditionals.DeleteIntKey(index); err != nil {
+		if err = channel.Their.Data.Conditionals.Delete(index); err != nil {
 			return nil, fmt.Errorf("failed to remove condition with index %s: %w", index.String(), err)
 		}
 
 		toExecute = func(ctx context.Context) error {
-			meta.Status = db.VirtualChannelStateRemoved
+			meta.Status = db.ConditionalStateRemoved
 			meta.UpdatedAt = time.Now()
 			if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
 				return fmt.Errorf("failed to update virtual channel meta: %w", err)
 			}
 
 			if s.webhook != nil {
-				if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeRemove, meta, cc); err != nil {
+				if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeRemove, meta); err != nil {
 					return fmt.Errorf("failed to push virtual channel close event: %w", err)
 				}
 			}
 
-			log.Info().Str("key", base64.StdEncoding.EncodeToString(data.Key)).Msg("virtual channel removed")
+			log.Info().Str("id", base64.StdEncoding.EncodeToString(data.ID)).Msg("conditional removed")
 			return nil
 		}
-	case transport.ConfirmCloseAction:
-		_, _, err = payments.FindVirtualChannel(condProposal, data.Key)
-		if err != nil && !errors.Is(err, payments.ErrNotFound) {
-			return nil, fmt.Errorf("failed to find virtual channel in their new state: %w", err)
-		}
-		if err == nil {
-			return nil, fmt.Errorf("condition should be removed to close")
-		}
-
-		index, vch, err := payments.FindVirtualChannel(channel.Their.Conditionals, data.Key)
+	case transport.ConfirmExecuteConditionalAction:
+		index, cond, err := payments.FindConditional(ctx, channel.Their.Data.Conditionals, data.ID, s)
 		if err != nil {
 			if errors.Is(err, payments.ErrNotFound) {
 				// idempotency
-				return &channel.Our.SignedSemiChannel, nil
+				break
 			}
 			return nil, fmt.Errorf("failed to find virtual channel in their prev state: %w", err)
 		}
 
-		balanceDiff := new(big.Int).Sub(signedState.State.Data.Sent.Nano(), channel.Their.State.Data.Sent.Nano())
-
-		var vState payments.VirtualChannelState
-		if err = tlb.LoadFromCell(&vState, data.State.BeginParse()); err != nil {
-			return nil, fmt.Errorf("failed to load virtual channel state cell: %w", err)
-		}
-
-		if !vState.Verify(vch.Key) {
-			return nil, fmt.Errorf("incorrect channel state signature")
-		}
-
-		if vState.Amount.Cmp(vch.Capacity) > 0 {
-			return nil, fmt.Errorf("amount cannot be > capacity")
-		}
-
-		needAmt := new(big.Int).Add(vState.Amount, vch.Fee)
-		needAmt = needAmt.Sub(needAmt, vch.Prepay)
-
-		if needAmt.Sign() < 0 {
-			// prepaid more than actual, we consider diff as our earning because of user's strange behave
-			needAmt.SetInt64(0)
-		}
-
-		if needAmt.Cmp(balanceDiff) > 0 {
-			return nil, fmt.Errorf("incorrect amount unlocked: %s instead of %s", balanceDiff.String(), needAmt.String())
-		}
-
-		meta, err := s.db.GetVirtualChannelMeta(context.Background(), vch.Key)
+		meta, err := s.db.GetVirtualChannelMeta(ctx, cond.GetKey())
 		if err != nil {
 			return nil, fmt.Errorf("failed to load virtual channel meta: %w", err)
 		}
 
-		if meta.Status != db.VirtualChannelStateWantClose {
+		if meta.Status != db.ConditionalStateWantClose {
 			return nil, fmt.Errorf("virtual channel close was not requested")
 		}
 
-		if res := meta.GetKnownResolve(); res != nil {
-			if res.Amount.Cmp(vState.Amount) > 0 {
-				return nil, fmt.Errorf("outdated virtual channel state")
-			}
-		} else {
-			return nil, fmt.Errorf("resolve is unknown on node side")
+		if err = meta.AddKnownResolve(cond, data.State); err != nil {
+			return nil, fmt.Errorf("failed to add resolve: %w", err)
 		}
 
-		if err = channel.Their.Conditionals.DeleteIntKey(index); err != nil {
+		actId := cond.GetAction().IDCell()
+		actBefore, err := channel.Their.Data.ActionStates.LoadValue(actId)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load before action state: %w", err)
+		}
+
+		newActState, err := cond.Execute(actBefore.MustToCell(), data.State, channel.Their.LockedDeposits)
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute condition: %w", err)
+		}
+
+		if err = channel.Their.Data.Conditionals.Delete(index); err != nil {
 			return nil, fmt.Errorf("failed to remove condition with index %s: %w", index.String(), err)
 		}
 
-		if channel.TheirLockedDeposit != nil {
-			// mark part of the rented deposit as used
-			channel.TheirLockedDeposit.Used.Add(channel.TheirLockedDeposit.Used, balanceDiff)
+		if err = channel.Their.Data.ActionStates.Set(actId, newActState); err != nil {
+			return nil, fmt.Errorf("failed to update action state: %w", err)
+		}
+
+		balanceDiff, err := cond.GetAction().StatesDiff(actBefore.MustToCell(), newActState)
+		if err != nil {
+			return nil, fmt.Errorf("failed to calc balance diff: %w", err)
 		}
 
 		toExecute = func(ctx context.Context) error {
-			meta.Status = db.VirtualChannelStateClosed
+			meta.Status = db.ConditionalStateClosed
 			meta.UpdatedAt = time.Now()
 			if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
 				return fmt.Errorf("failed to update virtual channel meta: %w", err)
 			}
 
 			if s.webhook != nil {
-				if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeClose, meta, cc); err != nil {
+				if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeClose, meta); err != nil {
 					return fmt.Errorf("failed to push virtual channel close event: %w", err)
 				}
 			}
@@ -280,8 +257,8 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 			}
 
 			evData := db.ChannelHistoryActionTransferInData{
-				Amount: vState.Amount.String(),
-				From:   senderKey,
+				Amounts: s.formatDiff(balanceDiff),
+				From:    senderKey,
 			}
 
 			jsonData, err := json.Marshal(evData)
@@ -296,181 +273,161 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 				return fmt.Errorf("failed to create channel event: %w", err)
 			}
 
-			log.Info().Str("key", base64.StdEncoding.EncodeToString(data.Key)).
-				Str("capacity", tlb.MustFromNano(vch.Capacity, int(cc.Decimals)).String()).
-				Str("fee", tlb.MustFromNano(vch.Fee, int(cc.Decimals)).String()).
-				Str("prepay", tlb.MustFromNano(vch.Prepay, int(cc.Decimals)).String()).
-				Msg("virtual channel closed")
+			log.Info().Fields(cond.GetLogInfo()).
+				Msg("conditional executed")
 
 			return nil
 		}
 	case transport.CommitVirtualAction:
-		_, vchNew, err := payments.FindVirtualChannel(condProposal, data.Key)
-		if err != nil {
-			return nil, fmt.Errorf("failed to find virtual channel in their new state: %w", err)
-		}
-
-		index, vchOld, err := payments.FindVirtualChannel(channel.Their.Conditionals, data.Key)
+		idx, cond, err := payments.FindConditional(ctx, channel.Their.Data.Conditionals, data.ID, s)
 		if err != nil {
 			return nil, fmt.Errorf("failed to find virtual channel in their old state: %w", err)
 		}
 
-		prepayAmt := new(big.Int).Sub(vchNew.Prepay, vchOld.Prepay)
-		if prepayAmt.Sign() < 0 {
-			return nil, fmt.Errorf("prepay cannot be decreased")
+		newCond, err := payments.CodeToConditional(ctx, data.UpdatedConditional, s)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode updated conditional: %w", err)
 		}
 
-		sentDiff := new(big.Int).Sub(signedState.State.Data.Sent.Nano(), channel.Their.State.Data.Sent.Nano())
-		if sentDiff.Cmp(prepayAmt) < 0 {
-			return nil, fmt.Errorf("sent is less than prepay")
+		act := cond.GetAction()
+		actIdx := act.IDCell()
+
+		actStateOld, err := channel.Their.Data.ActionStates.LoadValue(actIdx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load new action state: %w", err)
 		}
 
-		// we put our serialized condition to make sure that party is not cheated,
-		// if something diff will be in state, final signature will not match
-		vchOld.Prepay = vchNew.Prepay // only prepay can change
-		if err = channel.Their.Conditionals.SetIntKey(index, vchOld.Serialize()); err != nil {
-			return nil, fmt.Errorf("failed to set condition with index %s: %w", index.String(), err)
+		actStateUpdated, err := cond.Commit(newCond, actStateOld.MustToCell())
+		if err != nil {
+			return nil, fmt.Errorf("failed to commit new action state: %w", err)
+		}
+
+		// even after updated we keep index as hash of initial cond
+		if err = channel.Their.Data.Conditionals.Set(idx, cond.Serialize()); err != nil {
+			return nil, fmt.Errorf("failed to set condition: %w", err)
+		}
+
+		if err = channel.Their.Data.ActionStates.Set(actIdx, actStateUpdated); err != nil {
+			return nil, fmt.Errorf("failed to set action: %w", err)
 		}
 
 		toExecute = func(ctx context.Context) error {
-			if prepayAmt.Sign() == 0 {
+			if bytes.Equal(actStateUpdated.Hash(), actStateOld.MustToCell().Hash()) {
+				// nothing changed
 				return nil
 			}
 
-			log.Info().Str("key", base64.StdEncoding.EncodeToString(data.Key)).
-				Str("capacity", tlb.MustFromNano(vchOld.Capacity, int(cc.Decimals)).String()).
-				Str("fee", tlb.MustFromNano(vchOld.Fee, int(cc.Decimals)).String()).
-				Str("prepaid", tlb.MustFromNano(vchNew.Prepay, int(cc.Decimals)).String()).
-				Str("prepay_diff", tlb.MustFromNano(prepayAmt, int(cc.Decimals)).String()).
-				Str("sent_diff", tlb.MustFromNano(sentDiff, int(cc.Decimals)).String()).
-				Msg("virtual channel prepaid")
+			log.Info().Fields(cond.GetLogInfo()).
+				Msg("condition committed")
 
 			return nil
 		}
-	case transport.OpenVirtualAction:
-		index, vch, err := payments.FindVirtualChannel(condProposal, data.ChannelKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to find virtual channel in their new state: %w", err)
-		}
-
-		if vch.Capacity.Sign() <= 0 {
-			return nil, fmt.Errorf("invalid capacity")
-		}
-
-		if vch.Fee.Sign() < 0 {
-			return nil, fmt.Errorf("invalid fee")
-		}
-
-		if safe := vch.Deadline - (time.Now().UTC().Unix() + channel.SafeOnchainClosePeriod); safe < int64(s.cfg.MinSafeVirtualChannelTimeoutSec) {
-			return nil, fmt.Errorf("safe virtual channel deadline is less than acceptable: %d, %d", safe, s.cfg.MinSafeVirtualChannelTimeoutSec)
-		}
-
-		_, vchOld, err := payments.FindVirtualChannel(channel.Their.Conditionals, data.ChannelKey)
-		if err != nil && !errors.Is(err, payments.ErrNotFound) {
-			return nil, fmt.Errorf("failed to find virtual channel in their prev state: %w", err)
-		}
-		if err == nil {
-			if vchOld.Deadline == vch.Deadline && vchOld.Fee.Cmp(vch.Fee) == 0 && vchOld.Capacity.Cmp(vch.Capacity) == 0 {
-				// idempotency
-				return &channel.Our.SignedSemiChannel, nil
+	case transport.AddConditionalAction:
+		var aResolver payments.FullResolver = s
+		if data.NewActionCode != nil {
+			sr, err := s.addActionToChannel(ctx, channel, data.NewActionCode)
+			if err == nil {
+				aResolver = sr
+			} else if !errors.Is(err, ErrActionAlreadyExists) {
+				return nil, fmt.Errorf("failed to add action to channel: %w", err)
 			}
-			return nil, fmt.Errorf("channel with this key is already exists and has different configuration")
 		}
 
-		if _, err = s.db.GetVirtualChannelMeta(context.Background(), vch.Key); err != nil && !errors.Is(err, db.ErrNotFound) {
-			return nil, fmt.Errorf("failed to load virtual channel meta: %w", err)
+		cond, err := payments.CodeToConditional(ctx, data.Conditional, aResolver)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode updated conditional: %w", err)
+		}
+
+		srz := cond.Serialize()
+		if !bytes.Equal(data.Conditional.Hash(), srz.Hash()) {
+			return nil, fmt.Errorf("incorrect conditional")
+		}
+
+		if safe := cond.GetDeadline().UTC().Unix() - (time.Now().UTC().Unix() + channel.SafeOnchainClosePeriod); safe < int64(s.cfg.MinSafeVirtualChannelTimeoutSec) {
+			return nil, fmt.Errorf("safe conditional deadline is less than acceptable: %d, %d", safe, s.cfg.MinSafeVirtualChannelTimeoutSec)
+		}
+
+		_, _, err = payments.FindConditional(ctx, channel.Their.Data.Conditionals, srz.Hash(), aResolver)
+		if err != nil && !errors.Is(err, payments.ErrNotFound) {
+			return nil, fmt.Errorf("failed to lookup conditional in their prev state: %w", err)
 		}
 		if err == nil {
-			return nil, fmt.Errorf("this virtual channel key was already used before")
+			// idempotency
+			break
 		}
 
+		if err = cond.ValidateOnAdd(); err != nil {
+			return nil, fmt.Errorf("failed to validate condition: %w", err)
+		}
+
+		// we will not accept conditional with already used key
+		if _, err = s.db.GetVirtualChannelMeta(ctx, cond.GetKey()); err != nil && !errors.Is(err, db.ErrNotFound) {
+			return nil, fmt.Errorf("failed to load virtual channel meta: %w", err)
+		} else if err == nil {
+			return nil, fmt.Errorf("this conditional key %s was already used before", base64.StdEncoding.EncodeToString(cond.GetKey()))
+		}
+
+		id := cell.BeginCell().MustStoreSlice(srz.Hash(), 256).EndCell()
 		// we put our serialized condition to make sure that party is not cheated,
 		// if something diff will be in state, final signature will not match
-		if err = channel.Their.Conditionals.SetIntKey(index, vch.Serialize()); err != nil {
-			return nil, fmt.Errorf("failed to settle condition with index %s: %w", index.String(), err)
+		if err = channel.Their.Data.Conditionals.Set(id, srz); err != nil {
+			return nil, fmt.Errorf("failed to settle condition with index %s: %w", hex.EncodeToString(srz.Hash()), err)
 		}
 
-		theirBalance, _, err := channel.CalcBalance(true)
+		theirBalance, err := channel.CalcBalance(ctx, true, aResolver)
 		if err != nil {
 			return nil, fmt.Errorf("failed to calc other side balance: %w", err)
 		}
 
-		currentInstruction, err := data.DecryptOurInstruction(s.key, data.InstructionKey)
+		currentInstruction, err := data.DecryptOurInstruction(ctx, s.key, data.InstructionKey, aResolver)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decrypt instruction: %w", err)
 		}
 
-		expFee := new(big.Int).SetBytes(currentInstruction.ExpectedFee)
-		expCap := new(big.Int).SetBytes(currentInstruction.ExpectedCapacity)
+		if currentInstruction.ExpectedDeadline != cond.GetDeadline().Unix() {
+			return nil, fmt.Errorf("incorrect deadline %d, not equals to expected %d", cond.GetDeadline().Unix(), currentInstruction.ExpectedDeadline)
+		}
 
-		if expFee.Cmp(vch.Fee) != 0 || expCap.Cmp(vch.Capacity) != 0 || currentInstruction.ExpectedDeadline != vch.Deadline {
-			return nil, fmt.Errorf("incorrect values, not equals to expected")
+		isFinalDest := bytes.Equal(currentInstruction.NextTarget, s.key.Public().(ed25519.PublicKey))
+
+		err = cond.CheckInstruction(currentInstruction.Details, isFinalDest, theirBalance, currentInstruction.FinalState)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check instruction: %w", err)
 		}
 
 		removeAfterTimeout := func(ctx context.Context) error {
 			// try to remove virtual channel in future if it will time out
-			dl := time.Unix(vch.Deadline+1, 0)
-			err = s.db.CreateTask(ctx, PaymentsTaskPool, "ask-remove-virtual", channel.Address,
-				"ask-remove-virtual-"+base64.StdEncoding.EncodeToString(vch.Key)+"-timeout",
+			dl := time.Unix(cond.GetDeadline().Unix()+1, 0)
+			err = s.db.CreateTask(ctx, PaymentsTaskPool, "ask-remove-cond", channel.Our.Address,
+				"ask-remove-cond-"+base64.StdEncoding.EncodeToString(srz.Hash())+"-timeout",
 				db.AskRemoveVirtualTask{
-					ChannelAddress: channel.Address,
-					Key:            vch.Key,
+					ChannelAddress: channel.Our.Address,
+					Key:            cond.GetKey(),
 				}, &dl, nil,
 			)
 			if err != nil {
-				return fmt.Errorf("failed to create ask-remove-virtual task: %w", err)
+				return fmt.Errorf("failed to create ask-remove-cond task: %w", err)
 			}
 			return nil
 		}
 
-		if !bytes.Equal(currentInstruction.NextTarget, s.key.Public().(ed25519.PublicKey)) {
-			// willing to open tunnel for a virtual channel, for this we require party to have enough balance
-			if theirBalance.Sign() < 0 {
-				return nil, fmt.Errorf("not enough available balance, you need %s more tunnel channel through me", theirBalance.Abs(theirBalance).String())
+		if aResolver != s {
+			// new action
+			if err = s.SaveAction(ctx, cond.GetAction()); err != nil {
+				return nil, fmt.Errorf("failed to save action: %w", err)
 			}
+		}
 
-			nextFee := new(big.Int).SetBytes(currentInstruction.NextFee)
-			nextCap := new(big.Int).SetBytes(currentInstruction.NextCapacity)
-
-			maxNextDeadline := vch.Deadline - (channel.SafeOnchainClosePeriod + int64(s.cfg.MinSafeVirtualChannelTimeoutSec))
+		if !isFinalDest {
+			maxNextDeadline := cond.GetDeadline().Unix() - (channel.SafeOnchainClosePeriod + int64(s.cfg.MinSafeVirtualChannelTimeoutSec))
 			if currentInstruction.NextDeadline > maxNextDeadline {
 				return nil, fmt.Errorf("next deadline too late (not enough safety gap)")
-			}
-
-			if nextCap.Cmp(vch.Capacity) > 0 {
-				return nil, fmt.Errorf("capacity cannot increase")
-			}
-
-			if !cc.VirtualTunnelConfig.AllowTunneling {
-				return nil, fmt.Errorf("tunneling of such coin is not allowed through this node")
-			}
-
-			wantMinFee := tlb.MustFromDecimal(cc.VirtualTunnelConfig.ProxyMinFee, int(cc.Decimals))
-			wantFeePercent := cc.VirtualTunnelConfig.ProxyFeePercent / 100.0
-
-			wantFeeInt := new(big.Int).Add(nextCap, nextFee)
-
-			maxCap := tlb.MustFromDecimal(cc.VirtualTunnelConfig.ProxyMaxCapacity, int(cc.Decimals))
-			if wantFeeInt.Cmp(maxCap.Nano()) > 0 {
-				return nil, fmt.Errorf("too big next capacity+fee")
-			}
-
-			wantFeeInt, _ = new(big.Float).Mul(new(big.Float).SetInt(wantFeeInt), big.NewFloat(wantFeePercent)).Int(wantFeeInt)
-			wantFee := tlb.MustFromNano(wantFeeInt, int(cc.Decimals))
-			if wantFee.Compare(wantMinFee) < 0 {
-				wantFee = wantMinFee
-			}
-
-			proposedFee := new(big.Int).Sub(vch.Fee, nextFee)
-			if proposedFee.Cmp(wantFee.Nano()) < 0 {
-				return nil, fmt.Errorf("min fee to open channel is %s TON", wantFee.String())
 			}
 
 			targetChannels, err := s.db.GetChannels(context.Background(), currentInstruction.NextTarget, db.ChannelStateAny)
 			if err != nil {
 				return nil, fmt.Errorf("failed to get target channel: %w", err)
 			}
-			// TODO: tampering checks
 
 			if len(targetChannels) == 0 {
 				return nil, fmt.Errorf("destination channel is not belongs to this node")
@@ -478,37 +435,32 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 
 			var target *db.Channel
 			var targetNoBalance *db.Channel
-			var highestBalance *big.Int
+			var lowestScore *big.Int
 			for _, targetChannel := range targetChannels {
 				if targetChannel.Status != db.ChannelStateActive {
 					continue
 				}
 
-				// token should be the same
-				if targetChannel.JettonAddress != channel.JettonAddress {
-					continue
-				}
-
-				if targetChannel.ExtraCurrencyID != channel.ExtraCurrencyID {
-					continue
-				}
-
-				balance, _, err := targetChannel.CalcBalance(false)
+				balance, err := targetChannel.CalcBalance(ctx, false, s)
 				if err != nil {
-					return nil, fmt.Errorf("failed to calc our channel %s balance: %w", targetChannel.Address, err)
+					return nil, fmt.Errorf("failed to calc our channel %s balance: %w", targetChannel.Our.Address, err)
 				}
 
-				amt := new(big.Int).Add(nextCap, nextFee)
-				if balance.Cmp(amt) >= 0 {
+				score, err := cond.ScoreTunnelTarget(currentInstruction.Details, balance)
+				if err != nil {
+					return nil, fmt.Errorf("failed to check target: %w", err)
+				}
+
+				if score.Sign() >= 0 {
 					// balance is enough to tunnel
 					target = targetChannel
 					break
 				}
 
-				if highestBalance == nil || (highestBalance.Sign() >= 0 && balance.Cmp(highestBalance) > 0) || balance.Sign() < 0 {
+				if lowestScore == nil || score.Cmp(lowestScore) < 0 {
 					// if we already have a credited channel, it is better to use it again for less onchain actions
 					targetNoBalance = targetChannel
-					highestBalance = balance
+					lowestScore = score // < 0 score means credit amount on a channel
 				}
 			}
 
@@ -519,24 +471,45 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 				target = targetNoBalance // we will tunnel and topup to get a resolve
 			}
 
+			a, b := address.MustParseAddr(target.Our.Address), address.MustParseAddr(target.Their.Address)
+			if !target.WeLeft {
+				a, b = b, a
+			}
+
+			nextAction, err := cond.GetAction().PrepareNext(ctx, a, b)
+			if err != nil {
+				return nil, fmt.Errorf("failed to prepare next action: %w", err)
+			}
+
+			nextDeadline := time.Unix(currentInstruction.NextDeadline, 0)
+			next, err := cond.PrepareNext(currentInstruction.Details, nextAction, nextDeadline)
+			if err != nil {
+				return nil, fmt.Errorf("failed to prepare next conditional: %w", err)
+			}
+
+			if _, err = target.Our.Data.ActionStates.LoadValue(nextAction.IDCell()); err != nil {
+				if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
+					return nil, fmt.Errorf("failed to load next action state: %w", err)
+				}
+				data.NewActionCode = nextAction.Serialize()
+			}
+
+			senderKey := data.InstructionKey
+			data.InstructionKey = currentInstruction.NextInstructionKey
+			data.Conditional = next.Serialize()
+
 			// we will execute it only after all checks passed and final signature verified
 			toExecute = func(ctx context.Context) error {
-				senderKey := data.InstructionKey
-				data.InstructionKey = currentInstruction.NextInstructionKey
-
-				tryTill := time.Unix(currentInstruction.NextDeadline, 0)
-				err = s.db.CreateTask(ctx, PaymentsTaskPool, "open-virtual", target.Address,
-					"open-virtual-"+base64.StdEncoding.EncodeToString(vch.Key),
-					db.OpenVirtualTask{
+				err = s.db.CreateTask(ctx, PaymentsTaskPool, "create-send-conditional", target.Our.Address,
+					"create-send-conditional-"+base64.StdEncoding.EncodeToString(cond.GetKey()),
+					db.AddConditionalTask{
 						SenderKey:          senderKey,
-						PrevChannelAddress: channel.Address,
-						ChannelAddress:     target.Address,
-						VirtualKey:         vch.Key,
+						PrevChannelAddress: channel.Our.Address,
+						PrevConditionalID:  srz.Hash(),
+						ChannelAddress:     target.Our.Address,
 						Deadline:           currentInstruction.NextDeadline,
-						Fee:                nextFee.String(),
-						Capacity:           nextCap.String(),
-						Action:             data,
-					}, nil, &tryTill,
+						TransportAction:    data,
+					}, nil, &nextDeadline,
 				)
 				if err != nil {
 					return fmt.Errorf("failed to create open-virtual task: %w", err)
@@ -546,65 +519,38 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 					return err
 				}
 
-				log.Info().Str("key", base64.StdEncoding.EncodeToString(data.ChannelKey)).
-					Str("capacity", tlb.MustFromNano(vch.Capacity, int(cc.Decimals)).String()).
-					Str("fee", tlb.MustFromNano(vch.Fee, int(cc.Decimals)).String()).
-					Str("target", target.Address).
+				log.Info().Str("target", target.Our.Address).
+					Fields(cond.GetLogInfo()).
 					Msg("channel tunnelling through us requested")
 
 				return nil
 			}
 		} else {
-			var state payments.VirtualChannelState
-			if currentInstruction.FinalState != nil {
-				// for channels with known final state we allow credit, so we will wait for their topup and use it
-				if err = tlb.LoadFromCell(&state, currentInstruction.FinalState.BeginParse()); err != nil {
-					return nil, fmt.Errorf("failed to parse virtual channel state: %w", err)
-				}
-
-				if !state.Verify(vch.Key) {
-					return nil, fmt.Errorf("final state is incorrect")
-				}
-
-				if state.Amount.Cmp(vch.Capacity) != 0 {
-					return nil, fmt.Errorf("final state should use full capacity")
-				}
-
-				maxRentPerAction := cc.MustAmountDecimal(cc.VirtualTunnelConfig.MaxCapacityToRentPerTx)
-				if new(big.Int).Add(state.Amount, vch.Fee).Cmp(maxRentPerAction.Nano()) > 0 {
-					return nil, fmt.Errorf("amount to receive is too big to rent in single operation")
-				}
-			} else if theirBalance.Sign() < 0 {
-				return nil, fmt.Errorf("not enough available balance, you need %s more to open virtual channel with me", theirBalance.Abs(theirBalance).String())
-			}
-
 			toExecute = func(ctx context.Context) error {
-				meta := &db.VirtualChannelMeta{
-					Key:    vch.Key,
-					Status: db.VirtualChannelStateActive,
-					Incoming: &db.VirtualChannelMetaSide{
+				meta := &db.ConditionalMeta{
+					Key:    cond.GetKey(),
+					Status: db.ConditionalStateActive,
+					Incoming: &db.ConditionalMetaSide{
+						ChannelAddress:        channel.Our.Address,
+						Conditional:           cond.Serialize(),
+						UncooperativeDeadline: cond.GetDeadline(),
+						SafeDeadline:          cond.GetDeadline().Add(-time.Duration(channel.SafeOnchainClosePeriod+int64(s.cfg.MinSafeVirtualChannelTimeoutSec)) * time.Second),
 						SenderKey:             data.InstructionKey,
-						ChannelAddress:        channel.Address,
-						Capacity:              tlb.MustFromNano(vch.Capacity, int(cc.Decimals)).String(),
-						Fee:                   tlb.MustFromNano(vch.Fee, int(cc.Decimals)).String(),
-						UncooperativeDeadline: time.Unix(vch.Deadline, 0),
-						SafeDeadline:          time.Unix(vch.Deadline, 0).Add(-time.Duration(channel.SafeOnchainClosePeriod+int64(s.cfg.MinSafeVirtualChannelTimeoutSec)) * time.Second),
 					},
 					CreatedAt: time.Now(),
 					UpdatedAt: time.Now(),
 				}
 
 				if currentInstruction.FinalState != nil {
-					if err = meta.AddKnownResolve(&state); err != nil {
+					if err = meta.AddKnownResolve(cond, currentInstruction.FinalState); err != nil {
 						return fmt.Errorf("failed to add channel condition resolve: %w", err)
 					}
 
-					tryTill := time.Unix(vch.Deadline, 0)
-					if err = s.db.CreateTask(ctx, PaymentsTaskPool, "close-next-virtual", channel.Address,
-						"close-next-"+base64.StdEncoding.EncodeToString(vch.Key),
+					tryTill := cond.GetDeadline()
+					if err = s.db.CreateTask(ctx, PaymentsTaskPool, "close-next-virtual", channel.Our.Address,
+						"close-next-"+base64.StdEncoding.EncodeToString(cond.GetKey()),
 						db.CloseNextVirtualTask{
-							VirtualKey: vch.Key,
-							State:      currentInstruction.FinalState.ToBOC(),
+							VirtualKey: cond.GetKey(),
 						}, nil, &tryTill,
 					); err != nil {
 						return fmt.Errorf("failed to create close-next-virtual task: %w", err)
@@ -620,182 +566,318 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 				}
 
 				if currentInstruction.FinalState == nil && s.webhook != nil {
-					if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeOpen, meta, cc); err != nil {
+					if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeOpen, meta); err != nil {
 						return fmt.Errorf("failed to push virtual channel close event: %w", err)
 					}
 				}
 
-				log.Info().Str("key", base64.StdEncoding.EncodeToString(data.ChannelKey)).
-					Str("capacity", tlb.MustFromNano(vch.Capacity, int(cc.Decimals)).String()).
-					Msg("virtual channel opened with us")
+				log.Info().Str("key", base64.StdEncoding.EncodeToString(cond.GetKey())).
+					Fields(cond.GetLogInfo()).
+					Msg("conditional created with us")
 
 				return nil
 			}
 		}
-	case transport.CooperativeCommitAction:
-		// When requested to process this kind of action,
-		// then we should execute tx by ourselves and take fee from a party for gas
-		// it is useful when the party doesn't have a onchain balance yet
-		attachedFee := new(big.Int).Sub(signedState.State.Data.Sent.Nano(), channel.Their.State.Data.Sent.Nano())
-		wantFeePerAction := cc.MustAmountDecimal(cc.FeePerWithdrawPropose)
-		if wantFeePerAction.Nano().Sign() <= 0 {
-			return nil, fmt.Errorf("node not accepts cooperative commit proposals, use request")
+	case transport.SwapAction:
+		if s.onSwap == nil {
+			return nil, fmt.Errorf("swaps are not enabled on this node")
 		}
 
-		if attachedFee.Cmp(wantFeePerAction.Nano()) < 0 {
-			return nil, fmt.Errorf("not enough fee, %s need %s", cc.MustAmount(attachedFee).String(), wantFeePerAction.String())
-		}
-
-		theirBalance, _, err := channel.CalcBalance(true)
+		fromCC, err := s.ResolveCoinConfig(hex.EncodeToString(data.FromBalanceID))
 		if err != nil {
-			return nil, fmt.Errorf("failed to calc other side balance: %w", err)
+			return nil, fmt.Errorf("failed to resolve from coin config: %w", err)
 		}
 
-		if theirBalance.Cmp(attachedFee) < 0 {
-			return nil, fmt.Errorf("balance is less than attached fee")
-		}
-
-		var reqTheir payments.CooperativeCommit
-		err = tlb.LoadFromCell(&reqTheir, data.SignedCommitRequest.BeginParse())
+		toCC, err := s.ResolveCoinConfig(hex.EncodeToString(data.ToBalanceID))
 		if err != nil {
-			return nil, fmt.Errorf("failed to serialize their commit channel request: %w", err)
+			return nil, fmt.Errorf("failed to resolve to coin config: %w", err)
 		}
 
-		wOur, wTheir := reqTheir.Signed.WithdrawA, reqTheir.Signed.WithdrawB
-		if !channel.WeLeft {
-			wOur, wTheir = wTheir, wOur
-		}
+		fromAmt := fromCC.MustAmount(new(big.Int).SetBytes(data.FromAmount))
+		toAmt := toCC.MustAmount(new(big.Int).SetBytes(data.ToAmount))
 
-		var theirSignature = reqTheir.SignatureA.Value
-		if channel.WeLeft {
-			theirSignature = reqTheir.SignatureB.Value
-		}
-
-		req, dataCell, _, err := s.getCommitRequest(wOur, wTheir, channel)
+		fromAct, err := actions.NewSendActionFromBalanceID(ctx, fromCC, channel.SideA().Address, channel.SideB().Address)
 		if err != nil {
-			return nil, fmt.Errorf("failed to prepare commit channel request: %w", err)
+			return nil, fmt.Errorf("failed to create send action from 'from' balance id: %w", err)
 		}
 
-		if !dataCell.Verify(channel.TheirOnchain.Key, theirSignature) {
-			return nil, fmt.Errorf("incorrect party signature")
-		}
-
-		if channel.WeLeft {
-			req.SignatureB.Value = theirSignature
-		} else {
-			req.SignatureA.Value = theirSignature
-		}
-
-		cl, err := tlb.ToCell(req)
+		toAct, err := actions.NewSendActionFromBalanceID(ctx, toCC, channel.SideA().Address, channel.SideB().Address)
 		if err != nil {
-			return nil, fmt.Errorf("failed to serialize commit channel request: %w", err)
+			return nil, fmt.Errorf("failed to create send action from 'to' balance id: %w", err)
 		}
 
-		ourW := req.Signed.WithdrawA.Nano()
-		theirW := req.Signed.WithdrawB.Nano()
-		if !channel.WeLeft {
-			ourW, theirW = theirW, ourW
+		saveOurAction, saveTheirAction := false, false
+
+		theirState, err := channel.Their.Data.ActionStates.LoadValue(fromAct.IDCell())
+		if err != nil {
+			if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
+				return nil, fmt.Errorf("failed to load from action state: %w", err)
+			}
+			saveTheirAction = true
+			theirState = fromAct.GetEmptyState().BeginParse()
+		}
+		ourState, err := channel.Our.Data.ActionStates.LoadValue(toAct.IDCell())
+		if err != nil {
+			if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
+				return nil, fmt.Errorf("failed to load to action state: %w", err)
+			}
+			saveOurAction = true
+			ourState = toAct.GetEmptyState().BeginParse()
 		}
 
-		if err = channel.UpdatePendingWithdraw(false, ourW); err != nil {
-			return nil, fmt.Errorf("failed to update our pending withdraw: %w", err)
+		newTheirState, err := fromAct.AddCoins(theirState.MustToCell(), fromAmt.Nano(), channel.Their.LockedDeposits)
+		if err != nil {
+			return nil, fmt.Errorf("failed to add coins to their action state: %w", err)
 		}
-		if err = channel.UpdatePendingWithdraw(true, theirW); err != nil {
-			return nil, fmt.Errorf("failed to update their pending withdraw: %w", err)
+		newOurState, err := toAct.AddCoins(ourState.MustToCell(), toAmt.Nano(), channel.Our.LockedDeposits)
+		if err != nil {
+			return nil, fmt.Errorf("failed to add coins to our action state: %w", err)
+		}
+
+		if err = channel.Their.Data.ActionStates.Set(fromAct.IDCell(), newTheirState); err != nil {
+			return nil, fmt.Errorf("failed to set their action state: %w", err)
+		}
+		if err = channel.Our.Data.ActionStates.Set(toAct.IDCell(), newOurState); err != nil {
+			return nil, fmt.Errorf("failed to set our action state: %w", err)
+		}
+
+		resolver := tmpFullResolver{[]payments.Action{fromAct, toAct}, s}
+
+		theirBalance, err := channel.CalcBalance(ctx, true, resolver)
+		if err != nil {
+			return nil, fmt.Errorf("failed to calc their balance: %w", err)
+		}
+		if b := theirBalance[fromCC.BalanceID]; b == nil || b.Available().Sign() < 0 {
+			return nil, fmt.Errorf("not enough funds on their balance")
+		}
+
+		ourBalance, err := channel.CalcBalance(ctx, false, resolver)
+		if err != nil {
+			return nil, fmt.Errorf("failed to calc our balance: %w", err)
+		}
+		if b := ourBalance[toCC.BalanceID]; b == nil || b.Available().Sign() < 0 {
+			return nil, fmt.Errorf("not enough funds on our balance")
+		}
+
+		// ask to approve this swap in user-space logic
+		if err = s.onSwap(ctx, channel, fromCC, toCC, fromAmt, toAmt); err != nil {
+			return nil, fmt.Errorf("swap is not allowed: %w", err)
+		}
+
+		if saveOurAction {
+			if err = s.SaveAction(ctx, toAct); err != nil {
+				return nil, fmt.Errorf("failed to save action: %w", err)
+			}
+		}
+
+		if saveTheirAction {
+			if err = s.SaveAction(ctx, fromAct); err != nil {
+				return nil, fmt.Errorf("failed to save action: %w", err)
+			}
 		}
 
 		toExecute = func(ctx context.Context) error {
-			if err = s.db.CreateTask(ctx, PaymentsTaskPool, "increment-state", channel.Address,
-				"increment-state-"+channel.Address+"-"+fmt.Sprint(channel.Our.State.Data.Seqno),
+			log.Info().Str("addr", channel.Our.Address).
+				Str("from", fromAmt.String()+" "+fromCC.Symbol).Str("to", toAmt.String()+" "+toCC.Symbol).
+				Msg("swap confirmed")
+
+			return nil
+		}
+	case transport.CooperativeCommitAction:
+		if channel.PendingCommit != nil {
+			return nil, fmt.Errorf("can't execute action while there is already pending commit")
+		}
+		if len(channel.Their.PendingOnchainTransfers) > 0 || len(channel.Our.PendingOnchainTransfers) > 0 {
+			return nil, fmt.Errorf("can't execute action while there are pending onchian transfers")
+		}
+
+		var hasFee *bool
+		if data.WithFee {
+			fromUs := false
+			hasFee = &fromUs
+		}
+
+		req, ourPending, theirPending, _, err := s.getCommitRequest(ctx, channel, data.ActionID, data.WithFee, hasFee)
+		if err != nil {
+			return nil, fmt.Errorf("failed to prepare execute action channel request: %w", err)
+		}
+
+		toSign, err := tlb.ToCell(req.Signed)
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize pending commit message: %w", err)
+		}
+
+		if !toSign.Verify(channel.Their.OnchainInfo.Key, data.MsgSignature) {
+			return nil, fmt.Errorf("expected msg is not equal to actual")
+		}
+
+		if channel.WeLeft {
+			req.SignatureB.Value = data.MsgSignature
+		} else {
+			req.SignatureA.Value = data.MsgSignature
+		}
+
+		aid := cell.BeginCell().MustStoreSlice(data.ActionID, 256).EndCell()
+
+		our, their := req.Signed.Action.StateA, req.Signed.Action.StateB
+		if !channel.WeLeft {
+			our, their = their, our
+		}
+
+		if our != nil {
+			if err = channel.Our.Data.ActionStates.Set(aid, our); err != nil {
+				return nil, fmt.Errorf("failed to set our action state: %w", err)
+			}
+		}
+		if their != nil {
+			if err = channel.Their.Data.ActionStates.Set(aid, their); err != nil {
+				return nil, fmt.Errorf("failed to set their action state: %w", err)
+			}
+		}
+
+		channel.PendingCommit = &db.PendingCommit{
+			Seqno:   req.Signed.Seqno,
+			Message: toSign,
+		}
+
+		if ourPending != nil {
+			channel.Our.PendingOnchainTransfers[pendingIDCommit(req.Signed.Seqno)] = ourPending
+		}
+		if theirPending != nil {
+			channel.Their.PendingOnchainTransfers[pendingIDCommit(req.Signed.Seqno)] = theirPending
+		}
+
+		msg, err := tlb.ToCell(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize pending commit message: %w", err)
+		}
+
+		toExecute = func(ctx context.Context) error {
+			if err = s.db.CreateTask(ctx, PaymentsTaskPool, "increment-state", channel.Our.Address,
+				"increment-state-"+channel.Our.Address+"-"+fmt.Sprint(proposedState.Body.Seqno),
 				db.IncrementStatesTask{
-					ChannelAddress: channel.Address,
-					WantResponse:   true,
+					ChannelAddress: channel.Our.Address,
 				}, nil, nil,
 			); err != nil {
 				return fmt.Errorf("failed to create increment-state task: %w", err)
 			}
 
-			if err = s.db.CreateTask(ctx, PaymentsTaskPool, "withdraw-execute", channel.Address,
-				"withdraw-execute-"+channel.Address+"-"+hex.EncodeToString(cl.Hash()),
-				db.WithdrawExecuteTask{
-					Address:       channel.Address,
-					SignedRequest: cl,
+			if err = s.db.CreateTask(ctx, PaymentsTaskPool, "commit-execute", channel.Our.Address,
+				"commit-execute-"+channel.Our.Address+"-"+hex.EncodeToString(toSign.Hash()),
+				db.CommitExecuteTask{
+					ChannelAddress: channel.Our.Address,
+					SignedRequest:  msg,
 				}, nil, nil,
 			); err != nil {
 				return fmt.Errorf("failed to create increment-state task: %w", err)
 			}
 
-			log.Info().Str("address", channel.Address).Msg("accepted cooperative commit proposal")
+			log.Info().Str("address", channel.Our.Address).Bool("execute", req.Signed.FromA == channel.WeLeft).Msg("accepted cooperative commit proposal")
+
 			return nil
 		}
 	case transport.RentCapacityAction:
-		attachedFee := new(big.Int).Sub(signedState.State.Data.Sent.Nano(), channel.Their.State.Data.Sent.Nano())
-		amount := new(big.Int).SetBytes(data.Amount)
-		maxRentPerAction := cc.MustAmountDecimal(cc.VirtualTunnelConfig.MaxCapacityToRentPerTx)
+		bi := hex.EncodeToString(data.BalanceID)
+		cc, err := s.ResolveBalanceType(bi)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve balance type %s: %w", bi, err)
+		}
 
-		dt := time.Unix(int64(data.Till), 0)
+		a, err := actions.NewSendActionFromBalanceID(ctx, cc, channel.SideA().Address, channel.SideB().Address)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create send action: %w", err)
+		}
+
+		actId := a.IDCell()
+		aState, err := channel.Their.Data.ActionStates.LoadValue(actId)
+		if err != nil && !errors.Is(err, cell.ErrNoSuchKeyInDict) {
+			return nil, fmt.Errorf("failed to load action state: %w", err)
+		}
+
+		var saveAction bool
+		if aState == nil {
+			saveAction = true
+			aState = a.GetEmptyState().BeginParse()
+		}
+
+		amount := new(big.Int).SetBytes(data.Amount)
+		till := time.Unix(int64(data.Till), 0)
 
 		amountBefore := big.NewInt(0)
 		used := big.NewInt(0)
-		if channel.OurLockedDeposit != nil && channel.OurLockedDeposit.Till.After(time.Now()) {
-			used = new(big.Int).Set(channel.OurLockedDeposit.Used)
-			amountBefore = new(big.Int).Set(channel.OurLockedDeposit.Amount)
+		ld := channel.Our.LockedDeposits[cc.BalanceID]
+		if ld != nil && ld.Till.After(time.Now()) {
+			used = new(big.Int).Set(ld.Used)
+			amountBefore = new(big.Int).Set(ld.Amount)
 		}
 		diffAmount := new(big.Int).Sub(amount, amountBefore)
 
-		if time.Until(dt) > 366*24*time.Hour {
+		if time.Until(till) > 366*24*time.Hour {
 			// more than one year is too long
 			return nil, fmt.Errorf("duration too long")
 		}
 		if diffAmount.Sign() <= 0 {
 			return nil, fmt.Errorf("resulting topup amount must be positive")
 		}
-		if diffAmount.Cmp(maxRentPerAction.Nano()) > 0 {
+		if diffAmount.Cmp(cc.VirtualTunnelConfig.MaxCapacityToRentPerTx.Nano()) > 0 {
 			return nil, fmt.Errorf("capacity to rent is too big")
 		}
 
-		totalFee := channel.CalcDepositFee(cc, amount, dt, false)
+		totalFee := channel.CalcDepositFee(cc, amount, till, false)
 		if totalFee.Sign() <= 0 {
 			return nil, fmt.Errorf("payment not needed, capacity is already enough")
 		}
 
-		if attachedFee.Cmp(totalFee) < 0 {
-			return nil, fmt.Errorf("not enough fee, %s need %s", cc.MustAmount(attachedFee).String(), cc.MustAmount(totalFee).String())
-		}
-
-		theirBalance, _, err := channel.CalcBalance(true)
+		theirBalances, err := channel.CalcBalance(ctx, true, s)
 		if err != nil {
 			return nil, fmt.Errorf("failed to calc their balance: %w", err)
 		}
-		_, ourLockedBalance, err := channel.CalcBalance(false)
-		if err != nil {
-			return nil, fmt.Errorf("failed to calc our balance: %w", err)
+		theirBalance := theirBalances[cc.BalanceID]
+		if theirBalance == nil {
+			return nil, fmt.Errorf("their balance have no fee coin")
 		}
 
 		// calc balance + amount potentially could be received
-		usableBalance := new(big.Int).Add(theirBalance, ourLockedBalance)
-		// pending withdraw is not usable
-		pendingWithdraw := new(big.Int).Sub(channel.Our.PendingWithdraw, channel.OurOnchain.Withdrawn)
-		if pendingWithdraw.Sign() > 0 {
-			usableBalance = usableBalance.Sub(usableBalance, pendingWithdraw)
-		}
+		usableBalance := new(big.Int).Add(theirBalance.Available(), theirBalance.ConditionalPending)
 
 		if usableBalance.Cmp(totalFee) < 0 {
-			return nil, fmt.Errorf("not enough locked+balance for fee to rent")
+			return nil, fmt.Errorf("not enough locked+balance %s for fee to rent, usable: %s, fee: %s", cc.Symbol, cc.MustAmount(usableBalance), cc.MustAmount(totalFee))
 		}
 
-		channel.OurLockedDeposit = &db.LockedDepositInfo{
+		var actState actions.StateActionSend
+		if err = payments.LoadState(&actState, aState.MustToCell()); err != nil {
+			return nil, fmt.Errorf("failed to load action state: %w", err)
+		}
+		actState.Amount.Val = new(big.Int).Add(actState.Amount.Nano(), totalFee)
+
+		updatedState, err := tlb.ToCell(actState)
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize updated action state: %w", err)
+		}
+
+		if err := channel.Their.Data.ActionStates.Set(actId, updatedState); err != nil {
+			return nil, fmt.Errorf("failed to set condition: %w", err)
+		}
+
+		channel.Our.LockedDeposits[cc.BalanceID] = &payments.LockedDepositInfo{
 			Amount: amount,
-			Till:   dt,
+			Till:   till,
 			Used:   used,
+		}
+
+		if saveAction {
+			if err = s.SaveAction(ctx, a); err != nil {
+				return nil, fmt.Errorf("failed to save action: %w", err)
+			}
 		}
 
 		// we will execute it only after all checks passed and final signature verified
 		toExecute = func(ctx context.Context) error {
 			evData := db.ChannelHistoryActionRentCapData{
-				Amount: amount.String(),
-				Fee:    totalFee.String(),
-				Till:   dt.Unix(),
+				BalanceID: cc.BalanceID,
+				Amount:    amount.String(),
+				Fee:       totalFee.String(),
+				Till:      till.Unix(),
 			}
 			jsonData, err := json.Marshal(evData)
 			if err != nil {
@@ -812,9 +894,9 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 			// topup will be executed by balance handler on chanel updated
 			log.Info().Str("total", cc.MustAmount(amount).String()).
 				Str("amount", cc.MustAmount(diffAmount).String()).
-				Str("paid", cc.MustAmount(attachedFee).String()).
-				Str("channel", channel.Address).
-				Msg("capacity purchased")
+				Str("paid", cc.MustAmount(totalFee).String()).
+				Str("channel", channel.Our.Address).
+				Msg("inbound liquidity purchased from us")
 
 			return nil
 		}
@@ -822,65 +904,52 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		return nil, fmt.Errorf("unexpected action type: %s", reflect.TypeOf(data).String())
 	}
 
-	if channel.Our.IsReady() && signedState.State.CounterpartyData == nil {
-		return nil, fmt.Errorf("counterparty state downgrade attempt")
+	theirActHash, ourActHash := make([]byte, 32), make([]byte, 32)
+	theirCondHash, ourCondHash := make([]byte, 32), make([]byte, 32)
+	if !channel.Their.Data.Conditionals.IsEmpty() {
+		theirCondHash = channel.Their.Data.Conditionals.AsCell().Hash()
+	}
+	if !channel.Our.Data.Conditionals.IsEmpty() {
+		ourCondHash = channel.Our.Data.Conditionals.AsCell().Hash()
+	}
+	if !channel.Their.Data.ActionStates.IsEmpty() {
+		theirActHash = channel.Their.Data.ActionStates.AsCell().Hash()
+	}
+	if !channel.Our.Data.ActionStates.IsEmpty() {
+		ourActHash = channel.Our.Data.ActionStates.AsCell().Hash()
 	}
 
-	if signedState.State.CounterpartyData != nil {
-		// if seqno is diff we do additional checks and replace counterparty
-		if signedState.State.CounterpartyData.Seqno != channel.Our.State.Data.Seqno {
-			return nil, fmt.Errorf("counterparty state is incorrect")
-		}
-
-		cp, err := channel.Our.State.Data.Copy()
-		if err != nil {
-			return nil, err
-		}
-		// we replace it to our value, if something is incorrect, signature will fail
-		// we are doing copy to not depend on pointer to our state (which may change during exec)
-		channel.Their.State.CounterpartyData = &cp
+	if !bytes.Equal(theirCondHash, theirSideProposal.ConditionalsHash) {
+		return nil, fmt.Errorf("incorrect their resulting conditionals hash")
+	}
+	if !bytes.Equal(theirActHash, theirSideProposal.ActionStatesHash) {
+		return nil, fmt.Errorf("incorrect their resulting actions hash %s != %s",
+			hex.EncodeToString(theirActHash), hex.EncodeToString(theirSideProposal.ActionStatesHash))
+	}
+	if !bytes.Equal(ourCondHash, ourSideProposal.ConditionalsHash) {
+		return nil, fmt.Errorf("incorrect our resulting conditionals hash")
+	}
+	if !bytes.Equal(ourActHash, ourSideProposal.ActionStatesHash) {
+		return nil, fmt.Errorf("incorrect our resulting actions hash")
 	}
 
-	condHash := make([]byte, 32)
-	if !channel.Their.Conditionals.IsEmpty() {
-		condHash = channel.Their.Conditionals.AsCell().Hash()
-	}
-
-	if !bytes.Equal(condHash, signedState.State.Data.ConditionalsHash) {
-		return nil, fmt.Errorf("incorrect resulting hash")
-	}
-
-	channel.Their.State.Data.Seqno = signedState.State.Data.Seqno
-	channel.Their.State.Data.Sent = signedState.State.Data.Sent
-	channel.Their.State.Data.ConditionalsHash = signedState.State.Data.ConditionalsHash
-	channel.Their.Signature = signedState.Signature
-
-	if err = channel.Their.Verify(channel.TheirOnchain.Key); err != nil {
-		log.Warn().Msg(channel.Their.State.Dump())
-		log.Warn().Msg(signedState.State.Dump())
-		return nil, fmt.Errorf("state looks tampered: %w", err)
-	}
-
-	/*bal, _, err := channel.CalcBalance(true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to calc balance: %w", err)
-	}
-
-	if bal.Sign() < 0 {
-		return nil, fmt.Errorf("balance cannot be negative")
-	}*/
-
-	cp, err := channel.Their.State.Data.Copy()
-	if err != nil {
-		return nil, err
-	}
-	// update our counterparty
-	channel.Our.State.CounterpartyData = &cp
-	cl, err := tlb.ToCell(channel.Our.State)
+	toSign, err := tlb.ToCell(proposedState.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize our state for signing: %w", err)
 	}
-	channel.Our.Signature = payments.Signature{Value: cl.Sign(s.key)}
+
+	if channel.WeLeft {
+		proposedState.SignatureA = payments.Signature{Value: toSign.Sign(s.key)}
+	} else {
+		proposedState.SignatureB = payments.Signature{Value: toSign.Sign(s.key)}
+	}
+
+	newState, err := tlb.ToCell(proposedState)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize new state: %w", err)
+	}
+
+	channel.SignedState = newState
 	channel.WebPeer = fromWeb
 
 	if err = s.db.Transaction(context.Background(), func(ctx context.Context) error {
@@ -898,7 +967,7 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 	}
 	s.touchWorker()
 
-	return &channel.Our.SignedSemiChannel, nil
+	return &proposedState, nil
 }
 
 func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKey, channelAddr *address.Address, action transport.Action) ([]byte, error) {
@@ -910,19 +979,19 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 		return nil, fmt.Errorf("failed to get channel: %w", err)
 	}
 
-	if !bytes.Equal(channel.TheirOnchain.Key, key) {
+	if !bytes.Equal(channel.Their.OnchainInfo.Key, key) {
 		return nil, fmt.Errorf("unauthorized channel")
 	}
 
 	log.Debug().Str("action", reflect.TypeOf(action).String()).Msg("action request process")
 
 	switch data := action.(type) {
-	case transport.RequestRemoveVirtualAction:
+	case transport.RequestRemoveConditionalAction:
 		if !channel.AcceptingActions {
 			return nil, fmt.Errorf("channel is currently not accepting new actions")
 		}
 
-		_, vch, err := payments.FindVirtualChannel(channel.Our.Conditionals, data.Key)
+		_, vch, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, data.ID, s)
 		if err != nil {
 			if errors.Is(err, payments.ErrNotFound) {
 				return nil, fmt.Errorf("virtual channel is not found")
@@ -930,62 +999,47 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 			return nil, fmt.Errorf("failed to find virtual channel: %w", err)
 		}
 
-		if err = s.db.CreateTask(context.Background(), PaymentsTaskPool, "remove-virtual", channel.Address,
-			"remove-virtual-"+base64.StdEncoding.EncodeToString(vch.Key)+"-requested",
+		if err = s.db.CreateTask(context.Background(), PaymentsTaskPool, "remove-virtual", channel.Our.Address,
+			"remove-virtual-"+base64.StdEncoding.EncodeToString(vch.GetKey())+"-requested",
 			db.RemoveVirtualTask{
-				Key: data.Key,
+				Key: vch.GetKey(),
 			}, nil, nil,
 		); err != nil {
 			return nil, fmt.Errorf("failed to create remove-virtual task: %w", err)
 		}
 		s.touchWorker()
-	case transport.CloseVirtualAction:
+	case transport.ExecuteConditionalAction:
 		if !channel.AcceptingActions {
 			return nil, fmt.Errorf("channel is currently not accepting new actions")
 		}
 
-		var vState payments.VirtualChannelState
-		if err = tlb.LoadFromCell(&vState, data.State.BeginParse()); err != nil {
-			return nil, fmt.Errorf("failed to load virtual channel state cell: %w", err)
-		}
-
-		_, vch, err := payments.FindVirtualChannel(channel.Our.Conditionals, data.Key)
+		_, vch, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, data.ID, s)
 		if err != nil {
 			return nil, fmt.Errorf("failed to find virtual channel: %w", err)
 		}
 
-		if !vState.Verify(vch.Key) {
-			return nil, fmt.Errorf("incorrect channel state signature")
+		// prevalidate before tx
+		if err = vch.ValidateState(nil, data.State); err != nil {
+			return nil, fmt.Errorf("failed to validate state: %w", err)
 		}
 
-		if vState.Amount.Cmp(vch.Capacity) > 0 {
-			return nil, fmt.Errorf("amount cannot be > capacity")
-		}
-
-		if vch.Deadline < time.Now().UTC().Unix() {
-			return nil, fmt.Errorf("virtual channel is expired")
+		if vch.GetDeadline().Before(time.Now()) {
+			return nil, fmt.Errorf("condition is expired")
 		}
 
 		if err = s.db.Transaction(context.Background(), func(ctx context.Context) error {
-			if err = s.AddVirtualChannelResolve(ctx, vch.Key, vState); err != nil {
+			if err = s.AddConditionalResolve(ctx, vch.GetKey(), data.State); err != nil {
 				// we don't care if it is older, since party wants to close with this amount
 				if !errors.Is(err, db.ErrNewerStateIsKnown) {
 					return fmt.Errorf("failed to add virtual channel resolve: %w", err)
 				}
 			}
 
-			// serialize by ourselves for safety
-			stateCell, err := vState.ToCell()
-			if err != nil {
-				return fmt.Errorf("failed to serialize virtual channel state: %w", err)
-			}
-
-			tryTill := time.Unix(vch.Deadline+(channel.SafeOnchainClosePeriod/2), 0)
-			if err = s.db.CreateTask(ctx, PaymentsTaskPool, "confirm-close-virtual", channel.Address,
-				"confirm-close-virtual-"+base64.StdEncoding.EncodeToString(vch.Key),
+			tryTill := vch.GetDeadline().Add(time.Duration(channel.SafeOnchainClosePeriod/2) * time.Second)
+			if err = s.db.CreateTask(ctx, PaymentsTaskPool, "confirm-close-virtual", channel.Our.Address,
+				"confirm-close-virtual-"+base64.StdEncoding.EncodeToString(vch.GetKey()),
 				db.ConfirmCloseVirtualTask{
-					VirtualKey: data.Key,
-					State:      stateCell.ToBOC(),
+					VirtualKey: vch.GetKey(),
 				}, nil, &tryTill,
 			); err != nil {
 				return fmt.Errorf("failed to create confirm-close-virtual task: %w", err)
@@ -994,7 +1048,7 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 			// We start uncooperative close at specific moment to have time
 			// to commit resolve onchain in case partner is irresponsible.
 			// But in the same time we give our partner time to
-			uncooperativeAfter := time.Unix(vch.Deadline-channel.SafeOnchainClosePeriod, 0)
+			uncooperativeAfter := vch.GetDeadline().Add(time.Duration(-channel.SafeOnchainClosePeriod) * time.Second)
 			minDelay := time.Now().Add(1 * time.Minute)
 			if !uncooperativeAfter.After(minDelay) {
 				uncooperativeAfter = minDelay
@@ -1002,11 +1056,11 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 
 			// Creating aggressive onchain close task, for the future,
 			// in case we will not be able to communicate with party
-			if err = s.db.CreateTask(ctx, PaymentsTaskPool, "uncooperative-close", channel.Address+"-uncoop",
-				"uncooperative-close-"+channel.Address+"-vc-"+base64.StdEncoding.EncodeToString(vch.Key),
+			if err = s.db.CreateTask(ctx, PaymentsTaskPool, "uncooperative-close", channel.Our.Address+"-uncoop",
+				"uncooperative-close-"+channel.Our.Address+"-vc-"+base64.StdEncoding.EncodeToString(data.ID),
 				db.ChannelUncooperativeCloseTask{
-					Address:                 channel.Address,
-					CheckVirtualStillExists: vch.Key,
+					Address:              channel.Our.Address,
+					CheckCondStillExists: data.ID,
 				}, &uncooperativeAfter, nil,
 			); err != nil {
 				return fmt.Errorf("failed to create uncooperative close task: %w", err)
@@ -1017,6 +1071,96 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 			return nil, err
 		}
 		s.touchWorker()
+	case transport.ExecuteTransactionAction:
+		var req payments.ExternalMsgDoubleSigned
+		err = tlb.LoadFromCell(&req, data.ExternalBody.BeginParse())
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize message request: %w", err)
+		}
+
+		if !bytes.Equal(req.Signed.ChannelID, channel.ID) {
+			return nil, fmt.Errorf("channel id is not match")
+		}
+
+		if req.Signed.SideA == channel.WeLeft {
+			return nil, fmt.Errorf("execute action must be applied to other side")
+		}
+
+		if int64(req.Signed.ValidUntil) < time.Now().Add(90*time.Second).Unix() {
+			return nil, fmt.Errorf("execute action must have at least 90 seconds ttl")
+		}
+
+		if req.Signed.WalletSeqno != channel.Their.LatestWalletSeqno {
+			return nil, fmt.Errorf("to execute action must use last wallet seqno")
+		}
+
+		if len(channel.Their.PendingOnchainTransfers) != 0 {
+			return nil, fmt.Errorf("to execute action must be no pending onchain transfers")
+		} else if channel.Their.PendingOnchainTransfers[pendingIDWallet(req.Signed.WalletSeqno)] != nil {
+			// idempotency
+			return nil, nil
+		}
+
+		var theirSig = req.SignatureA.Value
+		if channel.WeLeft {
+			theirSig = req.SignatureB.Value
+		}
+
+		toSign, err := tlb.ToCell(req.Signed)
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize to sign: %w", err)
+		}
+
+		if !toSign.Verify(channel.Their.OnchainInfo.Key, theirSig) {
+			return nil, fmt.Errorf("invalid signature")
+		}
+
+		p, notEnoughOnchain, err := s.validateOutMessages(ctx, channel, req.Signed.OutActions, true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to validate out messages: %w", err)
+		}
+
+		if len(notEnoughOnchain) > 0 {
+			return nil, fmt.Errorf("not enough onchain balance")
+		}
+
+		if channel.WeLeft {
+			req.SignatureA = payments.Signature{Value: toSign.Sign(s.key)}
+		} else {
+			req.SignatureB = payments.Signature{Value: toSign.Sign(s.key)}
+		}
+
+		msg, err := tlb.ToCell(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize msg: %w", err)
+		}
+
+		err = s.db.Transaction(ctx, func(ctx context.Context) error {
+			channel.Their.PendingOnchainTransfers[pendingIDWallet(req.Signed.WalletSeqno)] = p
+
+			if err = s.db.UpdateChannel(ctx, channel); err != nil {
+				return fmt.Errorf("failed to update channel: %w", err)
+			}
+
+			if err = s.db.CreateTask(ctx, PaymentsTaskPool, "exec-tx-external", channel.Our.Address+"-ext-snd",
+				"exec-tx-external-"+channel.Their.Address+"-seq-"+fmt.Sprint(req.Signed.WalletSeqno),
+				db.ExecuteExternalTxTask{
+					ChannelAddress: channel.Our.Address,
+					OurSide:        false,
+					Body:           msg,
+					WalletSeqno:    req.Signed.WalletSeqno,
+				}, nil, nil,
+			); err != nil {
+				return fmt.Errorf("failed to create execute task: %w", err)
+			}
+
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute db transaction: %w", err)
+		}
+
+		return nil, nil
 	case transport.CooperativeCloseAction:
 		var req payments.CooperativeClose
 		err = tlb.LoadFromCell(&req, data.SignedCloseRequest.BeginParse())
@@ -1024,9 +1168,9 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 			return nil, fmt.Errorf("failed to serialize their close channel request: %w", err)
 		}
 
-		log.Info().Str("address", channel.Address).Msg("received cooperative close request")
+		log.Info().Str("address", channel.Our.Address).Msg("received cooperative close request")
 
-		_, dataCell, ourSignature, err := s.getCooperativeCloseRequest(channel)
+		_, dataCell, ourSignature, err := s.getCooperativeCloseRequest(ctx, channel, !channel.WeLeft)
 		if err != nil {
 			return nil, fmt.Errorf("failed to prepare close channel request: %w", err)
 		}
@@ -1036,7 +1180,7 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 			theirSignature = req.SignatureB.Value
 		}
 
-		if !dataCell.Verify(channel.TheirOnchain.Key, theirSignature) {
+		if !dataCell.Verify(channel.Their.OnchainInfo.Key, theirSignature) {
 			return nil, fmt.Errorf("incorrect party signature")
 		}
 
@@ -1045,55 +1189,6 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 			return nil, fmt.Errorf("failed to update channel: %w", err)
 		}
 
-		return ourSignature, nil
-	case transport.CooperativeCommitAction:
-		if !channel.AcceptingActions {
-			return nil, fmt.Errorf("channel is currently not accepting new actions")
-		}
-
-		var req payments.CooperativeCommit
-		err = tlb.LoadFromCell(&req, data.SignedCommitRequest.BeginParse())
-		if err != nil {
-			return nil, fmt.Errorf("failed to serialize their commit channel request: %w", err)
-		}
-
-		log.Info().Str("address", channel.Address).Msg("received cooperative commit request")
-
-		wOur, wTheir := req.Signed.WithdrawA, req.Signed.WithdrawB
-		if !channel.WeLeft {
-			wOur, wTheir = wTheir, wOur
-		}
-
-		_, dataCell, ourSignature, err := s.getCommitRequest(wOur, wTheir, channel)
-		if err != nil {
-			return nil, fmt.Errorf("failed to prepare commit channel request: %w", err)
-		}
-
-		var theirSignature = req.SignatureA.Value
-		if channel.WeLeft {
-			theirSignature = req.SignatureB.Value
-		}
-
-		if !dataCell.Verify(channel.TheirOnchain.Key, theirSignature) {
-			return nil, fmt.Errorf("incorrect party signature")
-		}
-
-		ourW := req.Signed.WithdrawA.Nano()
-		theirW := req.Signed.WithdrawB.Nano()
-		if !channel.WeLeft {
-			ourW, theirW = theirW, ourW
-		}
-
-		if err = channel.UpdatePendingWithdraw(false, ourW); err != nil {
-			return nil, fmt.Errorf("failed to update our pending withdraw: %w", err)
-		}
-		if err = channel.UpdatePendingWithdraw(true, theirW); err != nil {
-			return nil, fmt.Errorf("failed to update their pending withdraw: %w", err)
-		}
-
-		if err = s.db.UpdateChannel(ctx, channel); err != nil {
-			return nil, fmt.Errorf("failed to update channel: %w", err)
-		}
 		return ourSignature, nil
 	default:
 		return nil, fmt.Errorf("unexpected action type: %s", reflect.TypeOf(data).String())
@@ -1106,7 +1201,7 @@ func (s *Service) discoverChannel(channelAddr *address.Address) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel()
 
-	tx, acc, err := s.ton.GetLastTransaction(ctx, channelAddr)
+	tx, acc, err := s.ton.GetLastTransaction(ctx, channelAddr, time.Time{})
 	if err != nil {
 		log.Debug().Err(err).Str("address", channelAddr.String()).Msg("failed to get last transaction")
 		return false
@@ -1117,7 +1212,7 @@ func (s *Service) discoverChannel(channelAddr *address.Address) bool {
 		return false
 	}
 
-	ch, err := s.channelClient.ParseAsyncChannel(channelAddr, acc.Code, acc.Data, true)
+	ch, err := s.channelClient.ParseChannel(channelAddr, acc.Code, acc.Data, true)
 	if err != nil {
 		log.Warn().Err(err).Str("address", channelAddr.String()).Msg("failed to parse channel")
 		return false
@@ -1128,10 +1223,169 @@ func (s *Service) discoverChannel(channelAddr *address.Address) bool {
 	}
 
 	log.Info().Str("address", channelAddr.String()).Msg("discovered channel, scheduling check")
-	s.updates <- ChannelUpdatedEvent{
-		Transaction: tx,
-		Channel:     ch,
+	s.updates <- &ChannelUpdatedEvent{
+		Transaction:   tx,
+		LatestChannel: ch,
 	}
 
 	return true
+}
+
+func (s *Service) fetchChannelSideOnchainBalances(ctx context.Context, addr *address.Address, blockAfter time.Time) (map[string]*big.Int, error) {
+	acc, err := s.ton.GetAccount(ctx, addr, blockAfter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get account: %w", err)
+	}
+
+	log.Debug().Str("address", addr.String()).Msg("fetching onchain balances")
+
+	balances := map[string]*big.Int{}
+	if b := s.knownBalanceTypes[payments.GetTONBalanceID()]; b != nil && b.Enabled {
+		// TODO: subtract reserved value?
+		balances[payments.GetTONBalanceID()] = acc.Balance.Nano()
+	}
+
+	if !acc.ExtraCurrencies.IsEmpty() {
+		ecs, err := acc.ExtraCurrencies.LoadAll()
+		if err != nil {
+			return nil, fmt.Errorf("failed to load extra currencies: %w", err)
+		}
+
+		for _, dictKV := range ecs {
+			currencyId := payments.GetECBalanceID(uint32(dictKV.Key.MustLoadUInt(32)))
+			if b := s.knownBalanceTypes[currencyId]; b != nil && b.Enabled {
+				balances[currencyId] = dictKV.Value.MustLoadVarUInt(32)
+			}
+		}
+	}
+
+	for id, bt := range s.knownBalanceTypes {
+		if bt.Enabled && bt.JettonClient != nil {
+			amt, err := bt.JettonClient.GetBalance(ctx, addr, blockAfter)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get jetton %s balance: %w", bt.JettonClient.GetRootAddress().String(), err)
+			}
+			balances[id] = amt
+			log.Debug().Str("address", addr.String()).Str("symbol", bt.Symbol).Str("amount", bt.MustAmount(amt).String()).Msg("fetched jetton balance")
+		}
+	}
+
+	return balances, nil
+}
+
+func calcBalancesDiff(before, after map[string]*big.Int) map[string]*big.Int {
+	changes := map[string]*big.Int{}
+	for s2, b := range after {
+		diff := new(big.Int).Set(b)
+		prev := before[s2]
+		if prev != nil && prev.Sign() > 0 {
+			diff.Sub(diff, prev)
+		}
+
+		if diff.Sign() != 0 {
+			changes[s2] = diff
+		}
+	}
+	return changes
+}
+
+type tmpFullResolver struct {
+	newActions []payments.Action
+	s          *Service
+}
+
+func (s tmpFullResolver) GetKnownBalanceTypes() []*payments.CoinConfig {
+	return s.s.GetKnownBalanceTypes()
+}
+
+func (s tmpFullResolver) ResolveBalanceType(id string) (*payments.CoinConfig, error) {
+	return s.s.ResolveCoinConfig(id)
+}
+
+func (s tmpFullResolver) ResolveAction(ctx context.Context, id []byte) (payments.Action, error) {
+	a, err := s.s.ResolveAction(ctx, id)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			for _, action := range s.newActions {
+				if bytes.Equal(id, action.Serialize().Hash()) {
+					return action, nil
+				}
+			}
+		}
+		return nil, err
+	}
+	return a, nil
+}
+
+var ErrActionAlreadyExists = fmt.Errorf("action already exists")
+
+func (s *Service) addActionToChannel(ctx context.Context, channel *db.Channel, code *cell.Cell) (payments.FullResolver, error) {
+	newCodeHash := code.Hash()
+
+	a, err := payments.CodeToAction(ctx, code, s)
+	if err != nil {
+		return nil, fmt.Errorf("failed to detect action type: %w", err)
+	}
+
+	// after reserialization must match
+	if !bytes.Equal(a.Serialize().Hash(), newCodeHash) {
+		return nil, fmt.Errorf("incorrect action hash")
+	}
+
+	_, err = channel.Their.Data.ActionStates.LoadValue(a.IDCell())
+	if err != nil {
+		if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
+			return nil, fmt.Errorf("failed to find action in proposed state: %w", err)
+		}
+	} else {
+		// already exists
+		return nil, ErrActionAlreadyExists
+	}
+
+	validateAddrs := func(addrA, addrB *address.Address) error {
+		ourAddr, theirAddr := addrA, addrB
+		if !channel.WeLeft {
+			ourAddr, theirAddr = theirAddr, ourAddr
+		}
+
+		if ourAddr.String() != channel.Our.Address || theirAddr.String() != channel.Their.Address {
+			return fmt.Errorf("incorrect addresses %s != %s || %s != %s", ourAddr.String(), channel.Our.Address, theirAddr.String(), channel.Their.Address)
+		}
+		return nil
+	}
+
+	switch act := a.(type) {
+	case *actions.ActionSendJetton:
+		if err = validateAddrs(act.AddressA, act.AddressB); err != nil {
+			return nil, fmt.Errorf("failed to validate jetton action addresses: %w", err)
+		}
+	case *actions.ActionSendTon:
+		if err = validateAddrs(act.AddressA, act.AddressB); err != nil {
+			return nil, fmt.Errorf("failed to validate ton action addresses: %w", err)
+		}
+	case *actions.ActionSendEC:
+		if err = validateAddrs(act.AddressA, act.AddressB); err != nil {
+			return nil, fmt.Errorf("failed to validate ec action addresses: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported action type: %T", a)
+	}
+
+	if err = channel.Their.Data.ActionStates.Set(a.IDCell(), a.GetEmptyState()); err != nil {
+		return nil, fmt.Errorf("failed to set action state: %w", err)
+	}
+
+	return tmpFullResolver{[]payments.Action{a}, s}, nil
+}
+
+func (s *Service) formatDiff(balances map[string]*big.Int) map[string]string {
+	res := map[string]string{}
+	for id, b := range balances {
+		cc, err := s.ResolveCoinConfig(id)
+		if err != nil {
+			continue
+		}
+		res[cc.Symbol] = cc.MustAmount(b).String()
+	}
+	return res
 }

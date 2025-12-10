@@ -4,6 +4,8 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"github.com/xssnick/ton-payment-network/pkg/payments"
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"math/big"
 )
@@ -27,12 +29,12 @@ type BalanceControlConfig struct {
 type CoinConfig struct {
 	Enabled               bool
 	VirtualTunnelConfig   VirtualConfig
-	MisbehaviorFine       string
-	ExcessFeeTon          string
 	Symbol                string
 	Decimals              uint8
 	MinCapacityRequest    string
 	FeePerWithdrawPropose string
+
+	balanceID string
 
 	BalanceControl *BalanceControlConfig
 }
@@ -45,13 +47,22 @@ func (c *CoinConfig) MustAmountDecimal(str string) tlb.Coins {
 	return tlb.MustFromDecimal(str, int(c.Decimals))
 }
 
+func (c *CoinConfig) GetBalanceID() string {
+	if c.balanceID == "" {
+		panic("empty balance id")
+	}
+	return c.balanceID
+}
+
 type ChannelsConfig struct {
 	SupportedCoins CoinTypes
 
 	BufferTimeToCommit              uint32
 	QuarantineDurationSec           uint32
+	ActionsDuration                 uint32
 	ConditionalCloseDurationSec     uint32
 	MinSafeVirtualChannelTimeoutSec uint32
+	ReplicationMessageAttachAmount  string
 }
 
 type CoinTypes struct {
@@ -106,9 +117,9 @@ func Generate() (*Config, error) {
 		ADNLServerKey:                  nodePriv.Seed(),
 		PaymentNodePrivateKey:          priv.Seed(),
 		WalletPrivateKey:               walletPriv.Seed(),
-		APIListenAddr:                  "0.0.0.0:8096",
+		APIListenAddr:                  "127.0.0.1:8096",
 		WebTransportListenAddr:         "",
-		MetricsListenAddr:              "0.0.0.0:8097",
+		MetricsListenAddr:              "127.0.0.1:8097",
 		MetricsNamespace:               "",
 		NodeListenAddr:                 "0.0.0.0:17555",
 		ExternalIP:                     "",
@@ -129,8 +140,6 @@ func Generate() (*Config, error) {
 						ProxyFeePercent:             0.5,
 						AllowTunneling:              true,
 					},
-					MisbehaviorFine:       "3",
-					ExcessFeeTon:          "0.25",
 					Symbol:                "TON",
 					Decimals:              9,
 					MinCapacityRequest:    "1",
@@ -153,8 +162,6 @@ func Generate() (*Config, error) {
 							ProxyFeePercent:             0.8,
 							AllowTunneling:              false,
 						},
-						MisbehaviorFine:       "12",
-						ExcessFeeTon:          "0.35",
 						Symbol:                "USDT",
 						Decimals:              6,
 						MinCapacityRequest:    "3",
@@ -166,11 +173,14 @@ func Generate() (*Config, error) {
 			},
 			BufferTimeToCommit:              3 * 3600,
 			QuarantineDurationSec:           6 * 3600,
+			ActionsDuration:                 2 * 3600,
 			ConditionalCloseDurationSec:     3 * 3600,
 			MinSafeVirtualChannelTimeoutSec: 60,
+			ReplicationMessageAttachAmount:  "0.1",
 		},
 	}
 
+	cfg.assignBalanceID()
 	return cfg, nil
 }
 
@@ -221,4 +231,16 @@ func Upgrade(cfg *Config) bool {
 
 	cfg.Version = LatestConfigVersion
 	return true
+}
+
+func (cfg *Config) assignBalanceID() {
+	cfg.ChannelConfig.SupportedCoins.Ton.balanceID = payments.GetTONBalanceID()
+	for s, cc := range cfg.ChannelConfig.SupportedCoins.Jettons {
+		cc.balanceID = payments.GetJettonBalanceID(address.MustParseAddr(s))
+		cfg.ChannelConfig.SupportedCoins.Jettons[s] = cc
+	}
+	for s, cc := range cfg.ChannelConfig.SupportedCoins.ExtraCurrencies {
+		cc.balanceID = payments.GetECBalanceID(s)
+		cfg.ChannelConfig.SupportedCoins.ExtraCurrencies[s] = cc
+	}
 }

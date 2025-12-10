@@ -69,7 +69,10 @@ func (w *Wallet) DoTransactionMany(ctx context.Context, reason string, messages 
 		txMsg := map[string]any{
 			"to":      msg.To.String(),
 			"amtNano": msg.Amount.Nano().String(),
-			"body":    base64.StdEncoding.EncodeToString(msg.Body.ToBOC()),
+		}
+
+		if msg.Body != nil {
+			txMsg["body"] = base64.StdEncoding.EncodeToString(msg.Body.ToBOC())
 		}
 
 		if siBoc != "" {

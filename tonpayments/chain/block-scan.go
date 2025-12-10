@@ -14,6 +14,7 @@ import (
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,7 @@ type Scanner struct {
 	api       ton.APIClientWrapped
 	client    *payments.Client
 	lastBlock uint32
+	events    chan<- any
 
 	taskPool       chan accFetchTask
 	shardLastSeqno map[string]uint32
@@ -37,11 +39,12 @@ type Scanner struct {
 	mx sync.RWMutex
 }
 
-func NewScanner(api ton.APIClientWrapped, lastBlock uint32, lg zerolog.Logger) *Scanner {
+func NewScanner(api ton.APIClientWrapped, lastBlock uint32, lg zerolog.Logger, events chan<- any) *Scanner {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Scanner{
 		api:            api,
 		log:            lg,
+		events:         events,
 		client:         payments.NewPaymentChannelClient(client.NewTON(api)),
 		lastBlock:      lastBlock,
 		taskPool:       make(chan accFetchTask, 1000),
@@ -65,13 +68,13 @@ func (v *Scanner) Stop() {
 	// TODO: wait for completion
 }
 
-func (v *Scanner) Start(ctx context.Context, ch chan<- any) error {
+func (v *Scanner) Start(ctx context.Context) error {
 	master, err := v.api.GetMasterchainInfo(ctx)
 	if err != nil {
 		return fmt.Errorf("get masterchain info err: %w", err)
 	}
 
-	go v.accFetcherWorker(ch, 60)
+	go v.accFetcherWorker(30)
 
 	if v.lastBlock > 0 {
 		master, err = v.api.LookupBlock(ctx, master.Workchain, master.Shard, v.lastBlock)
@@ -97,21 +100,40 @@ func (v *Scanner) Start(ctx context.Context, ch chan<- any) error {
 
 			var transactionsNum, shardBlocksNum uint64
 			wg := sync.WaitGroup{}
+			mx := sync.Mutex{}
+			evsMap := map[uint32][]*tonpayments.ChannelUpdatedEvent{}
 			wg.Add(len(masters))
 			for _, m := range masters {
 				go func(m *ton.BlockIDExt) {
-					txNum, bNum := v.fetchBlock(context.Background(), m)
+					txNum, bNum, evs := v.fetchBlock(v.globalCtx, m)
 					atomic.AddUint64(&transactionsNum, txNum)
 					atomic.AddUint64(&shardBlocksNum, bNum)
+					mx.Lock()
+					evsMap[m.SeqNo] = evs
+					mx.Unlock()
 					wg.Done()
 				}(m)
 			}
 
 			wg.Wait()
+
+			select {
+			case <-v.globalCtx.Done():
+				v.log.Warn().Uint32("master", master.SeqNo).Msg("scanner stopped")
+				return
+			default:
+			}
+
 			took := time.Since(start)
 
 			for _, m := range masters {
-				ch <- tonpayments.BlockCheckedEvent{
+				// report transactions (already sorted)
+				for _, e := range evsMap[m.SeqNo] {
+					v.events <- e
+				}
+
+				// report block completed
+				v.events <- tonpayments.BlockCheckedEvent{
 					Seqno: m.SeqNo,
 				}
 			}
@@ -217,7 +239,7 @@ func (v *Scanner) getNotSeenShards(ctx context.Context, api ton.APIClientWrapped
 	return append(ret, shard), genTime, nil
 }
 
-func (v *Scanner) fetchBlock(ctx context.Context, master *ton.BlockIDExt) (transactionsNum, shardBlocksNum uint64) {
+func (v *Scanner) fetchBlock(ctx context.Context, master *ton.BlockIDExt) (transactionsNum, shardBlocksNum uint64, events []*tonpayments.ChannelUpdatedEvent) {
 	v.log.Debug().Uint32("seqno", master.SeqNo).Msg("scanning master")
 
 	tm := time.Now()
@@ -283,6 +305,7 @@ func (v *Scanner) fetchBlock(ctx context.Context, master *ton.BlockIDExt) (trans
 		}
 		v.log.Debug().Uint32("seqno", master.SeqNo).Dur("took", time.Since(tm)).Msg("not seen shards fetched")
 
+		var mx sync.Mutex
 		var shardsWg sync.WaitGroup
 		shardsWg.Add(len(newShards))
 		shardBlocksNum = uint64(len(newShards))
@@ -329,6 +352,15 @@ func (v *Scanner) fetchBlock(ctx context.Context, master *ton.BlockIDExt) (trans
 					}
 
 					var wg sync.WaitGroup
+					cb := func(ev *tonpayments.ChannelUpdatedEvent) {
+						wg.Done()
+
+						if ev != nil {
+							mx.Lock()
+							events = append(events, ev)
+							mx.Unlock()
+						}
+					}
 
 					sab := shardAccBlocks.All()
 					for _, kv := range sab {
@@ -360,7 +392,7 @@ func (v *Scanner) fetchBlock(ctx context.Context, master *ton.BlockIDExt) (trans
 								master:   master,
 								tx:       &tx,
 								addr:     address.NewAddress(0, byte(shard.Workchain), ab.Addr),
-								callback: wg.Done,
+								callback: cb,
 							}
 							// 1 tx for account is enough for us, as a reference
 							break
@@ -375,6 +407,15 @@ func (v *Scanner) fetchBlock(ctx context.Context, master *ton.BlockIDExt) (trans
 						Msg("scanning transactions")
 
 					wg.Wait()
+
+					if len(events) > 0 {
+						v.log.Debug().Uint32("seqno", shard.SeqNo).
+							Str("shard", shardHex(uint64(shard.Shard))).
+							Int32("wc", shard.Workchain).
+							Int("num", len(events)).
+							Msg("detected channel related events")
+					}
+
 					return nil
 				}()
 				if err != nil {
@@ -383,6 +424,11 @@ func (v *Scanner) fetchBlock(ctx context.Context, master *ton.BlockIDExt) (trans
 			}(shard)
 		}
 		shardsWg.Wait()
+
+		sort.Slice(events, func(i, j int) bool {
+			return events[i].Transaction.LT < events[j].Transaction.LT
+		})
+
 		return
 	}
 }

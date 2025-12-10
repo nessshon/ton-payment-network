@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/xssnick/ton-payment-network/pkg/log"
+	"github.com/xssnick/ton-payment-network/pkg/payments"
+	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 	"time"
 )
 
@@ -116,7 +118,7 @@ func (d *DB) GetUrgentPeers(ctx context.Context) ([][]byte, error) {
 }
 
 func (d *DB) CreateChannel(ctx context.Context, channel *Channel) error {
-	key := []byte("ch:" + channel.Address)
+	key := []byte("ch:" + channel.Our.Address)
 
 	return d.Transaction(ctx, func(ctx context.Context) error {
 		tx := d.storage.GetExecutor(ctx)
@@ -146,13 +148,64 @@ func (d *DB) CreateChannel(ctx context.Context, channel *Channel) error {
 	})
 }
 
-func (d *DB) UpdateChannel(ctx context.Context, channel *Channel) error {
-	key := []byte("ch:" + channel.Address)
+func (d *DB) CreateActionCode(ctx context.Context, action *cell.Cell) error {
+	key := []byte("ac:" + base64.StdEncoding.EncodeToString(action.Hash()))
 
 	return d.Transaction(ctx, func(ctx context.Context) error {
 		tx := d.storage.GetExecutor(ctx)
 
-		curChannel, err := d.GetChannel(ctx, channel.Address)
+		has, err := tx.Has(key)
+		if err != nil {
+			return fmt.Errorf("failed to check existance: %w", err)
+		}
+		if has {
+			return nil
+		}
+
+		data, err := json.Marshal(action)
+		if err != nil {
+			return fmt.Errorf("failed to encode json: %w", err)
+		}
+
+		if err = tx.Put(key, data); err != nil {
+			return fmt.Errorf("failed to put: %w", err)
+		}
+		return nil
+	})
+}
+
+func (d *DB) GetActionCode(ctx context.Context, hash []byte) (*cell.Cell, error) {
+	tx := d.storage.GetExecutor(ctx)
+
+	key := []byte("ac:" + base64.StdEncoding.EncodeToString(hash))
+
+	data, err := tx.Get(key)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to get from db: %w", err)
+	}
+
+	var code *cell.Cell
+	if err = json.Unmarshal(data, &code); err != nil {
+		return nil, fmt.Errorf("failed to decode json data: %w", err)
+	}
+
+	if !bytes.Equal(code.Hash(), hash) {
+		return nil, fmt.Errorf("invalid action code hash")
+	}
+
+	return code, nil
+}
+
+func (d *DB) UpdateChannel(ctx context.Context, channel *Channel) error {
+	key := []byte("ch:" + channel.Our.Address)
+
+	return d.Transaction(ctx, func(ctx context.Context) error {
+		tx := d.storage.GetExecutor(ctx)
+
+		curChannel, err := d.GetChannel(ctx, channel.Our.Address)
 		if err != nil {
 			return fmt.Errorf("failed to get channel: %w", err)
 		}
@@ -197,15 +250,6 @@ func (d *DB) GetChannel(ctx context.Context, addr string) (*Channel, error) {
 		return nil, fmt.Errorf("failed to decode json data: %w", err)
 	}
 
-	if err = channel.Our.Verify(d.pubKey); err != nil {
-		log.Warn().Msg(channel.Our.State.Dump())
-		return nil, fmt.Errorf("looks like our db state was tampered: %w", err)
-	}
-	if err = channel.Their.Verify(channel.TheirOnchain.Key); err != nil {
-		log.Warn().Msg(channel.Their.State.Dump())
-		return nil, fmt.Errorf("looks like their db state was tampered: %w", err)
-	}
-
 	return channel, nil
 }
 
@@ -223,16 +267,7 @@ func (d *DB) GetChannels(ctx context.Context, key ed25519.PublicKey, status Chan
 			return nil, fmt.Errorf("failed to decode json data: %w", err)
 		}
 
-		if (status == ChannelStateAny || channel.Status == status) && (key == nil || bytes.Equal(channel.TheirOnchain.Key, key)) {
-			if err := channel.Our.Verify(d.pubKey); err != nil {
-				log.Warn().Msg(channel.Our.State.Dump())
-				return nil, fmt.Errorf("looks like our db state was tampered: %w", err)
-			}
-			if err := channel.Their.Verify(channel.TheirOnchain.Key); err != nil {
-				log.Warn().Msg(channel.Their.State.Dump())
-				return nil, fmt.Errorf("looks like their db state was tampered: %w", err)
-			}
-
+		if (status == ChannelStateAny || channel.Status == status) && (key == nil || bytes.Equal(channel.Their.OnchainInfo.Key, key)) {
 			channels = append(channels, channel)
 		}
 	}
@@ -269,6 +304,101 @@ func (d *DB) CreateChannelEvent(ctx context.Context, channel *Channel, at time.T
 
 		if d.onChannelHistoryUpdate != nil {
 			d.onChannelHistoryUpdate(ctx, channel, item)
+		}
+
+		return nil
+	})
+}
+
+func (d *DB) SaveChannelPendingState(ctx context.Context, channel *Channel, body payments.StateBody) error {
+	state := PendingChannelState{
+		Seqno:     body.Seqno,
+		OurData:   channel.Our.Data,
+		TheirData: channel.Their.Data,
+	}
+
+	key, err := channel.getSavedChannelStateKey(body)
+	if err != nil {
+		return err
+	}
+
+	return d.Transaction(ctx, func(ctx context.Context) error {
+		tx := d.storage.GetExecutor(ctx)
+
+		has, err := tx.Has(key)
+		if err != nil {
+			return fmt.Errorf("failed to check existance: %w", err)
+		}
+		if has {
+			return nil
+		}
+
+		data, err := json.Marshal(state)
+		if err != nil {
+			return fmt.Errorf("failed to encode json: %w", err)
+		}
+
+		if err = tx.Put(key, data); err != nil {
+			return fmt.Errorf("failed to put: %w", err)
+		}
+
+		return nil
+	})
+}
+
+func (d *DB) GetChannelPendingState(ctx context.Context, channel *Channel, body payments.StateBody) (*PendingChannelState, error) {
+	tx := d.storage.GetExecutor(ctx)
+
+	key, err := channel.getSavedChannelStateKey(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate key: %w", err)
+	}
+
+	data, err := tx.Get(key)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to get from db: %w", err)
+	}
+
+	var state PendingChannelState
+	if err = json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("failed to decode json data: %w", err)
+	}
+
+	return &state, nil
+}
+
+func (d *DB) CleanupChannelPendingStates(ctx context.Context, channel *Channel, body payments.StateBody) error {
+	key, err := channel.getSavedChannelStateKey(body)
+	if err != nil {
+		return fmt.Errorf("failed to generate key: %w", err)
+	}
+
+	return d.Transaction(ctx, func(ctx context.Context) error {
+		tx := d.storage.GetExecutor(ctx)
+
+		if err = tx.Delete(key); err != nil {
+			return fmt.Errorf("failed to delete: %w", err)
+		}
+
+		// Delete all states with seqno less than current
+		seqnoBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(seqnoBytes, body.Seqno)
+		prefix := append([]byte("chp:"+channel.Our.Address+":"), seqnoBytes...)
+
+		iter := tx.NewIterator([]byte("chp:"+channel.Our.Address+":"), true)
+		defer iter.Release()
+
+		for iter.Next() {
+			ikey := iter.Key()
+			if bytes.Compare(ikey, prefix) >= 0 {
+				break
+			}
+			if err = tx.Delete(ikey); err != nil {
+				return fmt.Errorf("failed to delete old state: %w", err)
+			}
 		}
 
 		return nil
@@ -324,5 +454,17 @@ func (ch *Channel) getChannelHistoryIndexKey(at time.Time, typ ChannelHistoryEve
 	atBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(atBytes, uint64(at.UTC().UnixNano()))
 
-	return append(append([]byte("chs:"+ch.Address+":"), atBytes...), fmt.Sprintf("%d", typ)...)
+	return append(append([]byte("chs:"+ch.Our.Address+":"), atBytes...), fmt.Sprintf("%d", typ)...)
+}
+
+func (ch *Channel) getSavedChannelStateKey(body payments.StateBody) ([]byte, error) {
+	c, err := tlb.ToCell(body)
+	if err != nil {
+		return nil, err
+	}
+
+	seq := make([]byte, 8)
+	binary.BigEndian.PutUint64(seq, body.Seqno)
+
+	return append(append([]byte("chp:"+ch.Our.Address+":"), seq...), c.Hash()...), nil
 }

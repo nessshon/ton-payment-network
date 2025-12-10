@@ -8,14 +8,12 @@ import (
 	"fmt"
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
-	"github.com/xssnick/ton-payment-network/tonpayments/config"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
-	"math"
-	"math/big"
 	"math/rand"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -39,12 +37,12 @@ type Peer struct {
 }
 
 type Service interface {
-	ReviewChannelConfig(prop ProposeChannelConfig) (*address.Address, config.CoinConfig, error)
-	ProcessAction(ctx context.Context, key ed25519.PublicKey, lockId int64, channelAddr *address.Address, signedState payments.SignedSemiChannel, action Action, updateProof *cell.Cell, fromWeb bool) (*payments.SignedSemiChannel, error)
+	ReviewChannelConfig(prop ProposeChannelConfig) error
+	ProcessAction(ctx context.Context, key ed25519.PublicKey, lockId int64, channelAddr *address.Address, signedState payments.StateBodySigned, action Action, fromWeb bool) (*payments.StateBodySigned, error)
 	ProcessActionRequest(ctx context.Context, key ed25519.PublicKey, channelAddr *address.Address, action Action) ([]byte, error)
 	ProcessExternalChannelLock(ctx context.Context, key ed25519.PublicKey, addr *address.Address, id int64, lock bool) error
 	ProcessIsChannelLocked(ctx context.Context, key ed25519.PublicKey, addr *address.Address, id int64) error
-	OpenChannelOffchain(ctx context.Context, cfg *payments.OpenConfigContainer, codeHash, authorizedKey []byte, urgent, withWeb bool) (*address.Address, error)
+	OpenChannelOffchain(ctx context.Context, cfg *payments.OpenConfigContainer, codeHash, authorizedKey []byte, urgent, withWeb bool) (*address.Address, []byte, error)
 }
 
 type Transport struct {
@@ -97,7 +95,11 @@ func (t *Transport) handleQuery(ctx context.Context, peer *Peer, msg any) (any, 
 	case Ping:
 		return Pong{Value: q.Value}, nil
 	case Authenticate:
+		log.Debug().Str("key", base64.StdEncoding.EncodeToString(q.Key)).Msg("received auth from peer")
+
 		if q.Timestamp < time.Now().Add(-30*time.Second).Unix() || q.Timestamp > time.Now().UTC().Unix() {
+			log.Debug().Str("key", base64.StdEncoding.EncodeToString(q.Key)).Int64("timestamp", q.Timestamp).Msg("outdated auth data")
+
 			return nil, fmt.Errorf("outdated auth data")
 		}
 
@@ -108,10 +110,12 @@ func (t *Transport) handleQuery(ctx context.Context, peer *Peer, msg any) (any, 
 			Timestamp: q.Timestamp,
 		})
 		if err != nil {
+			log.Debug().Str("key", base64.StdEncoding.EncodeToString(q.Key)).Msg("failed to hash their auth data")
 			return nil, fmt.Errorf("failed to hash their auth data: %w", err)
 		}
 
 		if !ed25519.Verify(q.Key, authData, q.Signature) {
+			log.Debug().Str("key", base64.StdEncoding.EncodeToString(q.Key)).Msg("incorrect signature")
 			return nil, fmt.Errorf("incorrect signature")
 		}
 
@@ -135,9 +139,11 @@ func (t *Transport) handleQuery(ctx context.Context, peer *Peer, msg any) (any, 
 			Timestamp: q.Timestamp,
 		})
 		if err != nil {
+			log.Debug().Str("key", base64.StdEncoding.EncodeToString(q.Key)).Msg("failed to hash our auth data")
 			return nil, fmt.Errorf("failed to hash our auth data: %w", err)
 		}
 
+		log.Debug().Str("key", base64.StdEncoding.EncodeToString(q.Key)).Msg("sending auth response")
 		return Authenticate{
 			Key:       t.channelKey.Public().(ed25519.PublicKey),
 			Timestamp: q.Timestamp,
@@ -169,16 +175,7 @@ func (t *Transport) handleQuery(ctx context.Context, peer *Peer, msg any) (any, 
 		return Decision{Agreed: reason == "", Reason: reason}, nil
 	case ProposeChannelConfig:
 		var res ChannelConfigDecision
-		if addr, cc, err := t.svc.ReviewChannelConfig(q); err == nil {
-			res.WalletAddr = addr.Data()
-
-			res.ProxyAllowed = cc.VirtualTunnelConfig.AllowTunneling
-			if res.ProxyAllowed {
-				res.ProxyMaxCap = tlb.MustFromDecimal(cc.VirtualTunnelConfig.ProxyMaxCapacity, int(cc.Decimals)).Nano().Bytes()
-				res.ProxyMinFee = tlb.MustFromDecimal(cc.VirtualTunnelConfig.ProxyMinFee, int(cc.Decimals)).Nano().Bytes()
-				res.ProxyPercentFeeFloat = math.Float64bits(cc.VirtualTunnelConfig.ProxyFeePercent)
-			}
-
+		if err := t.svc.ReviewChannelConfig(q); err == nil {
 			res.Ok = true
 		} else {
 			res.Reason = err.Error()
@@ -190,7 +187,7 @@ func (t *Transport) handleQuery(ctx context.Context, peer *Peer, msg any) (any, 
 			return nil, fmt.Errorf("not authorized")
 		}
 
-		var state payments.SignedSemiChannel
+		var state payments.StateBodySigned
 		if err := tlb.LoadFromCell(&state, q.SignedState.BeginParse()); err != nil {
 			return nil, fmt.Errorf("failed to parse channel state")
 		}
@@ -199,26 +196,15 @@ func (t *Transport) handleQuery(ctx context.Context, peer *Peer, msg any) (any, 
 		ok := true
 		reason := ""
 		updateProof, err := t.svc.ProcessAction(ctx, peer.AuthKey, q.LockID,
-			address.NewAddress(0, 0, q.ChannelAddr), state, q.Action, q.UpdateProof, t.web)
+			address.NewAddress(0, 0, q.ChannelAddr), state, q.Action, t.web)
 		if err != nil {
 			reason = err.Error()
 			ok = false
-			log.Debug().Str("addr", address.NewAddress(0, 0, q.ChannelAddr).String()).Str("reason", reason).Msg("failed to process action")
+			log.Debug().Str("action", reflect.TypeOf(q.Action).String()).Str("addr", address.NewAddress(0, 0, q.ChannelAddr).String()).Str("reason", reason).Msg("failed to process action")
 		} else {
 			if updCell, err = tlb.ToCell(updateProof); err != nil {
 				return nil, fmt.Errorf("failed to serialize state cell: %w", err)
 			}
-
-			sk := cell.CreateProofSkeleton()
-			if updateProof.State.CounterpartyData != nil {
-				// include counterparty to proof (last ref)
-				sk.ProofRef(int(updCell.RefsNum() - 1))
-			}
-			// prune conditionals, leave only hashes for optimization
-			if updCell, err = updCell.CreateProof(sk); err != nil {
-				return nil, fmt.Errorf("failed to create proof from state cell: %w", err)
-			}
-			updCell = updCell.MustPeekRef(0)
 		}
 
 		return ProposalDecision{Agreed: ok, Reason: reason, SignedState: updCell}, nil
@@ -247,12 +233,12 @@ func (t *Transport) handleQuery(ctx context.Context, peer *Peer, msg any) (any, 
 			return nil, fmt.Errorf("failed to parse channel open config")
 		}
 
-		addr, err := t.svc.OpenChannelOffchain(ctx, &ctr, q.CodeHash, peer.AuthKey, false, t.web)
+		addr, initBodySig, err := t.svc.OpenChannelOffchain(ctx, &ctr, q.CodeHash, peer.AuthKey, false, t.web)
 		if err != nil {
-			return OpenChannelOffchainResponse{make([]byte, 32), err.Error()}, nil
+			return OpenChannelOffchainResponse{make([]byte, 32), nil, err.Error()}, nil
 		}
 
-		return OpenChannelOffchainResponse{addr.Data(), ""}, nil
+		return OpenChannelOffchainResponse{addr.Data(), initBodySig, ""}, nil
 	}
 
 	return nil, fmt.Errorf("unknown query")
@@ -397,33 +383,17 @@ func (t *Transport) preparePeer(ctx context.Context, key []byte, connect bool) (
 	return peer, nil
 }
 
-func (t *Transport) ProposeChannelConfig(ctx context.Context, theirChannelKey ed25519.PublicKey, prop ProposeChannelConfig) (*address.Address, VirtualConfigResponse, error) {
+func (t *Transport) ProposeChannelConfig(ctx context.Context, theirChannelKey ed25519.PublicKey, prop ProposeChannelConfig) error {
 	var res ChannelConfigDecision
 	err := t.doQuery(ctx, theirChannelKey, prop, &res, true)
 	if err != nil {
-		return nil, VirtualConfigResponse{}, fmt.Errorf("failed to make request: %w", err)
+		return fmt.Errorf("failed to make request: %w", err)
 	}
 
 	if !res.Ok {
-		return nil, VirtualConfigResponse{}, fmt.Errorf("rejected: %s", res.Reason)
+		return fmt.Errorf("rejected: %s", res.Reason)
 	}
-
-	cfg := VirtualConfigResponse{
-		ProxyFeePercent: math.Float64frombits(res.ProxyPercentFeeFloat),
-		AllowTunneling:  res.ProxyAllowed,
-	}
-
-	if res.ProxyAllowed {
-		if len(res.ProxyMinFee) > 32 || len(res.ProxyMaxCap) > 32 {
-			return nil, VirtualConfigResponse{}, fmt.Errorf("invalid proxy config")
-		}
-
-		cfg.ProxyMinFee = new(big.Int).SetBytes(res.ProxyMinFee)
-		cfg.ProxyMaxCapacity = new(big.Int).SetBytes(res.ProxyMaxCap)
-	}
-
-	// TODO: check proxy fees and config
-	return address.NewAddress(0, 0, res.WalletAddr), cfg, nil
+	return nil
 }
 
 func (t *Transport) RequestChannelLock(ctx context.Context, theirChannelKey ed25519.PublicKey, channel *address.Address, id int64, lock bool) (*Decision, error) {
@@ -451,14 +421,13 @@ func (t *Transport) IsChannelUnlocked(ctx context.Context, theirChannelKey ed255
 	return &res, nil
 }
 
-func (t *Transport) ProposeAction(ctx context.Context, lockId int64, channelAddr *address.Address, theirChannelKey []byte, state, updateProof *cell.Cell, action Action) (*ProposalDecision, error) {
+func (t *Transport) ProposeAction(ctx context.Context, lockId int64, channelAddr *address.Address, theirChannelKey []byte, state *cell.Cell, action Action) (*ProposalDecision, error) {
 	var res ProposalDecision
 	err := t.doQuery(ctx, theirChannelKey, ProposeAction{
 		LockID:      lockId,
 		ChannelAddr: channelAddr.Data(),
 		Action:      action,
 		SignedState: state,
-		UpdateProof: updateProof,
 	}, &res, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to make request: %w", err)
@@ -478,10 +447,10 @@ func (t *Transport) RequestAction(ctx context.Context, channelAddr *address.Addr
 	return &res, nil
 }
 
-func (t *Transport) OpenOffchainChannel(ctx context.Context, theirChannelKey, codeHash []byte, cfg payments.OpenConfigContainer) (*address.Address, error) {
+func (t *Transport) OpenOffchainChannel(ctx context.Context, theirChannelKey, codeHash []byte, cfg payments.OpenConfigContainer) (*address.Address, []byte, error) {
 	cl, err := tlb.ToCell(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize config to cell: %w", err)
+		return nil, nil, fmt.Errorf("failed to serialize config to cell: %w", err)
 	}
 
 	var res OpenChannelOffchainResponse
@@ -491,17 +460,20 @@ func (t *Transport) OpenOffchainChannel(ctx context.Context, theirChannelKey, co
 		NodeVersion: payments.Version,
 	}, &res, false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to make request: %w", err)
+		return nil, nil, fmt.Errorf("failed to make request: %w", err)
 	}
 	if res.Reason != "" {
-		return nil, fmt.Errorf("failed to open channel, response: %s", res.Reason)
+		return nil, nil, fmt.Errorf("failed to open channel, response: %s", res.Reason)
+	}
+	if len(res.InitBodySignature) != ed25519.SignatureSize {
+		return nil, nil, fmt.Errorf("invalid signature size: %d", len(res.InitBodySignature))
 	}
 
-	return address.NewAddress(0, 0, res.Addr), nil
+	return address.NewAddress(0, 0, res.Addr), res.InitBodySignature, nil
 }
 
 func (t *Transport) doQuery(ctx context.Context, theirKey []byte, req, resp tl.Serializable, connect bool) error {
-	maxWait := 7 * time.Second
+	maxWait := 10 * time.Second
 	if connect {
 		maxWait = 30 * time.Second
 	}

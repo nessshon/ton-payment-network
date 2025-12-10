@@ -14,6 +14,7 @@ import (
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tl"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -68,8 +69,10 @@ func (h *HTTP) StartServer(addr string) error {
 	m.HandleFunc("/web-channel/api/v1/subscribe", h.sseHandler)
 	m.HandleFunc("/web-channel/api/v1/subscribe/auth", h.sseAuthHandler)
 
+	m.HandleFunc("/web-channel/api/v1/ton/external", h.sendExternalHandler)
 	m.HandleFunc("/web-channel/api/v1/ton/account", h.getAccountHandler)
 	m.HandleFunc("/web-channel/api/v1/ton/transaction/last", h.getLastTxHandler)
+	m.HandleFunc("/web-channel/api/v1/ton/transaction/by_in_msg_hash", h.getTxByInMsgHashHandler)
 	m.HandleFunc("/web-channel/api/v1/ton/transaction/list", h.getListTxHandler)
 	m.HandleFunc("/web-channel/api/v1/ton/jetton/wallet", h.getJettonWalletAddrHandler)
 	m.HandleFunc("/web-channel/api/v1/ton/jetton/balance", h.getJettonWalletBalanceHandler)
@@ -86,15 +89,55 @@ func (h *HTTP) getAccountHandler(w http.ResponseWriter, r *http.Request) {
 	addr, err := address.ParseAddr(r.URL.Query().Get("address"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	acc, err := h.ton.GetAccount(r.Context(), addr)
+	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	acc, err := h.ton.GetAccount(r.Context(), addr, time.Unix(after, 0))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	_ = json.NewEncoder(w).Encode(acc)
+}
+
+func (h *HTTP) sendExternalHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	addr, err := address.ParseAddr(r.URL.Query().Get("address"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	type request struct {
+		Body *cell.Cell `json:"body"`
+	}
+
+	var req request
+	if err = json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	msgHash, err := h.ton.SendWaitExternalMessage(r.Context(), addr, req.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"MsgHash": msgHash,
+	})
 }
 
 func (h *HTTP) getLastTxHandler(w http.ResponseWriter, r *http.Request) {
@@ -106,9 +149,16 @@ func (h *HTTP) getLastTxHandler(w http.ResponseWriter, r *http.Request) {
 	addr, err := address.ParseAddr(r.URL.Query().Get("address"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	tx, acc, err := h.ton.GetLastTransaction(r.Context(), addr)
+	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	tx, acc, err := h.ton.GetLastTransaction(r.Context(), addr, time.Unix(after, 0))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -116,6 +166,45 @@ func (h *HTTP) getLastTxHandler(w http.ResponseWriter, r *http.Request) {
 
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"Account":     acc,
+		"Transaction": tx,
+	})
+}
+
+func (h *HTTP) getTxByInMsgHashHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	addr, err := address.ParseAddr(r.URL.Query().Get("address"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	hash, err := base64.URLEncoding.DecodeString(r.URL.Query().Get("hash"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(hash) != 32 {
+		http.Error(w, "hash len incorrect", http.StatusBadRequest)
+		return
+	}
+
+	tx, err := h.ton.GetTransactionByInMsgHash(r.Context(), addr, hash, time.Unix(after, 0))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"Transaction": tx,
 	})
 }
@@ -199,9 +288,16 @@ func (h *HTTP) getJettonWalletBalanceHandler(w http.ResponseWriter, r *http.Requ
 	addr, err := address.ParseAddr(r.URL.Query().Get("address"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	res, err := h.ton.GetJettonBalance(r.Context(), jet, addr)
+	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	res, err := h.ton.GetJettonBalance(r.Context(), jet, addr, time.Unix(after, 0))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -234,6 +330,11 @@ func (h *HTTP) pushHandler(w http.ResponseWriter, r *http.Request) {
 	h.mx.RUnlock()
 	if pk == nil {
 		http.Error(w, "peer not found, subscribe first", http.StatusUnauthorized)
+		return
+	}
+
+	if !e.Verify(e.Key) {
+		http.Error(w, "invalid signature", http.StatusBadRequest)
 		return
 	}
 
@@ -272,6 +373,7 @@ func (h *HTTP) pushHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Error().Err(err).Msg("failed to serialize response")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	_ = json.NewEncoder(w).Encode(Event{Data: data})

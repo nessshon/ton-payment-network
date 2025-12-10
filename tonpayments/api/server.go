@@ -7,12 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
-	"github.com/xssnick/ton-payment-network/tonpayments/config"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
+	"math/big"
 	"net/http"
 	"time"
 )
@@ -29,18 +29,24 @@ type Service interface {
 	GetActiveChannel(ctx context.Context, addr string) (*db.Channel, error)
 	ListChannels(ctx context.Context, key ed25519.PublicKey, status db.ChannelStatus) ([]*db.Channel, error)
 
-	GetVirtualChannelMeta(ctx context.Context, key ed25519.PublicKey) (*db.VirtualChannelMeta, error)
+	GetVirtualChannelMeta(ctx context.Context, key ed25519.PublicKey) (*db.ConditionalMeta, error)
 
 	RequestCooperativeClose(ctx context.Context, channelAddr string) error
 	RequestUncooperativeClose(ctx context.Context, addr string) error
-	CloseVirtualChannel(ctx context.Context, virtualKey ed25519.PublicKey) error
-	AddVirtualChannelResolve(ctx context.Context, virtualKey ed25519.PublicKey, state payments.VirtualChannelState) error
-	OpenVirtualChannel(ctx context.Context, with, instructionKey, finalDest ed25519.PublicKey, private ed25519.PrivateKey, chain []transport.OpenVirtualInstruction, vch payments.VirtualChannel, jettonMaster *address.Address, ecID uint32) error
-	OpenChannelWithNode(ctx context.Context, nodeKey ed25519.PublicKey, jettonMaster *address.Address, ecID uint32) (*address.Address, error)
-	TopupChannel(ctx context.Context, ch *db.Channel, amount tlb.Coins) error
-	RequestWithdraw(ctx context.Context, addr *address.Address, amount tlb.Coins, doTxOurself bool) error
-	ResolveCoinConfig(jetton string, ecID uint32, onlyEnabled bool) (*config.CoinConfig, error)
+	CloseConditional(ctx context.Context, virtualKey ed25519.PublicKey) error
+	AddConditionalResolve(ctx context.Context, virtualKey ed25519.PublicKey, state *cell.Cell) error
+	CreateSendConditional(ctx context.Context, instructionKey ed25519.PublicKey, private ed25519.PrivateKey, firstPart, lastPart transport.TunnelChainPart, chain []transport.AddConditionalInstruction, cc *payments.CoinConfig) error
+	OpenChannelWithNode(ctx context.Context, nodeKey ed25519.PublicKey) (*address.Address, error)
+	TopupChannel(ctx context.Context, channel *db.Channel, balanceId string, amount tlb.Coins, unlockBalanceControl bool) error
+	RequestCommitAction(ctx context.Context, addr *address.Address, actionId []byte) error
+	ResolveCoinConfig(balanceId string) (*payments.CoinConfig, error)
+	ResolveCoinConfigBySymbol(sym string) (*payments.CoinConfig, error)
+	RequestWithdrawToAddr(ctx context.Context, channelAddr string, addr *address.Address, cc *payments.CoinConfig, amount *big.Int) error
 	GetPrivateKey() ed25519.PrivateKey
+
+	ResolveAction(ctx context.Context, id []byte) (payments.Action, error)
+	ResolveBalanceType(id string) (*payments.CoinConfig, error)
+	GetKnownBalanceTypes() []*payments.CoinConfig
 }
 
 type Success struct {
@@ -87,12 +93,14 @@ func NewServer(addr, webhook, webhookKey string, svc Service, queue Queue, crede
 	mx.HandleFunc("/api/v1/channel/onchain/list", s.checkCredentials(s.handleChannelsList))
 	mx.HandleFunc("/api/v1/channel/onchain", s.checkCredentials(s.handleChannelGet))
 
-	mx.HandleFunc("/api/v1/channel/virtual/open", s.checkCredentials(s.handleVirtualOpen))
-	mx.HandleFunc("/api/v1/channel/virtual/close", s.checkCredentials(s.handleVirtualClose))
-	mx.HandleFunc("/api/v1/channel/virtual/transfer", s.checkCredentials(s.handleVirtualTransfer))
-	mx.HandleFunc("/api/v1/channel/virtual/state", s.checkCredentials(s.handleVirtualState))
-	mx.HandleFunc("/api/v1/channel/virtual/list", s.checkCredentials(s.handleVirtualList))
-	mx.HandleFunc("/api/v1/channel/virtual", s.checkCredentials(s.handleVirtualGet))
+	mx.HandleFunc("/api/v1/channel/conditional/open", s.checkCredentials(s.handleVirtualOpen))
+	mx.HandleFunc("/api/v1/channel/conditional/close", s.checkCredentials(s.handleVirtualClose))
+	mx.HandleFunc("/api/v1/channel/conditional/transfer", s.checkCredentials(s.handleVirtualTransfer))
+	mx.HandleFunc("/api/v1/channel/conditional/state", s.checkCredentials(s.handleVirtualState))
+	mx.HandleFunc("/api/v1/channel/conditional/list", s.checkCredentials(s.handleVirtualList))
+	mx.HandleFunc("/api/v1/channel/conditional", s.checkCredentials(s.handleVirtualGet))
+
+	// TODO: actions
 
 	s.srv = http.Server{
 		Addr:    addr,
@@ -155,26 +163,4 @@ func parseKey(key string) (ed25519.PublicKey, error) {
 		return nil, fmt.Errorf("incorrect key length, should be 32")
 	}
 	return ed25519.PublicKey(k), nil
-}
-
-func parseState(state string, key ed25519.PublicKey) (payments.VirtualChannelState, error) {
-	s, err := base64.StdEncoding.DecodeString(state)
-	if err != nil {
-		return payments.VirtualChannelState{}, fmt.Errorf("failed to decode state from hex: %w", err)
-	}
-
-	cll, err := cell.FromBOC(s)
-	if err != nil {
-		return payments.VirtualChannelState{}, fmt.Errorf("failed to parse state: %w", err)
-	}
-
-	var st payments.VirtualChannelState
-	if err = tlb.LoadFromCell(&st, cll.BeginParse()); err != nil {
-		return payments.VirtualChannelState{}, fmt.Errorf("failed to parse last known resolve state: %w", err)
-	}
-
-	if !st.Verify(key) {
-		return payments.VirtualChannelState{}, fmt.Errorf("failed to verify last known resolve state: %w", err)
-	}
-	return st, nil
 }

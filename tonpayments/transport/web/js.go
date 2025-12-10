@@ -86,7 +86,7 @@ func (h *HTTP) Connect(ctx context.Context, channelKey ed25519.PublicKey) (*tran
 	connCh := make(chan struct{})
 	var connected bool
 	url := fmt.Sprintf("/web-channel/api/v1/subscribe?timestamp=%d&token=%s&key=%s", ts, token, base64.URLEncoding.EncodeToString(h.GetOurID()))
-	stop, err := h.subscribeSSE(ctx, url, func(msg []byte) {
+	stop, err := h.subscribeSSE(ctx, url, func(ctx context.Context, msg []byte) {
 		var e Event
 		if err = json.Unmarshal(msg, &e); err != nil {
 			log.Error().Err(err).Msg("event json parse err")
@@ -120,7 +120,10 @@ func (h *HTTP) Connect(ctx context.Context, channelKey ed25519.PublicKey) (*tran
 			return
 		}
 
-		_, err = peer.pushJSON(ctx, "/web-channel/api/v1/push", Event{Key: h.GetOurID(), Data: resp, QueryID: e.QueryID})
+		ev := Event{Key: h.GetOurID(), Data: resp, QueryID: e.QueryID}
+		ev.Sign(h.key)
+
+		_, err = peer.pushJSON(ctx, "/web-channel/api/v1/push", ev)
 		if err != nil {
 			log.Error().Err(err).Msg("push response err")
 			return
@@ -157,8 +160,14 @@ func (p *PeerConnection) Query(ctx context.Context, msg, res tl.Serializable) er
 		return err
 	}
 
-	resBytes, err := p.pushJSON(ctx, "/web-channel/api/v1/push", Event{Key: p.key.Public().(ed25519.PublicKey), Data: req})
+	e := Event{Key: p.key.Public().(ed25519.PublicKey), Data: req}
+	e.Sign(p.key)
+
+	resBytes, err := p.pushJSON(ctx, "/web-channel/api/v1/push", e)
 	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			p.close()
+		}
 		return err
 	}
 
@@ -228,6 +237,8 @@ func await(p js.Value) (js.Value, error) {
 	return res, err
 }
 
+var ErrUnauthorized = errors.New("unauthorized")
+
 func (p *PeerConnection) pushJSON(ctx context.Context, url string, body any) ([]byte, error) {
 	reqData, err := json.Marshal(body)
 	if err != nil {
@@ -255,8 +266,13 @@ func (p *PeerConnection) pushJSON(ctx context.Context, url string, body any) ([]
 	}
 
 	if !resp.Get("ok").Bool() {
+		status := resp.Get("status").Int()
+		if status == 401 {
+			return nil, ErrUnauthorized
+		}
+
 		txt, _ := await(resp.Call("text"))
-		return nil, fmt.Errorf("http %d: %s", resp.Get("status").Int(), txt.String())
+		return nil, fmt.Errorf("http %d: %s", status, txt.String())
 	}
 
 	jsData, err := await(resp.Call("json"))
@@ -268,7 +284,7 @@ func (p *PeerConnection) pushJSON(ctx context.Context, url string, body any) ([]
 	return []byte(str), nil
 }
 
-func (h *HTTP) subscribeSSE(ctx context.Context, url string, onMsg func(msg []byte), onDisconnect func()) (func(), error) {
+func (h *HTTP) subscribeSSE(ctx context.Context, url string, onMsg func(ctx context.Context, msg []byte), onDisconnect func()) (func(), error) {
 	eventSourceConstructor := js.Global().Get("EventSource")
 	if eventSourceConstructor.IsUndefined() {
 		return nil, fmt.Errorf("EventSource not supported")
@@ -276,9 +292,12 @@ func (h *HTTP) subscribeSSE(ctx context.Context, url string, onMsg func(msg []by
 	eventSource := eventSourceConstructor.New(url)
 
 	onMessage := js.FuncOf(func(this js.Value, args []js.Value) any {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
 		event := args[0]
 		data := event.Get("data").String()
-		onMsg([]byte(data))
+		onMsg(ctx, []byte(data))
 		return nil
 	})
 
@@ -288,7 +307,16 @@ func (h *HTTP) subscribeSSE(ctx context.Context, url string, onMsg func(msg []by
 	onError := js.FuncOf(func(this js.Value, args []js.Value) any {
 		js.Global().Get("console").Call("log", args[0])
 
-		log.Error().Msg("sse err")
+		// EventSource fires an error event on transient reconnect attempts too. Only
+		// trigger disconnect handling when the stream is fully closed so we don't
+		// thrash the connection after successful requests.
+		readyState := eventSource.Get("readyState").Int()
+		if readyState == 2 { // CLOSED
+			log.Error().Msg("sse closed")
+			onDisconnect()
+		}
+
+		// log.Error().Msg("sse err")
 		return nil
 	})
 	eventSource.Call("addEventListener", "error", onError)

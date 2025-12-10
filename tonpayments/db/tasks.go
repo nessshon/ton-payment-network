@@ -14,6 +14,7 @@ type Task struct {
 	Queue          string
 	Data           json.RawMessage
 	LockedTill     *time.Time
+	LockedAt       *time.Time
 	ExecuteAfter   time.Time
 	ReExecuteAfter *time.Time
 	ExecuteTill    *time.Time
@@ -26,39 +27,91 @@ type ChannelTask struct {
 	Address string
 }
 
+type FinalizeSettleTask struct {
+	ChannelAddress      string
+	ExpectedActionsHash []byte
+}
+
 type BlockOffset struct {
 	Seqno     uint32
 	UpdatedAt time.Time
 }
 
 type ChannelUncooperativeCloseTask struct {
-	Address                 string
-	CheckVirtualStillExists []byte
-	ChannelInitiatedAt      *time.Time
+	Address              string
+	CheckCondStillExists []byte
+	ChannelInitiatedAt   *time.Time
 }
 
 type TopupTask struct {
 	Address            string
 	Amount             string
+	BalanceID          string
 	ChannelInitiatedAt time.Time
+	FromBalanceControl bool
 }
 
-type WithdrawTask struct {
+type ActionCommitTask struct {
 	Address            string
-	Amount             string
+	ActionId           []byte
 	ChannelInitiatedAt time.Time
-	Propose            bool
+	ForFee             bool
 }
 
-type WithdrawExecuteTask struct {
-	Address       string
-	SignedRequest *cell.Cell
+type CommitExecuteTask struct {
+	ChannelAddress string
+	SignedRequest  *cell.Cell
 }
 
-type SettleStepTask struct {
+type WaitPendingTxTask struct {
+	ChannelAddress string
+	IsOurSide      bool
+	PendingID      string
+
+	MsgHash   []byte
+	StartedAt time.Time
+}
+
+type WaitDepositCompletionTask struct {
+	ChannelAddress string
+	BalanceID      string
+
+	UnlockBalanceControl bool
+	MsgHash              []byte
+	FromAddress          string
+	StartedAt            time.Time
+}
+
+type RefreshOnchainBalanceTask struct {
+	ChannelAddress string
+	IsOurSide      bool
+	BlockAfter     int64
+}
+
+type ExecuteExternalTxTask struct {
+	ChannelAddress string
+	OurSide        bool
+	Body           *cell.Cell
+	WalletSeqno    uint32
+}
+
+type RequestExternalTxTask struct {
+	ChannelAddress string
+	PackedMessages *cell.Cell
+	WalletSeqno    uint32
+}
+
+type SettleConditionalStepTask struct {
 	Step               int
 	Address            string
-	Messages           [][]byte
+	Message            *cell.Cell
+	ChannelInitiatedAt *time.Time
+}
+
+type SettleActionStepTask struct {
+	Step               int
+	Address            string
+	Message            *cell.Cell
 	ChannelInitiatedAt *time.Time
 }
 
@@ -69,12 +122,10 @@ type ChannelCooperativeCloseTask struct {
 
 type ConfirmCloseVirtualTask struct {
 	VirtualKey []byte
-	State      []byte
 }
 
 type CloseNextVirtualTask struct {
 	VirtualKey []byte
-	State      []byte
 }
 
 type CommitVirtualTask struct {
@@ -82,16 +133,19 @@ type CommitVirtualTask struct {
 	VirtualKey     []byte
 }
 
-type OpenVirtualTask struct {
+type AddConditionalTask struct {
 	SenderKey           ed25519.PublicKey
 	FinalDestinationKey ed25519.PublicKey // known only for initiator
 	PrevChannelAddress  string
+	PrevConditionalID   []byte
 	ChannelAddress      string
-	VirtualKey          []byte
 	Deadline            int64
-	Fee                 string
-	Capacity            string
-	Action              transport.OpenVirtualAction
+	TransportAction     transport.AddConditionalAction
+}
+
+type SwapTask struct {
+	ChannelAddress  string
+	TransportAction transport.SwapAction
 }
 
 type AskRemoveVirtualTask struct {
@@ -100,13 +154,8 @@ type AskRemoveVirtualTask struct {
 }
 
 type AskCloseVirtualTask struct {
-	Key            []byte
+	ID             []byte
 	ChannelAddress string
-}
-
-type RentCapacityTask struct {
-	ChannelAddress string
-	Amount         string
 }
 
 type IncrementStatesTask struct {
