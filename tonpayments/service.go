@@ -647,7 +647,7 @@ func (s *Service) scanSettledConditionals(ctx context.Context, ch *db.Channel, t
 			}
 
 			// close next virtual channels since they commited latest resolve onchain
-			if err = s.CloseConditional(ctx, cond.GetKey()); err != nil && !errors.Is(err, ErrCannotCloseOngoingVirtual) {
+			if err = s.CloseConditional(ctx, cond.GetKey()); err != nil && !errors.Is(err, ErrCannotCloseOutgoingVirtual) {
 				log.Warn().Err(err).Bool("our", isOur).Str("address", ch.Our.Address).
 					Str("key", base64.StdEncoding.EncodeToString(cond.GetKey())).Msg("failed to create task for close virtual channel")
 			}
@@ -1842,14 +1842,14 @@ func (s *Service) IncrementStates(ctx context.Context, channelAddr string, wantR
 	return nil
 }
 
-func (s *Service) RequestRemoveVirtual(ctx context.Context, key ed25519.PublicKey) error {
+func (s *Service) RemoveConditional(ctx context.Context, key ed25519.PublicKey) error {
 	meta, err := s.db.GetVirtualChannelMeta(ctx, key)
 	if err != nil {
 		return err
 	}
 
 	if meta.Incoming == nil {
-		return fmt.Errorf("virtual channel has no incoming channel")
+		return fmt.Errorf("conditional has no incoming channel")
 	}
 
 	if meta.Outgoing != nil && !meta.Outgoing.UncooperativeDeadline.Before(time.Now()) {
@@ -1857,18 +1857,17 @@ func (s *Service) RequestRemoveVirtual(ctx context.Context, key ed25519.PublicKe
 	}
 
 	if meta.Status != db.ConditionalStateActive && meta.Status != db.ConditionalStatePending {
-		return fmt.Errorf("virtual channel is not active or pending")
+		return fmt.Errorf("conditional is not active or pending")
 	}
 
-	err = s.db.CreateTask(ctx, PaymentsTaskPool, "ask-remove-cond", meta.Incoming.ChannelAddress,
-		"ask-remove-cond-"+base64.StdEncoding.EncodeToString(meta.Key)+"-desire",
-		db.AskRemoveVirtualTask{
-			ChannelAddress: meta.Incoming.ChannelAddress,
-			Key:            meta.Key,
+	err = s.db.CreateTask(ctx, PaymentsTaskPool, "remove-cond", meta.Incoming.ChannelAddress,
+		"remove-cond-"+base64.StdEncoding.EncodeToString(meta.Key),
+		db.RemoveConditionalTask{
+			Key: meta.Key,
 		}, nil, nil,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to create ask-remove-cond task: %w", err)
+		return fmt.Errorf("failed to create remove-cond task: %w", err)
 	}
 	return nil
 }

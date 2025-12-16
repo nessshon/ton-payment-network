@@ -129,7 +129,7 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			return nil
 		}
 	case transport.RemoveConditionalAction:
-		idx, vch, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, act.ID, s)
+		idx, vch, err := payments.FindConditional(ctx, channel.Their.Data.Conditionals, act.ID, s)
 		if err != nil {
 			if errors.Is(err, payments.ErrNotFound) {
 				// idempotency, if not found we consider it already closed
@@ -139,19 +139,30 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			return nil, nil, err
 		}
 
-		if err = channel.Our.Data.Conditionals.Delete(idx); err != nil {
+		meta, err := s.db.GetVirtualChannelMeta(ctx, vch.GetKey())
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to load virtual channel meta: %w", err)
+		}
+
+		if err = channel.Their.Data.Conditionals.Delete(idx); err != nil {
 			return nil, nil, err
 		}
 
 		onSuccess = func(_ context.Context) error {
+			if s.webhook != nil {
+				if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeRemove, meta); err != nil {
+					return fmt.Errorf("failed to push virtual channel close event: %w", err)
+				}
+			}
+
 			log.Info().Fields(vch.GetLogInfo()).
-				Msg("our conditional successfully removed")
+				Msg("their conditional successfully removed")
 			return nil
 		}
-	case transport.ConfirmExecuteConditionalAction:
+	case transport.ExecuteConditionalAction:
 		meta := details.(*db.ConditionalMeta)
 
-		idx, cond, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, act.ID, s)
+		idx, cond, err := payments.FindConditional(ctx, channel.Their.Data.Conditionals, act.ID, s)
 		if err != nil {
 			if errors.Is(err, payments.ErrNotFound) {
 				// idempotency, if not found we consider it already closed
@@ -169,22 +180,22 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			return nil, nil, fmt.Errorf("conditional has expired")
 		}
 
-		if err = channel.Our.Data.Conditionals.Delete(idx); err != nil {
+		if err = channel.Their.Data.Conditionals.Delete(idx); err != nil {
 			return nil, nil, err
 		}
 
 		actId := cond.GetAction().IDCell()
-		actState, err := channel.Our.Data.ActionStates.LoadValue(actId)
+		actState, err := channel.Their.Data.ActionStates.LoadValue(actId)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to load action state: %w", err)
 		}
 
-		newActState, err := cond.Execute(actState.MustToCell(), act.State, channel.Our.LockedDeposits)
+		newActState, err := cond.Execute(actState.MustToCell(), act.State, channel.Their.LockedDeposits)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to execute condition: %w", err)
 		}
 
-		if err = channel.Our.Data.ActionStates.Set(actId, newActState); err != nil {
+		if err = channel.Their.Data.ActionStates.Set(actId, newActState); err != nil {
 			return nil, nil, fmt.Errorf("failed to set action: %w", err)
 		}
 
@@ -193,9 +204,14 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			return nil, nil, fmt.Errorf("failed to calc balance diff: %w", err)
 		}
 
-		evData := db.ChannelHistoryActionTransferOutData{
+		var senderKey []byte
+		if meta.Incoming != nil {
+			senderKey = meta.Incoming.SenderKey
+		}
+
+		evData := db.ChannelHistoryActionTransferInData{
 			Amounts: s.formatDiff(balanceDiff),
-			To:      meta.FinalDestination,
+			From:    senderKey,
 		}
 		jsonData, err := json.Marshal(evData)
 		if err != nil {
@@ -203,16 +219,29 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 		}
 
 		onSuccess = func(ctx context.Context) error {
+			meta.Status = db.ConditionalStateClosed
+			meta.UpdatedAt = time.Now()
+			if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
+				return fmt.Errorf("failed to update virtual channel meta: %w", err)
+			}
+
 			if err = s.db.CreateChannelEvent(ctx, channel, time.Now(), db.ChannelHistoryItem{
-				Action: db.ChannelHistoryActionTransferOut,
+				Action: db.ChannelHistoryActionTransferIn,
 				Data:   jsonData,
 			}); err != nil {
 				return fmt.Errorf("failed to create channel event: %w", err)
 			}
 
+			if s.webhook != nil {
+				if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeClose, meta); err != nil {
+					return fmt.Errorf("failed to push virtual channel close event: %w", err)
+				}
+			}
+
 			log.Info().Fields(cond.GetLogInfo()).
 				Str("channel", channel.Our.Address).
-				Msg("conditional close confirmed")
+				Fields(s.repackDiffForLogs(evData.Amounts)).
+				Msg("their conditional executed, amounts received")
 			return nil
 		}
 	case transport.RentCapacityAction:

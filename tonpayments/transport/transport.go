@@ -316,6 +316,8 @@ func (t *Transport) auth(ctx context.Context, peer *Peer) error {
 		return fmt.Errorf("failed to hash our auth data: %w", err)
 	}
 
+	log.Debug().Str("key", base64.StdEncoding.EncodeToString(peer.AuthKey)).Msg("sending auth request")
+	
 	var res Authenticate
 	err = peer.Conn.Query(ctx, Authenticate{
 		Key:       t.channelKey.Public().(ed25519.PublicKey),

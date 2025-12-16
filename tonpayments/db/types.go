@@ -186,8 +186,6 @@ type AgreedData struct {
 	ActionStates *cell.Dictionary
 }
 
-var ErrNewerStateIsKnown = errors.New("newer state is already known")
-
 func NewAgreedData() AgreedData {
 	return AgreedData{
 		Conditionals: cell.NewDict(256),
@@ -455,12 +453,15 @@ func (ch *Channel) CalcDepositFee(cc *payments.CoinConfig, newAmount *big.Int, t
 	return result
 }
 
-func (ch *ConditionalMeta) AddKnownResolve(cond payments.Conditional, state *cell.Cell) error {
+func (ch *ConditionalMeta) AddKnownResolve(cond payments.Conditional, state *cell.Cell, errOnOlderState bool) error {
 	if cond.GetDeadline().Before(time.Now()) {
 		return fmt.Errorf("conditional has expired")
 	}
 
 	if err := cond.ValidateState(ch.LastKnownResolve, state); err != nil {
+		if !errOnOlderState && errors.Is(err, payments.ErrNewerConditionalStateIsKnown) {
+			return nil
+		}
 		return fmt.Errorf("failed to validate add state: %w", err)
 	}
 

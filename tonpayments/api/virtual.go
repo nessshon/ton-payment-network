@@ -228,7 +228,7 @@ func (s *Server) handleVirtualState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err = s.svc.AddConditionalResolve(r.Context(), key, req.State); err != nil && !errors.Is(err, db.ErrNewerStateIsKnown) {
+	if err = s.svc.AddConditionalResolve(r.Context(), key, req.State); err != nil && !errors.Is(err, payments.ErrNewerConditionalStateIsKnown) {
 		writeErr(w, 500, "failed to add virtual channel state: "+err.Error())
 		return
 	}
@@ -259,7 +259,7 @@ func (s *Server) handleVirtualClose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err = s.svc.AddConditionalResolve(r.Context(), key, req.State); err != nil && !errors.Is(err, db.ErrNewerStateIsKnown) {
+	if err = s.svc.AddConditionalResolve(r.Context(), key, req.State); err != nil && !errors.Is(err, payments.ErrNewerConditionalStateIsKnown) {
 		writeErr(w, 500, "failed to add virtual channel state: "+err.Error())
 		return
 	}

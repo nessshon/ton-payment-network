@@ -432,7 +432,7 @@ func (c *ConditionalVirtualChannel) ValidateState(oldStateCell, newStateCell *ce
 	}
 
 	if oldStateCell != nil && oldState.Amount.Cmp(newState.Amount) > 0 {
-		return fmt.Errorf("amount is less than known state")
+		return payments.ErrNewerConditionalStateIsKnown
 	}
 
 	if newState.Amount.Cmp(c.Capacity) > 0 {

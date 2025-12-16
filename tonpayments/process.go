@@ -153,7 +153,7 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 			return nil
 		}
 	case transport.RemoveConditionalAction:
-		index, vch, err := payments.FindConditional(ctx, channel.Their.Data.Conditionals, data.ID, s)
+		index, vch, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, data.ID, s)
 		if err != nil {
 			if errors.Is(err, payments.ErrNotFound) {
 				// idempotency
@@ -162,37 +162,33 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 			return nil, fmt.Errorf("failed to find virtual channel in their prev state: %w", err)
 		}
 
-		meta, err := s.db.GetVirtualChannelMeta(context.Background(), vch.GetKey())
+		meta, err := s.db.GetVirtualChannelMeta(ctx, vch.GetKey())
 		if err != nil {
 			return nil, fmt.Errorf("failed to load virtual channel meta: %w", err)
 		}
 
-		if vch.GetDeadline().Before(time.Now()) && meta.Status != db.ConditionalStateWantRemove {
-			return nil, fmt.Errorf("virtual channel is not expired")
-		}
-
-		if err = channel.Their.Data.Conditionals.Delete(index); err != nil {
+		if err = channel.Our.Data.Conditionals.Delete(index); err != nil {
 			return nil, fmt.Errorf("failed to remove condition with index %s: %w", index.String(), err)
 		}
 
 		toExecute = func(ctx context.Context) error {
-			meta.Status = db.ConditionalStateRemoved
-			meta.UpdatedAt = time.Now()
-			if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
-				return fmt.Errorf("failed to update virtual channel meta: %w", err)
-			}
-
-			if s.webhook != nil {
-				if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeRemove, meta); err != nil {
-					return fmt.Errorf("failed to push virtual channel close event: %w", err)
+			if meta.Incoming != nil {
+				err = s.db.CreateTask(ctx, PaymentsTaskPool, "remove-cond", meta.Incoming.ChannelAddress,
+					"remove-cond-"+base64.StdEncoding.EncodeToString(meta.Key),
+					db.RemoveConditionalTask{
+						Key: meta.Key,
+					}, nil, nil,
+				)
+				if err != nil {
+					return fmt.Errorf("failed to create remove-cond task: %w", err)
 				}
 			}
 
-			log.Info().Str("id", base64.StdEncoding.EncodeToString(data.ID)).Msg("conditional removed")
+			log.Info().Str("id", base64.StdEncoding.EncodeToString(data.ID)).Msg("our conditional removed")
 			return nil
 		}
-	case transport.ConfirmExecuteConditionalAction:
-		index, cond, err := payments.FindConditional(ctx, channel.Their.Data.Conditionals, data.ID, s)
+	case transport.ExecuteConditionalAction:
+		index, cond, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, data.ID, s)
 		if err != nil {
 			if errors.Is(err, payments.ErrNotFound) {
 				// idempotency
@@ -206,30 +202,26 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 			return nil, fmt.Errorf("failed to load virtual channel meta: %w", err)
 		}
 
-		if meta.Status != db.ConditionalStateWantClose {
-			return nil, fmt.Errorf("virtual channel close was not requested")
-		}
-
-		if err = meta.AddKnownResolve(cond, data.State); err != nil {
+		if err = meta.AddKnownResolve(cond, data.State, false); err != nil {
 			return nil, fmt.Errorf("failed to add resolve: %w", err)
 		}
 
 		actId := cond.GetAction().IDCell()
-		actBefore, err := channel.Their.Data.ActionStates.LoadValue(actId)
+		actBefore, err := channel.Our.Data.ActionStates.LoadValue(actId)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load before action state: %w", err)
 		}
 
-		newActState, err := cond.Execute(actBefore.MustToCell(), data.State, channel.Their.LockedDeposits)
+		newActState, err := cond.Execute(actBefore.MustToCell(), data.State, channel.Our.LockedDeposits)
 		if err != nil {
 			return nil, fmt.Errorf("failed to execute condition: %w", err)
 		}
 
-		if err = channel.Their.Data.Conditionals.Delete(index); err != nil {
+		if err = channel.Our.Data.Conditionals.Delete(index); err != nil {
 			return nil, fmt.Errorf("failed to remove condition with index %s: %w", index.String(), err)
 		}
 
-		if err = channel.Their.Data.ActionStates.Set(actId, newActState); err != nil {
+		if err = channel.Our.Data.ActionStates.Set(actId, newActState); err != nil {
 			return nil, fmt.Errorf("failed to update action state: %w", err)
 		}
 
@@ -238,43 +230,41 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 			return nil, fmt.Errorf("failed to calc balance diff: %w", err)
 		}
 
+		evData := db.ChannelHistoryActionTransferOutData{
+			Amounts: s.formatDiff(balanceDiff),
+			To:      meta.FinalDestination,
+		}
+
+		jsonData, err := json.Marshal(evData)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to marshal event data")
+		}
+
 		toExecute = func(ctx context.Context) error {
-			meta.Status = db.ConditionalStateClosed
-			meta.UpdatedAt = time.Now()
-			if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
-				return fmt.Errorf("failed to update virtual channel meta: %w", err)
-			}
-
-			if s.webhook != nil {
-				if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeClose, meta); err != nil {
-					return fmt.Errorf("failed to push virtual channel close event: %w", err)
-				}
-			}
-
-			var senderKey []byte
-			if meta.Incoming != nil {
-				senderKey = meta.Incoming.SenderKey
-			}
-
-			evData := db.ChannelHistoryActionTransferInData{
-				Amounts: s.formatDiff(balanceDiff),
-				From:    senderKey,
-			}
-
-			jsonData, err := json.Marshal(evData)
-			if err != nil {
-				log.Error().Err(err).Msg("failed to marshal event data")
-			}
-
 			if err = s.db.CreateChannelEvent(ctx, channel, meta.UpdatedAt, db.ChannelHistoryItem{
-				Action: db.ChannelHistoryActionTransferIn,
+				Action: db.ChannelHistoryActionTransferOut,
 				Data:   jsonData,
 			}); err != nil {
 				return fmt.Errorf("failed to create channel event: %w", err)
 			}
 
-			log.Info().Fields(cond.GetLogInfo()).
-				Msg("conditional executed")
+			if meta.Incoming == nil {
+				meta.Status = db.ConditionalStateClosed
+			}
+
+			meta.UpdatedAt = time.Now()
+			if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
+				return fmt.Errorf("failed to update virtual channel meta: %w", err)
+			}
+
+			if meta.Incoming != nil {
+				if err = s.closeConditional(ctx, meta); err != nil {
+					return fmt.Errorf("failed to close next conditional: %w", err)
+				}
+			}
+
+			log.Info().Str("key", base64.StdEncoding.EncodeToString(meta.Key)).Fields(s.repackDiffForLogs(evData.Amounts)).
+				Msg("our conditional executed, sent amounts")
 
 			return nil
 		}
@@ -396,17 +386,18 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		}
 
 		removeAfterTimeout := func(ctx context.Context) error {
-			// try to remove virtual channel in future if it will time out
+			condKey := cond.GetKey()
+
+			// try to remove conditional in future if it will time out
 			dl := time.Unix(cond.GetDeadline().Unix()+1, 0)
-			err = s.db.CreateTask(ctx, PaymentsTaskPool, "ask-remove-cond", channel.Our.Address,
-				"ask-remove-cond-"+base64.StdEncoding.EncodeToString(srz.Hash())+"-timeout",
-				db.AskRemoveVirtualTask{
-					ChannelAddress: channel.Our.Address,
-					Key:            cond.GetKey(),
+			err = s.db.CreateTask(ctx, PaymentsTaskPool, "remove-cond", channel.Our.Address,
+				"remove-cond-"+base64.StdEncoding.EncodeToString(condKey)+"-timeout",
+				db.RemoveConditionalTask{
+					Key: condKey,
 				}, &dl, nil,
 			)
 			if err != nil {
-				return fmt.Errorf("failed to create ask-remove-cond task: %w", err)
+				return fmt.Errorf("failed to create remove-cond task: %w", err)
 			}
 			return nil
 		}
@@ -476,6 +467,8 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 				a, b = b, a
 			}
 
+			log.Debug().Str("target", target.Our.Address).Str("a", a.String()).Str("b", b.String()).Msg("channel tunnelling requested")
+
 			nextAction, err := cond.GetAction().PrepareNext(ctx, a, b)
 			if err != nil {
 				return nil, fmt.Errorf("failed to prepare next action: %w", err)
@@ -542,7 +535,7 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 				}
 
 				if currentInstruction.FinalState != nil {
-					if err = meta.AddKnownResolve(cond, currentInstruction.FinalState); err != nil {
+					if err = meta.AddKnownResolve(cond, currentInstruction.FinalState, false); err != nil {
 						return fmt.Errorf("failed to add channel condition resolve: %w", err)
 					}
 
@@ -983,94 +976,13 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 		return nil, fmt.Errorf("unauthorized channel")
 	}
 
+	if !channel.AcceptingActions {
+		return nil, fmt.Errorf("channel is currently not accepting new actions")
+	}
+
 	log.Debug().Str("action", reflect.TypeOf(action).String()).Msg("action request process")
 
 	switch data := action.(type) {
-	case transport.RequestRemoveConditionalAction:
-		if !channel.AcceptingActions {
-			return nil, fmt.Errorf("channel is currently not accepting new actions")
-		}
-
-		_, vch, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, data.ID, s)
-		if err != nil {
-			if errors.Is(err, payments.ErrNotFound) {
-				return nil, fmt.Errorf("virtual channel is not found")
-			}
-			return nil, fmt.Errorf("failed to find virtual channel: %w", err)
-		}
-
-		if err = s.db.CreateTask(context.Background(), PaymentsTaskPool, "remove-virtual", channel.Our.Address,
-			"remove-virtual-"+base64.StdEncoding.EncodeToString(vch.GetKey())+"-requested",
-			db.RemoveVirtualTask{
-				Key: vch.GetKey(),
-			}, nil, nil,
-		); err != nil {
-			return nil, fmt.Errorf("failed to create remove-virtual task: %w", err)
-		}
-		s.touchWorker()
-	case transport.ExecuteConditionalAction:
-		if !channel.AcceptingActions {
-			return nil, fmt.Errorf("channel is currently not accepting new actions")
-		}
-
-		_, vch, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, data.ID, s)
-		if err != nil {
-			return nil, fmt.Errorf("failed to find virtual channel: %w", err)
-		}
-
-		// prevalidate before tx
-		if err = vch.ValidateState(nil, data.State); err != nil {
-			return nil, fmt.Errorf("failed to validate state: %w", err)
-		}
-
-		if vch.GetDeadline().Before(time.Now()) {
-			return nil, fmt.Errorf("condition is expired")
-		}
-
-		if err = s.db.Transaction(context.Background(), func(ctx context.Context) error {
-			if err = s.AddConditionalResolve(ctx, vch.GetKey(), data.State); err != nil {
-				// we don't care if it is older, since party wants to close with this amount
-				if !errors.Is(err, db.ErrNewerStateIsKnown) {
-					return fmt.Errorf("failed to add virtual channel resolve: %w", err)
-				}
-			}
-
-			tryTill := vch.GetDeadline().Add(time.Duration(channel.SafeOnchainClosePeriod/2) * time.Second)
-			if err = s.db.CreateTask(ctx, PaymentsTaskPool, "confirm-close-virtual", channel.Our.Address,
-				"confirm-close-virtual-"+base64.StdEncoding.EncodeToString(vch.GetKey()),
-				db.ConfirmCloseVirtualTask{
-					VirtualKey: vch.GetKey(),
-				}, nil, &tryTill,
-			); err != nil {
-				return fmt.Errorf("failed to create confirm-close-virtual task: %w", err)
-			}
-
-			// We start uncooperative close at specific moment to have time
-			// to commit resolve onchain in case partner is irresponsible.
-			// But in the same time we give our partner time to
-			uncooperativeAfter := vch.GetDeadline().Add(time.Duration(-channel.SafeOnchainClosePeriod) * time.Second)
-			minDelay := time.Now().Add(1 * time.Minute)
-			if !uncooperativeAfter.After(minDelay) {
-				uncooperativeAfter = minDelay
-			}
-
-			// Creating aggressive onchain close task, for the future,
-			// in case we will not be able to communicate with party
-			if err = s.db.CreateTask(ctx, PaymentsTaskPool, "uncooperative-close", channel.Our.Address+"-uncoop",
-				"uncooperative-close-"+channel.Our.Address+"-vc-"+base64.StdEncoding.EncodeToString(data.ID),
-				db.ChannelUncooperativeCloseTask{
-					Address:              channel.Our.Address,
-					CheckCondStillExists: data.ID,
-				}, &uncooperativeAfter, nil,
-			); err != nil {
-				return fmt.Errorf("failed to create uncooperative close task: %w", err)
-			}
-
-			return nil
-		}); err != nil {
-			return nil, err
-		}
-		s.touchWorker()
 	case transport.ExecuteTransactionAction:
 		var req payments.ExternalMsgDoubleSigned
 		err = tlb.LoadFromCell(&req, data.ExternalBody.BeginParse())
@@ -1193,8 +1105,6 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 	default:
 		return nil, fmt.Errorf("unexpected action type: %s", reflect.TypeOf(data).String())
 	}
-
-	return nil, nil
 }
 
 func (s *Service) discoverChannel(channelAddr *address.Address) bool {
@@ -1386,6 +1296,14 @@ func (s *Service) formatDiff(balances map[string]*big.Int) map[string]string {
 			continue
 		}
 		res[cc.Symbol] = cc.MustAmount(b).String()
+	}
+	return res
+}
+
+func (s *Service) repackDiffForLogs(balances map[string]string) map[string]any {
+	res := make(map[string]any, len(balances))
+	for id, b := range balances {
+		res[id] = b
 	}
 	return res
 }

@@ -26,7 +26,6 @@ func init() {
 	tl.RegisterAllowedGroup("payments.proposable",
 		"payments.addConditionalAction",
 		"payments.executeConditionalAction",
-		"payments.confirmCloseAction",
 		"payments.removeConditionalAction",
 		"payments.incrementStatesAction",
 		"payments.commitVirtualAction",
@@ -36,9 +35,7 @@ func init() {
 		"payments.swapAction")
 
 	tl.RegisterAllowedGroup("payments.requestable",
-		"payments.executeConditionalAction",
 		"payments.cooperativeCloseAction",
-		"payments.requestRemoveConditionalAction",
 		"payments.executeTransactionAction")
 
 	tl.Register(Ping{}, "payments.ping value:long = payments.Ping")
@@ -50,13 +47,11 @@ func init() {
 	tl.Register(AuthenticateToSign{}, "payments.authenticateToSign a:int256 b:int256 timestamp:long = payments.AuthenticateToSign")
 	tl.Register(NodeAddress{}, "payments.nodeAddress adnl_addr:int256 = payments.NodeAddress")
 
-	tl.Register(ConfirmExecuteConditionalAction{}, "payments.confirmCloseAction id:int256 state:bytes = payments.Action")
+	tl.Register(ExecuteConditionalAction{}, "payments.executeConditionalAction id:int256 state:bytes = payments.Action")
 	tl.Register(RemoveConditionalAction{}, "payments.removeConditionalAction id:int256 = payments.Action")
-	tl.Register(RequestRemoveConditionalAction{}, "payments.requestRemoveConditionalAction id:int256 = payments.Action")
 	tl.Register(AddConditionalAction{}, "payments.addConditionalAction newActionCode:bytes conditional:bytes instruction_key:int256 instructions:payments.instructionsToSign signature:bytes = payments.Action")
 	tl.Register(RemoveActionAction{}, "payments.removeActionAction id:int256 = payments.Action")
 	tl.Register(CommitVirtualAction{}, "payments.commitVirtualAction id:int256 prepayAmount:bytes = payments.Action")
-	tl.Register(ExecuteConditionalAction{}, "payments.executeConditionalAction id:int256 state:bytes = payments.Action")
 	tl.Register(CooperativeCloseAction{}, "payments.cooperativeCloseAction signedCloseRequest:bytes = payments.Action")
 	tl.Register(CooperativeCommitAction{}, "payments.cooperativeCommitAction action_id:int256 msg_signature:bytes withFee:bool = payments.Action")
 	tl.Register(IncrementStatesAction{}, "payments.incrementStatesAction wantResponse:Bool = payments.Action")
@@ -237,13 +232,6 @@ type AddConditionalInstruction struct {
 	instructionPrivateKey ed25519.PrivateKey `tl:"-"`
 }
 
-// ExecuteConditionalAction - request party to close virtual channel,
-// must be accepted only from virtual channel receiver side.
-type ExecuteConditionalAction struct {
-	ID    []byte     `tl:"int256"`
-	State *cell.Cell `tl:"cell"`
-}
-
 // CooperativeCloseAction - request party to close onchain channel
 type CooperativeCloseAction struct {
 	SignedCloseRequest *cell.Cell `tl:"cell"`
@@ -265,15 +253,8 @@ type RemoveConditionalAction struct {
 	ID []byte `tl:"int256"`
 }
 
-// RequestRemoveConditionalAction - request party to close condition to us,
-// without state, because something went wrong
-type RequestRemoveConditionalAction struct {
-	ID []byte `tl:"int256"`
-}
-
-// ConfirmExecuteConditionalAction - request party to remove closed condition
-// and increase unconditional amount
-type ConfirmExecuteConditionalAction struct {
+// ExecuteConditionalAction - execute conditional and increase the unconditional amount
+type ExecuteConditionalAction struct {
 	ID    []byte     `tl:"int256"`
 	State *cell.Cell `tl:"cell"`
 }

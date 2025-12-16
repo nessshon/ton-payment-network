@@ -120,7 +120,7 @@ type ChannelCooperativeCloseTask struct {
 	ChannelInitiatedAt time.Time
 }
 
-type ConfirmCloseVirtualTask struct {
+type CloseConditionalTask struct {
 	VirtualKey []byte
 }
 
@@ -148,21 +148,11 @@ type SwapTask struct {
 	TransportAction transport.SwapAction
 }
 
-type AskRemoveVirtualTask struct {
-	Key            []byte
-	ChannelAddress string
-}
-
-type AskCloseVirtualTask struct {
-	ID             []byte
-	ChannelAddress string
-}
-
 type IncrementStatesTask struct {
 	ChannelAddress string
 	WantResponse   bool
 }
 
-type RemoveVirtualTask struct {
+type RemoveConditionalTask struct {
 	Key []byte
 }

@@ -566,7 +566,7 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 			return fmt.Errorf("incorrect len of key: %d, should be 32", len(btsKey))
 		}
 
-		if err = svc.RequestRemoveVirtual(context.Background(), btsKey); err != nil {
+		if err = svc.RemoveConditional(context.Background(), btsKey); err != nil {
 			return fmt.Errorf("failed to remove virtual channel: %w", err)
 		}
 	case "swap":

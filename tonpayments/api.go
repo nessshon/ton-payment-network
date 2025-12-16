@@ -449,7 +449,7 @@ func (s *Service) AddConditionalResolve(ctx context.Context, virtualKey ed25519.
 		}
 	}
 
-	if err = meta.AddKnownResolve(cond, state); err != nil {
+	if err = meta.AddKnownResolve(cond, state, true); err != nil {
 		return fmt.Errorf("failed to add channel condition resolve: %w", err)
 	}
 
@@ -622,7 +622,7 @@ func (s *Service) requestCommitAction(ctx context.Context, channel *db.Channel, 
 	return nil
 }
 
-var ErrCannotCloseOngoingVirtual = fmt.Errorf("cannot close outgoing channel")
+var ErrCannotCloseOutgoingVirtual = fmt.Errorf("cannot close outgoing channel")
 
 func (s *Service) CloseConditional(ctx context.Context, virtualKey ed25519.PublicKey) error {
 	s.mx.Lock()
@@ -636,10 +636,10 @@ func (s *Service) CloseConditional(ctx context.Context, virtualKey ed25519.Publi
 		return fmt.Errorf("failed to load virtual channel meta: %w", err)
 	}
 
-	if meta.Incoming == nil {
-		return ErrCannotCloseOngoingVirtual
-	}
+	return s.closeConditional(ctx, meta)
+}
 
+func (s *Service) closeConditional(ctx context.Context, meta *db.ConditionalMeta) error {
 	ch, err := s.GetActiveChannel(ctx, meta.Incoming.ChannelAddress)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
@@ -648,10 +648,15 @@ func (s *Service) CloseConditional(ctx context.Context, virtualKey ed25519.Publi
 		return fmt.Errorf("failed to get channel: %w", err)
 	}
 
+	if meta.Incoming == nil {
+		return ErrCannotCloseOutgoingVirtual
+	}
+
 	condId := meta.Incoming.Conditional.Hash()
 	_, cond, err := payments.FindConditional(ctx, ch.Their.Data.Conditionals, condId, s)
 	if err != nil {
 		if errors.Is(err, payments.ErrNotFound) {
+			log.Debug().Err(err).Str("channel", ch.Our.Address).Str("id", base64.StdEncoding.EncodeToString(condId)).Msg("conditional not found, nothing to close")
 			// idempotency
 			return nil
 		}
@@ -711,15 +716,17 @@ func (s *Service) CloseConditional(ctx context.Context, virtualKey ed25519.Publi
 			}
 		}
 
-		if err = s.db.CreateTask(ctx, PaymentsTaskPool, "ask-close-virtual", ch.Our.Address+"-coop",
-			"virtual-close-"+ch.Our.Address+"-vc-"+base64.StdEncoding.EncodeToString(condId),
-			db.AskCloseVirtualTask{
-				ID:             condId,
-				ChannelAddress: ch.Our.Address,
+		log.Debug().Str("key", base64.StdEncoding.EncodeToString(meta.Key)).
+			Msg("creating task to close conditional to us")
+
+		if err = s.db.CreateTask(ctx, PaymentsTaskPool, "close-conditional", ch.Our.Address+"-coop",
+			"close-conditional-"+ch.Our.Address+"-vc-"+base64.StdEncoding.EncodeToString(condId),
+			db.CloseConditionalTask{
+				VirtualKey: meta.Key,
 			}, nil, &till,
 		); err != nil {
-			log.Warn().Err(err).Str("channel", ch.Our.Address).Str("id", base64.StdEncoding.EncodeToString(condId)).Msg("failed to create ask virtual close task")
-			return fmt.Errorf("failed to create ask virtual close task: %w", err)
+			log.Warn().Err(err).Str("channel", ch.Our.Address).Str("id", base64.StdEncoding.EncodeToString(condId)).Msg("failed to create close conditional task")
+			return fmt.Errorf("failed to create close conditional task: %w", err)
 		}
 
 		return nil

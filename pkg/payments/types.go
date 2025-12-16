@@ -17,7 +17,9 @@ import (
 	"time"
 )
 
-const Version = 3
+const Version = 4
+
+var ErrNewerConditionalStateIsKnown = fmt.Errorf("newer conditional state is known")
 
 type VirtualConfig struct {
 	MaxCapacityToRentPerTx      tlb.Coins
