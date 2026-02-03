@@ -337,9 +337,10 @@ func (c *ChannelContract) PrepareUncoopCloseMessage(ourKey ed25519.PrivateKey, s
 	return body, nil
 }
 
-func (c *ChannelContract) PrepareSettleMessage(ourKey ed25519.PrivateKey, toSettle *cell.Dictionary, condProof, actProof *cell.Cell) (body *cell.Cell, err error) {
+func (c *ChannelContract) PrepareSettleMessage(ourKey ed25519.PrivateKey, toSettle *cell.Dictionary, condProof, actProof *cell.Cell, sender *address.Address) (body *cell.Cell, err error) {
 	msg := SettleMsg{}
 	msg.Signed.ChannelID = c.Storage.ChannelID
+	msg.Signed.ExpectedSender = sender
 	msg.Signed.WalletSeqno = c.Storage.WalletSeqno
 	msg.Signed.ToSettle = toSettle
 	msg.Signed.ConditionalsProof = condProof

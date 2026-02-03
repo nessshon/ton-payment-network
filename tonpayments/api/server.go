@@ -6,15 +6,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math/big"
+	"net/http"
+	"time"
+
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
-	"math/big"
-	"net/http"
-	"time"
 )
 
 type Queue interface {
@@ -49,6 +50,12 @@ type Service interface {
 	GetKnownBalanceTypes() []*payments.CoinConfig
 }
 
+type DerivativesService interface {
+	GetDerivativesPosition(ctx context.Context, channelAddr string, symbol string) (any, error)
+	OpenPosition(ctx context.Context, channelAddr string, symbol string, side string, leverage int, amount string, typ string, price string) (string, error)
+	ClosePosition(ctx context.Context, channelAddr string, symbol string, typ string) error
+}
+
 type Success struct {
 	Success bool `json:"success"`
 }
@@ -59,6 +66,7 @@ type Error struct {
 
 type Server struct {
 	svc            Service
+	deriv          DerivativesService
 	queue          Queue
 	webhook        string
 	webhookKey     string
@@ -73,9 +81,10 @@ type Credentials struct {
 	Password string
 }
 
-func NewServer(addr, webhook, webhookKey string, svc Service, queue Queue, credentials *Credentials) *Server {
+func NewServer(addr, webhook, webhookKey string, svc Service, deriv DerivativesService, queue Queue, credentials *Credentials) *Server {
 	s := &Server{
 		svc:        svc,
+		deriv:      deriv,
 		queue:      queue,
 		webhook:    webhook,
 		webhookKey: webhookKey,
@@ -100,7 +109,10 @@ func NewServer(addr, webhook, webhookKey string, svc Service, queue Queue, crede
 	mx.HandleFunc("/api/v1/channel/conditional/list", s.checkCredentials(s.handleVirtualList))
 	mx.HandleFunc("/api/v1/channel/conditional", s.checkCredentials(s.handleVirtualGet))
 
-	// TODO: actions
+	// Derivatives endpoints
+	mx.HandleFunc("/api/v1/derivatives/position", s.checkCredentials(s.handleDerivativesPosition))
+	mx.HandleFunc("/api/v1/derivatives/open", s.checkCredentials(s.handleDerivativesOpen))
+	mx.HandleFunc("/api/v1/derivatives/close", s.checkCredentials(s.handleDerivativesClose))
 
 	s.srv = http.Server{
 		Addr:    addr,

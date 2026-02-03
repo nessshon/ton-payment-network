@@ -3,20 +3,24 @@ package tonpayments
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
+	"math/rand"
+	"time"
+
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
+	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
-	"math/big"
-	"math/rand"
-	"time"
 )
 
 var ErrWaitingForCapacity = errors.New("capacity request was sent, waiting for it")
@@ -155,6 +159,7 @@ func (s *Service) taskExecutor() {
 					if err != nil {
 						return fmt.Errorf("failed to propose action: %w", err)
 					}
+					return nil
 				case "close-next-virtual":
 					var data db.CloseNextVirtualTask
 					if err = json.Unmarshal(task.Data, &data); err != nil {
@@ -242,16 +247,21 @@ func (s *Service) taskExecutor() {
 						return fmt.Errorf("failed to parse conditional: %w", err)
 					}
 
-					channel, lockId, unlock, err := s.AcquireChannel(ctx, data.ChannelAddress)
+					channel, err := s.db.GetChannel(ctx, data.ChannelAddress)
 					if err != nil {
-						return fmt.Errorf("failed to acquire channel: %w", err)
+						return fmt.Errorf("failed to get channel: %w", err)
 					}
-					defer unlock()
 
 					if channel.Status != db.ChannelStateActive {
 						// not needed anymore
 						return nil
 					}
+
+					channel, lockId, unlock, err := s.AcquireChannel(ctx, data.ChannelAddress)
+					if err != nil {
+						return fmt.Errorf("failed to acquire channel: %w", err)
+					}
+					defer unlock()
 
 					meta := &db.ConditionalMeta{
 						Key:    cond.GetKey(),
@@ -335,6 +345,11 @@ func (s *Service) taskExecutor() {
 						return fmt.Errorf("failed to propose actions to the next node: %w", err)
 					}
 
+					meta, err = s.db.GetVirtualChannelMeta(ctx, cond.GetKey())
+					if err != nil {
+						return fmt.Errorf("failed to load conditional meta: %w", err)
+					}
+
 					meta.Status = db.ConditionalStateActive
 					meta.UpdatedAt = time.Now()
 					if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
@@ -350,6 +365,202 @@ func (s *Service) taskExecutor() {
 					log.Info().Fields(cond.GetLogInfo()).
 						Str("target", data.ChannelAddress).
 						Msg("conditional successfully tunnelled through us")
+				case "create-derivative-cond":
+					var data db.AddDerivativeTask
+					if err = json.Unmarshal(task.Data, &data); err != nil {
+						return fmt.Errorf("invalid json: %w", err)
+					}
+
+					var resolver payments.FullResolver = s
+					if data.TransportAction.NewActionCode != nil {
+						a, err := payments.CodeToAction(ctx, data.TransportAction.NewActionCode, s)
+						if err != nil {
+							return fmt.Errorf("failed to detect action type: %w", err)
+						}
+						resolver = tmpFullResolver{[]payments.Action{a}, s}
+					}
+
+					cond, err := payments.CodeToConditional(ctx, data.TransportAction.Conditional, resolver)
+					if err != nil {
+						return fmt.Errorf("failed to parse conditional: %w", err)
+					}
+
+					channel, err := s.db.GetChannel(ctx, data.ChannelAddress)
+					if err != nil {
+						return fmt.Errorf("failed to get channel: %w", err)
+					}
+
+					if channel.Status != db.ChannelStateActive {
+						// not needed anymore
+						return nil
+					}
+
+					channel, lockId, unlock, err := s.AcquireChannel(ctx, data.ChannelAddress)
+					if err != nil {
+						return fmt.Errorf("failed to acquire channel: %w", err)
+					}
+					defer unlock()
+
+					// Logic to prepare atomic derivative creation
+					// We need to create Incoming Conditional (Partner -> Us)
+					incomingKey, _, err := ed25519.GenerateKey(nil)
+					if err != nil {
+						return fmt.Errorf("failed to generate incoming key: %w", err)
+					}
+
+					// Parse outgoing details to mirror for incoming
+					// We assume conditional is Resolvable (deriv)
+					resOut, ok := cond.(*conditionals.ConditionalResolvable)
+					if !ok {
+						return fmt.Errorf("outgoing conditional is not resolvable")
+					}
+
+					condDetails := resOut.Details
+
+					var targetCC *payments.CoinConfig
+
+					// Try to cast Action
+					// resOut.Action is payments.Action
+					// We need to check its type.
+					switch act := resOut.Action.(type) {
+					case *actions.ActionSendTon:
+						targetCC = act.Coin
+					case *actions.ActionSendJetton:
+						targetCC = act.Coin
+					case *actions.ActionSendEC:
+						targetCC = act.Coin
+					default:
+						// Fallback: try to resolve from channel coin?
+						// derivatives usually settle in the channel's main coin if simplified.
+						// Let's assume TON for now if fails? Or Error.
+						return fmt.Errorf("unsupported action type for derivative: %T", resOut.Action)
+					}
+
+					inCondDetails := condDetails
+					inCondDetails.IsLong = !condDetails.IsLong // Invert direction
+
+					fromAddr, toAddr := address.MustParseAddr(channel.SideA().Address), address.MustParseAddr(channel.SideB().Address)
+					if channel.WeLeft {
+						fromAddr, toAddr = toAddr, fromAddr
+					}
+
+					inAction, err := actions.NewSendActionFromBalanceID(ctx, targetCC, fromAddr.String(), toAddr.String())
+					if err != nil {
+						return fmt.Errorf("failed to create incoming action: %w", err)
+					}
+
+					inCondResolvable := conditionals.ConditionalResolvable{
+						Key:          incomingKey,
+						Amount:       big.NewInt(0), // No Cap
+						ResolverAddr: resOut.ResolverAddr,
+						Details:      inCondDetails,
+						Action:       inAction,
+					}
+
+					metaOut := &db.ConditionalMeta{
+						Key:    cond.GetKey(),
+						Status: db.ConditionalStatePending,
+						Outgoing: &db.ConditionalMetaSide{
+							ChannelAddress:        data.ChannelAddress,
+							Conditional:           data.TransportAction.Conditional,
+							UncooperativeDeadline: time.Unix(data.Deadline, 0),
+							SafeDeadline:          time.Unix(data.Deadline, 0).Add(-time.Duration(channel.SafeOnchainClosePeriod+int64(s.cfg.MinSafeVirtualChannelTimeoutSec)) * time.Second),
+							LinkedKey:             incomingKey,
+						},
+						Any:       resOut.Details,
+						CreatedAt: time.Now(),
+						UpdatedAt: time.Now(),
+					}
+
+					metaIn := &db.ConditionalMeta{
+						Key:    incomingKey,
+						Status: db.ConditionalStatePending,
+						Incoming: &db.ConditionalMetaSide{
+							ChannelAddress:        data.ChannelAddress,
+							Conditional:           inCondResolvable.Serialize(),
+							UncooperativeDeadline: time.Unix(data.Deadline, 0),
+							SafeDeadline:          time.Unix(data.Deadline, 0).Add(-time.Duration(channel.SafeOnchainClosePeriod+int64(s.cfg.MinSafeVirtualChannelTimeoutSec)) * time.Second),
+							SenderKey:             channel.Their.OnchainInfo.Key,
+							LinkedKey:             cond.GetKey(),
+						},
+						Any:       inCondDetails,
+						CreatedAt: time.Now(),
+						UpdatedAt: time.Now(),
+					}
+
+					if err := s.db.CreateVirtualChannelMeta(ctx, metaOut); err != nil && !errors.Is(err, db.ErrAlreadyExists) {
+						return fmt.Errorf("failed to save meta out: %w", err)
+					}
+					if err := s.db.CreateVirtualChannelMeta(ctx, metaIn); err != nil && !errors.Is(err, db.ErrAlreadyExists) {
+						return fmt.Errorf("failed to save meta in: %w", err)
+					}
+
+					if err = s.proposeAction(ctx, lockId, data.ChannelAddress, data.TransportAction, cond); err != nil {
+						if errors.Is(err, ErrDenied) {
+							// ensure that state was not modified on the other side by sending newer state without this conditional
+							if err := s.proposeAction(ctx, lockId, data.ChannelAddress, transport.IncrementStatesAction{WantResponse: false}, nil); err != nil {
+								return fmt.Errorf("failed to increment states on conditional revert: %w", err)
+							}
+
+							return s.db.Transaction(ctx, func(ctx context.Context) error {
+								meta, err := s.db.GetVirtualChannelMeta(ctx, cond.GetKey())
+								if err != nil {
+									return fmt.Errorf("failed to load conditional meta: %w", err)
+								}
+
+								meta.Status = db.ConditionalStateWantRemove
+								meta.UpdatedAt = time.Now()
+								if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
+									return fmt.Errorf("failed to update conditional meta: %w", err)
+								}
+
+								return nil
+							})
+						} else if errors.Is(err, ErrNotPossible) {
+							// not possible by us, so no revert confirmation needed
+							log.Warn().Err(err).Msg("it is not possible to open virtual channel")
+							return nil
+						}
+						return fmt.Errorf("failed to propose actions to the next node: %w", err)
+					}
+
+					err = s.db.Transaction(ctx, func(ctx context.Context) error {
+						metaOut, err = s.db.GetVirtualChannelMeta(ctx, cond.GetKey())
+						if err != nil {
+							return fmt.Errorf("failed to load conditional meta: %w", err)
+						}
+
+						metaIn, err = s.db.GetVirtualChannelMeta(ctx, incomingKey)
+						if err != nil {
+							return fmt.Errorf("failed to load conditional meta: %w", err)
+						}
+
+						metaOut.Status = db.ConditionalStateActive
+						metaOut.UpdatedAt = time.Now()
+						if err = s.db.UpdateVirtualChannelMeta(ctx, metaOut); err != nil {
+							return fmt.Errorf("failed to update conditional meta: %w", err)
+						}
+
+						metaIn.Status = db.ConditionalStateActive
+						metaIn.UpdatedAt = time.Now()
+						if err = s.db.UpdateVirtualChannelMeta(ctx, metaIn); err != nil {
+							return fmt.Errorf("failed to update conditional meta: %w", err)
+						}
+
+						if s.webhook != nil {
+							if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeOpen, metaOut); err != nil {
+								return fmt.Errorf("failed to push conditional open event: %w", err)
+							}
+						}
+						return nil
+					})
+					if err != nil {
+						return fmt.Errorf("failed to update conditional meta: %w", err)
+					}
+
+					log.Info().Fields(cond.GetLogInfo()).
+						Str("target", data.ChannelAddress).
+						Msg("derivative conditional created")
 				case "swap":
 					var data db.SwapTask
 					if err = json.Unmarshal(task.Data, &data); err != nil {
@@ -455,13 +666,13 @@ func (s *Service) taskExecutor() {
 					}
 
 					// if we are not the first node of the tunnel
-					if meta.Incoming != nil {
+					if meta.Outgoing != nil && len(meta.Outgoing.LinkedKey) > 0 {
 						channel, err := s.db.GetChannel(ctx, meta.Incoming.ChannelAddress)
 						if err != nil {
 							return fmt.Errorf("failed to load 'from' channel: %w", err)
 						}
 
-						_, vch, err := payments.FindConditional(ctx, channel.Their.Data.Conditionals, data.Key, s)
+						_, vch, err := payments.FindConditional(ctx, channel.Their.Data.Conditionals, meta.Incoming.Conditional.Hash(), s)
 						if err != nil {
 							if errors.Is(err, payments.ErrNotFound) {
 								return nil

@@ -3,9 +3,10 @@ package db
 import (
 	"crypto/ed25519"
 	"encoding/json"
+	"time"
+
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/tvm/cell"
-	"time"
 )
 
 type Task struct {
@@ -141,6 +142,12 @@ type AddConditionalTask struct {
 	ChannelAddress      string
 	Deadline            int64
 	TransportAction     transport.AddConditionalAction
+}
+
+type AddDerivativeTask struct {
+	ChannelAddress  string
+	Deadline        int64
+	TransportAction transport.AddConditionalAction
 }
 
 type SwapTask struct {

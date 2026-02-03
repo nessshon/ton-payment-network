@@ -7,17 +7,18 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"math"
+	"math/big"
+	mRand "math/rand"
+	"reflect"
+	"time"
+
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
-	"math"
-	"math/big"
-	mRand "math/rand"
-	"reflect"
-	"time"
 )
 
 var ErrNotConnected = fmt.Errorf("not connected with peer")
@@ -32,7 +33,9 @@ func init() {
 		"payments.rentCapacityAction",
 		"payments.cooperativeCommitAction",
 		"payments.removeActionAction",
-		"payments.swapAction")
+		"payments.swapAction",
+		"payments.addDerivativeAction",
+		"payments.closeDerivativeAction")
 
 	tl.RegisterAllowedGroup("payments.requestable",
 		"payments.cooperativeCloseAction",

@@ -8,6 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
+	"reflect"
+	"time"
+
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
@@ -15,9 +19,6 @@ import (
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
-	"math/big"
-	"reflect"
-	"time"
 )
 
 func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Channel, action transport.Action, details any) (func(ctx context.Context) error, *payments.StateBodySigned, error) {
@@ -172,7 +173,7 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			return nil, nil, err
 		}
 
-		if err = cond.ValidateState(nil, act.State); err != nil {
+		if err = cond.ValidateState(ctx, nil, act.State); err != nil {
 			return nil, nil, fmt.Errorf("failed to validate state: %w", err)
 		}
 

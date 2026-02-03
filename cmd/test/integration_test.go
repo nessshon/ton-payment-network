@@ -10,6 +10,8 @@ import (
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
 	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
+	condcontracts "github.com/xssnick/ton-payment-network/pkg/payments/conditionals/contracts"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals/oracle"
 	client2 "github.com/xssnick/ton-payment-network/tonpayments/chain/client"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -69,7 +71,7 @@ func TestClient_AsyncChannelFullFlow(t *testing.T) {
 
 	closeConfig := payments.ClosingConfig{
 		QuarantineDuration:             25,
-		ReplicationMessageAttachAmount: tlb.MustFromTON("0.05"),
+		ReplicationMessageAttachAmount: tlb.MustFromTON("0.047"),
 		ConditionalCloseDuration:       50,
 		ActionsDuration:                40,
 	}
@@ -84,7 +86,7 @@ func TestClient_AsyncChannelFullFlow(t *testing.T) {
 		t.Fatal(fmt.Errorf("failed to build deploy channel params: %w", err))
 	}
 
-	channelAddr, _, block, err := w.DeployContractWaitTransaction(ctx, tlb.MustFromTON("0.5"), body, code, data)
+	channelAddr, _, block, err := w.DeployContractWaitTransaction(ctx, tlb.MustFromTON("0.6"), body, code, data)
 	if err != nil {
 		t.Fatal(fmt.Errorf("failed to deploy channel: %w", err))
 	}
@@ -356,14 +358,14 @@ reCh8:
 	}
 	actC := a1.Serialize()
 	actStateA, _ := tlb.ToCell(actions.StateActionSend{
-		Amount:        tlb.MustFromTON("0.009999"),
-		Commited:      tlb.MustFromTON("0.00"),
+		Amount:        actions.Coins{Val: tlb.MustFromTON("0.009999").Nano()},
+		Commited:      actions.Coins{Val: tlb.MustFromTON("0.00").Nano()},
 		CommitedSeqno: 0,
 	})
 
 	actStateB, _ := tlb.ToCell(actions.StateActionSend{
-		Amount:        tlb.MustFromTON("0.00"),
-		Commited:      tlb.MustFromTON("0.00"),
+		Amount:        actions.Coins{Val: tlb.MustFromTON("0.00").Nano()},
+		Commited:      actions.Coins{Val: tlb.MustFromTON("0.00").Nano()},
 		CommitedSeqno: 0,
 	})
 
@@ -388,6 +390,95 @@ reCh8:
 		Deadline: time.Now().Add(5 * time.Minute).Unix(),
 	}
 	_ = condA.SetIntKey(big.NewInt(5), vch2.Serialize())
+
+	// Prepare derivative resolver contract and conditional
+	oraclePub, oracleKey, _ := ed25519.GenerateKey(nil)
+	entryPrice := tlb.MustFromTON("100").Nano()
+	finalPrice := tlb.MustFromTON("110").Nano()
+
+	cfg := condcontracts.DerivativeConfig{
+		OracleKey:          oraclePub,
+		QuarantineDuration: 1,
+		AcceptionWindow:    10,
+		AddressA:           ch.Address,
+		AddressB:           ch2.Address,
+	}
+	stor, err := condcontracts.BuildDerivativeStorage(vPubKey, cfg, tlb.MustFromTON("0.1"), 1, false, tlb.MustFromTON("100"), uint32(time.Now().Unix()-30))
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to build derivative storage: %w", err))
+	}
+	si, err := condcontracts.BuildDerivativeStateInit(stor)
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to build derivative state init: %w", err))
+	}
+	resolverAddr, err := condcontracts.CalcDerivativeAddress(si)
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to calc derivative address: %w", err))
+	}
+	// deploy resolver contract
+	_, _, block, err = w.DeployContractWaitTransaction(ctx, tlb.MustFromTON("0.05"), nil, si.Code, si.Data)
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to deploy derivative resolver: %w", err))
+	}
+	log.Println("derivative resolver deployed:", resolverAddr.String())
+
+	// Setup mock price resolver (+10% increase)
+	mock := oracle.NewMockProvider(finalPrice)
+	priceResolver := oracle.NewResolver(mock)
+	defer priceResolver.Close()
+
+	der := conditionals.ConditionalResolvable{
+		Key:          vPubKey,
+		Amount:       tlb.MustFromTON("0.1").Nano(),
+		ResolverAddr: resolverAddr,
+		Details: conditionals.ConditionalResolvableDetails{
+			AssetID:    0,
+			IsLong:     false,
+			Leverage:   1,
+			EntryPrice: actions.Coins{Val: entryPrice},
+		},
+		PriceResolver: priceResolver,
+		Action:        &a1,
+	}
+	_ = condA.SetIntKey(big.NewInt(7), der.Serialize())
+
+	// Commit price to resolver with oracle signature and wait quarantine
+	ppEntry := condcontracts.PriceProof{
+		At:    uint32(time.Now().Unix() - 10),
+		Price: tlb.MustFromNano(entryPrice, 9),
+	}
+	pp := condcontracts.PriceProof{
+		At:    uint32(time.Now().Unix()),
+		Price: tlb.MustFromNano(finalPrice, 9),
+	}
+	ppEntryCell, _ := tlb.ToCell(ppEntry)
+	ppExitCell, _ := tlb.ToCell(pp)
+
+	cm := condcontracts.Commit{
+		Entry: condcontracts.PriceInner{
+			SignedBody: ppEntryCell,
+		},
+		Exit: condcontracts.PriceInner{
+			SignedBody: ppExitCell,
+		},
+	}
+	cm.Entry.Signature.V = ppEntryCell.Sign(oracleKey)
+	cm.Exit.Signature.V = ppExitCell.Sign(oracleKey)
+	cmBody, _ := tlb.ToCell(cm)
+
+reCommit:
+	tx, _, err = w.SendWaitTransaction(ctx, wallet.SimpleMessage(resolverAddr, tlb.MustFromTON("0.03"), cmBody))
+	if err != nil {
+		t.Log(fmt.Errorf("failed to send commit: %w, retrying", err))
+		block, err = api.WaitForBlock(block.SeqNo + 1).GetMasterchainInfo(ctx)
+		if err != nil {
+			t.Fatal(fmt.Errorf("failed to wait for block: %w", err))
+		}
+		goto reCommit
+	}
+	log.Println("commit price external tx sent:", base64.StdEncoding.EncodeToString(tx.Hash))
+	// Wait resolver quarantine (1s)
+	time.Sleep(2000 * time.Millisecond)
 
 	xBody := payments.StateBody{
 		ChannelID: chID,
@@ -524,7 +615,7 @@ reCh12:
 	}
 	log.Println("ready to settle")
 
-	block, err = api.WaitForBlock(block.SeqNo + 3).GetMasterchainInfo(ctx)
+	block, err = api.WaitForBlock(block.SeqNo + 5).GetMasterchainInfo(ctx)
 	if err != nil {
 		t.Fatal(fmt.Errorf("failed to wait for block: %w", err))
 	}
@@ -548,41 +639,56 @@ reCh12:
 	state.Sign(vKey)
 	condInput, _ := state.ToCell()
 
-	toSettle := cell.NewDict(256)
-	toSettle.SetIntKey(big.NewInt(0), condInput)
-	toSettle.SetIntKey(big.NewInt(5), condInput)
+	// PHASE 1: derivative-only settle via resolver proxy
+	toSettleDrv := cell.NewDict(256)
+	// Derivative resolve: add 10% of 0.1 = 0.01 to action, at committed timestamp
+	drv := condcontracts.DerivativeResolve{Key: vPubKey, Amount: tlb.MustFromTON("0.01"), At: pp.At}
+	drvInput, _ := tlb.ToCell(drv)
+	toSettleDrv.SetIntKey(big.NewInt(7), drvInput)
 
-	body, err = ch2.PrepareSettleMessage(bKey, toSettle, condAProof, actAProof)
-	if err != nil {
-		t.Fatal(fmt.Errorf("failed to build deploy channel params: %w", err))
+	if !bytes.Equal(der.Key, drv.Key) {
+		t.Fatal("derivation key mismatch")
 	}
 
-reTx3:
-	tx, _, _, err = api.SendExternalMessageWaitTransaction(ctx, &tlb.ExternalMessage{
-		DstAddr: ch2.Address,
-		Body:    body,
-	})
+	// Prepare settle, requiring it to be sent by resolver contract
+	body, err = ch2.PrepareSettleMessage(bKey, toSettleDrv, condAProof, actAProof, resolverAddr)
 	if err != nil {
-		t.Log(fmt.Errorf("failed to send tx: %w", err))
+		t.Fatal(fmt.Errorf("failed to build settle message (phase 1): %w", err))
+	}
+
+	// Wrap settle into resolver proxy and send to resolver contract
+	px := condcontracts.ProxySettle{ToA: false, Msg: body}
+	pxCell, _ := tlb.ToCell(px)
+
+reProxySettle:
+	tx, _, err = w.SendWaitTransaction(ctx, wallet.SimpleMessage(resolverAddr, tlb.MustFromTON("0.03"), pxCell))
+	if err != nil {
+		t.Log(fmt.Errorf("failed to send proxy settle to resolver: %w", err))
 		block, err = api.WaitForBlock(block.SeqNo + 1).GetMasterchainInfo(ctx)
 		if err != nil {
 			t.Fatal(fmt.Errorf("failed to wait for block: %w", err))
 		}
-		goto reTx3
+		goto reProxySettle
 	}
-	log.Println("settle B external tx sent:", base64.StdEncoding.EncodeToString(tx.Hash))
+	log.Println("proxy settle to resolver sent:", base64.StdEncoding.EncodeToString(tx.Hash))
+	log.Println("act hash before:", ch2.Address.String(), hex.EncodeToString(ch2.Storage.Quarantine.TheirState.ActionStatesHash), hex.EncodeToString(ch2.Storage.Quarantine.TheirState.ConditionalsHash))
 
-	actStateA, _ = tlb.ToCell(actions.StateActionSend{
-		Amount:        tlb.MustFromTON("0.069999"),
-		Commited:      tlb.MustFromTON("0.00"),
+	// After phase 1, only derivative should be applied: 0.009999 + 0.01 = 0.019999
+	actStateA1, _ := tlb.ToCell(actions.StateActionSend{
+		Amount:        actions.Coins{Val: tlb.MustFromTON("0.019999").Nano()},
+		Commited:      actions.Coins{Val: tlb.MustFromTON("0.00").Nano()},
 		CommitedSeqno: 0,
 	})
+	actAfterDrv := cell.NewDict(256)
+	_ = actAfterDrv.SetIntKey(new(big.Int).SetBytes(actC.Hash()), actStateA1)
 
-	_ = actA.SetIntKey(new(big.Int).SetBytes(actC.Hash()), actStateA)
+	// Verify conditionals updated after derivative-only settle: mark key 7 as removed via empty cell
+	condAfterDrv := cell.NewDict(256)
+	condAfterDrv.SetIntKey(big.NewInt(0), vch.Serialize())
+	condAfterDrv.SetIntKey(big.NewInt(5), vch2.Serialize())
+	condAfterDrv.SetIntKey(big.NewInt(7), cell.BeginCell().EndCell())
 
-	println("UPDATED ACT", actA.AsCell().Dump())
-
-reCh14:
+reCh14_phase1:
 	block, err = api.WaitForBlock(block.SeqNo + 1).GetMasterchainInfo(ctx)
 	if err != nil {
 		t.Fatal(fmt.Errorf("failed to wait for block: %w", err))
@@ -590,17 +696,87 @@ reCh14:
 	ch2, err = client.GetChannel(ctx, ch.Storage.PartyAddress, true, time.Time{})
 	if err != nil {
 		t.Log(fmt.Errorf("failed to get party channel: %w, retrying", err))
-		goto reCh14
+		goto reCh14_phase1
 	}
-	if !bytes.Equal(ch2.Storage.Quarantine.TheirState.ActionStatesHash, actA.AsCell().Hash()) {
-		t.Log("waiting for actions updated, cur hash", hex.EncodeToString(ch2.Storage.Quarantine.TheirState.ActionStatesHash), hex.EncodeToString(actA.AsCell().Hash()))
-		goto reCh14
+	if !bytes.Equal(ch2.Storage.Quarantine.TheirState.ActionStatesHash, actAfterDrv.AsCell().Hash()) {
+		t.Log("waiting for actions updated after derivative-only settle, cur hash", hex.EncodeToString(ch2.Storage.Quarantine.TheirState.ActionStatesHash),
+			hex.EncodeToString(ch2.Storage.Quarantine.TheirState.ConditionalsHash), hex.EncodeToString(actAfterDrv.AsCell().Hash()), hex.EncodeToString(condAfterDrv.AsCell().Hash()))
+		goto reCh14_phase1
 	}
-	log.Println("settled, actions updated")
+	if !bytes.Equal(ch2.Storage.Quarantine.TheirState.ConditionalsHash, condAfterDrv.AsCell().Hash()) {
+		t.Log("waiting for conditionals updated after derivative-only settle, cur hash", hex.EncodeToString(ch2.Storage.Quarantine.TheirState.ConditionalsHash), hex.EncodeToString(condAfterDrv.AsCell().Hash()))
+		goto reCh14_phase1
+	}
+	log.Println("phase 1 settled, updated (derivative applied)")
 
-	body, err = ch2.PrepareFinalizeSettleMessage(bKey, actA.AsCell().Hash())
+	// PHASE 2: normal resolves (virtual channels) sent directly to channel
+	toSettleNorm := cell.NewDict(256)
+	toSettleNorm.SetIntKey(big.NewInt(0), condInput)
+	toSettleNorm.SetIntKey(big.NewInt(5), condInput)
+
+	// Rebuild proof of actions input against the updated action state after phase 1
+	actAProof2, _ := actAfterDrv.AsCell().CreateProof(sk)
+
+	// Rebuild conditionals proof after phase 1: mark derivative key (7) as removed by empty cell
+	condAAfterDrv := cell.NewDict(256)
+	condAAfterDrv.SetIntKey(big.NewInt(0), vch.Serialize())
+	condAAfterDrv.SetIntKey(big.NewInt(5), vch2.Serialize())
+	// empty cell value denotes removed key in proof semantics
+	condAAfterDrv.SetIntKey(big.NewInt(7), cell.BeginCell().EndCell())
+	condAProof2, _ := condAAfterDrv.AsCell().CreateProof(sk)
+
+	// ExpectedSender = addr_none for normal resolves
+	body, err = ch2.PrepareSettleMessage(bKey, toSettleNorm, condAProof2, actAProof2, nil)
 	if err != nil {
-		t.Fatal(fmt.Errorf("failed to build deploy channel params: %w", err))
+		t.Fatal(fmt.Errorf("failed to build settle message (phase 2): %w", err))
+	}
+
+reTx3b:
+	tx, _, _, err = api.SendExternalMessageWaitTransaction(ctx, &tlb.ExternalMessage{
+		DstAddr: ch2.Address,
+		Body:    body,
+	})
+	if err != nil {
+		t.Log(fmt.Errorf("failed to send normal settle: %w", err))
+		block, err = api.WaitForBlock(block.SeqNo + 1).GetMasterchainInfo(ctx)
+		if err != nil {
+			t.Fatal(fmt.Errorf("failed to wait for block: %w", err))
+		}
+		goto reTx3b
+	}
+	log.Println("normal settle external tx sent:", base64.StdEncoding.EncodeToString(tx.Hash))
+
+	// Final expected action after phase 2: add both virtual channels 0.03 + 0.03 => 0.079999 total
+	actStateAFinal, _ := tlb.ToCell(actions.StateActionSend{
+		Amount:        actions.Coins{Val: tlb.MustFromTON("0.079999").Nano()},
+		Commited:      actions.Coins{Val: tlb.MustFromTON("0.00").Nano()},
+		CommitedSeqno: 0,
+	})
+	actFinal := cell.NewDict(256)
+	_ = actFinal.SetIntKey(new(big.Int).SetBytes(actC.Hash()), actStateAFinal)
+
+reCh14_phase2:
+	block, err = api.WaitForBlock(block.SeqNo + 1).GetMasterchainInfo(ctx)
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to wait for block: %w", err))
+	}
+	ch2, err = client.GetChannel(ctx, ch.Storage.PartyAddress, true, time.Time{})
+	if err != nil {
+		t.Log(fmt.Errorf("failed to get party channel: %w, retrying", err))
+		goto reCh14_phase2
+	}
+	if !bytes.Equal(ch2.Storage.Quarantine.TheirState.ActionStatesHash, actFinal.AsCell().Hash()) {
+		t.Log("waiting for actions updated after normal resolves, cur hash", hex.EncodeToString(ch2.Storage.Quarantine.TheirState.ActionStatesHash), hex.EncodeToString(actFinal.AsCell().Hash()))
+		goto reCh14_phase2
+	}
+	log.Println("phase 2 settled, actions updated (normal resolves applied)")
+
+	// Use final actions for subsequent steps
+	actA = actFinal
+
+	body, err = ch2.PrepareFinalizeSettleMessage(bKey, actFinal.AsCell().Hash())
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to build finalize settle message: %w", err))
 	}
 
 reTx4:
@@ -609,7 +785,7 @@ reTx4:
 		Body:    body,
 	})
 	if err != nil {
-		t.Log(fmt.Errorf("failed to send tx: %w", err))
+		t.Log(fmt.Errorf("failed to send finalize settle: %w", err))
 		block, err = api.WaitForBlock(block.SeqNo + 1).GetMasterchainInfo(ctx)
 		if err != nil {
 			t.Fatal(fmt.Errorf("failed to wait for block: %w", err))

@@ -37,7 +37,7 @@ type Conditional interface {
 	GetDeadline() time.Time
 	GetLogInfo() map[string]any
 	ValidateOnAdd() error
-	ValidateState(old, new *cell.Cell) error
+	ValidateState(ctx context.Context, old, new *cell.Cell) error
 	EmulateBalance(balances map[string]*BalanceInfo, fromUs bool) error
 	Commit(updated Conditional, actState *cell.Cell) (*cell.Cell, error)
 	PrepareCommit(condState *cell.Cell) (Conditional, error)

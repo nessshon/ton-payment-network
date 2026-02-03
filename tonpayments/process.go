@@ -9,17 +9,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
+	"reflect"
+	"time"
+
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
-	"math/big"
-	"reflect"
-	"time"
 )
 
 // Tunnel channel flow:
@@ -153,22 +155,48 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 			return nil
 		}
 	case transport.RemoveConditionalAction:
-		index, vch, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, data.ID, s)
+		idxOut, vchOut, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, data.ID, s)
 		if err != nil {
 			if errors.Is(err, payments.ErrNotFound) {
 				// idempotency
 				break
 			}
-			return nil, fmt.Errorf("failed to find virtual channel in their prev state: %w", err)
+			return nil, fmt.Errorf("failed to find virtual channel in our prev state: %w", err)
 		}
 
-		meta, err := s.db.GetVirtualChannelMeta(ctx, vch.GetKey())
+		var idxIn *cell.Cell
+
+		meta, err := s.db.GetVirtualChannelMeta(ctx, vchOut.GetKey())
 		if err != nil {
 			return nil, fmt.Errorf("failed to load virtual channel meta: %w", err)
 		}
 
-		if err = channel.Our.Data.Conditionals.Delete(index); err != nil {
-			return nil, fmt.Errorf("failed to remove condition with index %s: %w", index.String(), err)
+		if meta.Outgoing != nil && len(meta.Outgoing.LinkedKey) > 0 {
+			// TODO: only allow if order is not yet opened, but for now not impled
+			// return nil, fmt.Errorf("not implemented for derivatives")
+			panic("not implemented for derivatives")
+
+			// remove linked conditional
+			linkedMeta, err := s.db.GetVirtualChannelMeta(ctx, meta.Outgoing.LinkedKey)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load linked virtual channel meta: %w", err)
+			}
+
+			if linkedMeta.Incoming != nil {
+				idxIn, _, err = payments.FindConditional(ctx, channel.Our.Data.Conditionals, linkedMeta.Incoming.Conditional.Hash(), s)
+				if err != nil && !errors.Is(err, payments.ErrNotFound) {
+					return nil, fmt.Errorf("failed to find linked virtual channel: %w", err)
+				}
+			}
+		}
+
+		if err = channel.Their.Data.Conditionals.Delete(idxOut); err != nil {
+			return nil, fmt.Errorf("failed to remove condition: %w", err)
+		}
+		if idxIn != nil {
+			if err = channel.Our.Data.Conditionals.Delete(idxIn); err != nil {
+				return nil, fmt.Errorf("failed to remove linked condition: %w", err)
+			}
 		}
 
 		toExecute = func(ctx context.Context) error {
@@ -183,49 +211,95 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 					return fmt.Errorf("failed to create remove-cond task: %w", err)
 				}
 			}
-
-			log.Info().Str("id", base64.StdEncoding.EncodeToString(data.ID)).Msg("our conditional removed")
+			log.Info().Str("id", base64.StdEncoding.EncodeToString(data.ID)).Msg("our conditional removed (and linked if present)")
 			return nil
 		}
 	case transport.ExecuteConditionalAction:
-		index, cond, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, data.ID, s)
+		idxOut, condOut, err := payments.FindConditional(ctx, channel.Our.Data.Conditionals, data.ID, s)
 		if err != nil {
 			if errors.Is(err, payments.ErrNotFound) {
 				// idempotency
 				break
 			}
-			return nil, fmt.Errorf("failed to find virtual channel in their prev state: %w", err)
+			return nil, fmt.Errorf("failed to find virtual channel in our prev state: %w", err)
 		}
 
-		meta, err := s.db.GetVirtualChannelMeta(ctx, cond.GetKey())
+		meta, err := s.db.GetVirtualChannelMeta(ctx, condOut.GetKey())
 		if err != nil {
 			return nil, fmt.Errorf("failed to load virtual channel meta: %w", err)
 		}
 
-		if err = meta.AddKnownResolve(cond, data.State, false); err != nil {
+		if err = meta.AddKnownResolve(ctx, condOut, data.State, false); err != nil {
 			return nil, fmt.Errorf("failed to add resolve: %w", err)
 		}
 
-		actId := cond.GetAction().IDCell()
-		actBefore, err := channel.Our.Data.ActionStates.LoadValue(actId)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load before action state: %w", err)
+		// Check for linked conditional (Atomic Derivative)
+		var idxIn *cell.Cell // Assuming key is *cell.Cell
+		var condIn payments.Conditional
+
+		if meta.Outgoing != nil && len(meta.Outgoing.LinkedKey) > 0 {
+			linkedMeta, err := s.db.GetVirtualChannelMeta(ctx, meta.Outgoing.LinkedKey)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load linked virtual channel meta: %w", err)
+			}
+
+			// Find linked in Their conditionals
+			if linkedMeta.Incoming != nil {
+				var k *cell.Cell
+				var c payments.Conditional
+				k, c, err = payments.FindConditional(ctx, channel.Their.Data.Conditionals, linkedMeta.Incoming.Conditional.Hash(), s)
+				if err != nil && !errors.Is(err, payments.ErrNotFound) {
+					return nil, fmt.Errorf("failed to find linked conditional: %w", err)
+				}
+				if c != nil {
+					idxIn = k
+					condIn = c
+				}
+			}
 		}
 
-		newActState, err := cond.Execute(actBefore.MustToCell(), data.State, channel.Our.LockedDeposits)
+		// Execute Our Outgoing
+		actIdOut := condOut.GetAction().IDCell()
+		actStateOut, err := channel.Our.Data.ActionStates.LoadValue(actIdOut)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load action state (out): %w", err)
+		}
+
+		newActStateOut, err := condOut.Execute(actStateOut.MustToCell(), data.State, channel.Our.LockedDeposits)
 		if err != nil {
 			return nil, fmt.Errorf("failed to execute condition: %w", err)
 		}
 
-		if err = channel.Our.Data.Conditionals.Delete(index); err != nil {
-			return nil, fmt.Errorf("failed to remove condition with index %s: %w", index.String(), err)
+		// Execute Their Linked (if exists)
+		if condIn != nil {
+			actIdIn := condIn.GetAction().IDCell()
+			actStateIn, err := channel.Their.Data.ActionStates.LoadValue(actIdIn)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load action state (in): %w", err)
+			}
+
+			// state must be shared for linked channels
+			newActStateIn, err := condIn.Execute(actStateIn.MustToCell(), data.State, channel.Their.LockedDeposits)
+			if err != nil {
+				return nil, fmt.Errorf("failed to execute linked condition: %w", err)
+			}
+
+			if err = channel.Their.Data.Conditionals.Delete(idxIn); err != nil {
+				return nil, fmt.Errorf("failed to remove condition (in): %w", err)
+			}
+			if err = channel.Their.Data.ActionStates.Set(actIdIn, newActStateIn); err != nil {
+				return nil, fmt.Errorf("failed to set action state (in): %w", err)
+			}
 		}
 
-		if err = channel.Our.Data.ActionStates.Set(actId, newActState); err != nil {
-			return nil, fmt.Errorf("failed to update action state: %w", err)
+		if err = channel.Our.Data.Conditionals.Delete(idxOut); err != nil {
+			return nil, fmt.Errorf("failed to remove condition (out): %w", err)
+		}
+		if err = channel.Our.Data.ActionStates.Set(actIdOut, newActStateOut); err != nil {
+			return nil, fmt.Errorf("failed to set action state (out): %w", err)
 		}
 
-		balanceDiff, err := cond.GetAction().StatesDiff(actBefore.MustToCell(), newActState)
+		balanceDiff, err := condOut.GetAction().StatesDiff(actStateOut.MustToCell(), newActStateOut)
 		if err != nil {
 			return nil, fmt.Errorf("failed to calc balance diff: %w", err)
 		}
@@ -241,11 +315,18 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		}
 
 		toExecute = func(ctx context.Context) error {
+			// TODO: another event for linked conditional
 			if err = s.db.CreateChannelEvent(ctx, channel, meta.UpdatedAt, db.ChannelHistoryItem{
 				Action: db.ChannelHistoryActionTransferOut,
 				Data:   jsonData,
 			}); err != nil {
 				return fmt.Errorf("failed to create channel event: %w", err)
+			}
+
+			if s.webhook != nil {
+				if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeOpen, meta); err != nil {
+					return fmt.Errorf("failed to push virtual channel open event: %w", err)
+				}
 			}
 
 			if meta.Incoming == nil {
@@ -409,7 +490,137 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 			}
 		}
 
-		if !isFinalDest {
+		if res, ok := cond.(*conditionals.ConditionalResolvable); ok {
+			// Atomic Derivative Logic:
+			// If we receive `AddConditionalAction` for a Resolvable (Their Outgoing),
+			// we must also add the Reciprocal (Our Outgoing) -> Their Incoming.
+
+			// 1. Construct Reciprocal Conditional (Our Outgoing)
+			condDetails := res.Details
+			inCondDetails := condDetails
+			inCondDetails.IsLong = !res.Details.IsLong // Derived side is opposite
+
+			inCondResolvable := &conditionals.ConditionalResolvable{
+				Details: inCondDetails,
+				Action:  res.Action, // Is action symmetric? We need to verify who pays whom.
+				// Wait, `res.Action` defines what happens when resolved.
+				// Usually "Send X to Target".
+				// For Derivatives: "If Price > X, Long pays Short".
+				// `res.Action` likely encodes "Pay to Peer".
+				// Reciprocal should also be "Pay to Peer" (from Us).
+				// We reuse `res.Action`?
+				// `res.Action` contains Coin, Address?
+				// If Address is "Target", we need to switch Target?
+				// Actually, `ConditionalResolvable` logic usually handles payout based on State.
+				// If `res.Action` is just "Send X", and the logic says "Execute this action if I lose",
+				// then for Reciprocal (We lose), we also execute "Send X".
+				// So `res.Action` might be reusable if it's generic "Send to Counterparty".
+				// Or we must construct new Action sending to *Them*.
+				// `cond.GetAction()` returns the action.
+				// `data.TransportAction` usually doesn't carry full Action for both sides.
+				// We assume symmetric configuration.
+			}
+			// Important: We need a VALID `inCondResolvable`.
+			// Since we don't have deep context here, we assume `res` logic works for both sides
+			// if configured correctly with `IsLong` flip.
+
+			// 2. Add Reciprocal to Our Conditionals (Our State)
+			ourCond := inCondResolvable // This should be a `Conditional`
+			// We need to ensure `ourCond` is initialized properly (e.g. Action logic).
+			// If `res.Action` relies on `target` being set, `inCondResolvable` needs it.
+			// `res` from `CodeToConditional` has access to `aResolver`.
+
+			// For now, to match the pattern, we assume `inCondResolvable` is enough.
+			// We need to Serializing it.
+			srzIn := ourCond.Serialize()
+			idIn := cell.BeginCell().MustStoreSlice(srzIn.Hash(), 256).EndCell()
+
+			// Check idempotency in Our State
+			if _, err := channel.Our.Data.Conditionals.LoadValue(idIn); err == nil {
+				// already exists
+			} else if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
+				return nil, fmt.Errorf("failed to check our conditional: %w", err)
+			} else {
+				// Add to Our Conditionals
+				if err = channel.Our.Data.Conditionals.Set(idIn, srzIn); err != nil {
+					return nil, fmt.Errorf("failed to set our linked condition: %w", err)
+				}
+
+				// Initialize Action State for Incoming (Our Outgoing)
+				act := ourCond.GetAction()
+				actId := act.IDCell()
+				if _, err := channel.Our.Data.ActionStates.LoadValue(actId); err != nil {
+					if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
+						return nil, err
+					}
+
+					// We need Action Code? `aResolver`?
+					if err = s.SaveAction(ctx, act); err != nil {
+						return nil, fmt.Errorf("failed to save our linked action: %w", err)
+					}
+					if err = channel.Our.Data.ActionStates.Set(actId, act.GetEmptyState()); err != nil {
+						return nil, fmt.Errorf("failed to set our linked action state: %w", err)
+					}
+				}
+			}
+
+			toExecute = func(ctx context.Context) error {
+				meta := &db.ConditionalMeta{
+					Key:    cond.GetKey(),
+					Status: db.ConditionalStateActive,
+					Incoming: &db.ConditionalMetaSide{
+						ChannelAddress:        channel.Our.Address,
+						Conditional:           cond.Serialize(),
+						UncooperativeDeadline: cond.GetDeadline(),
+						SafeDeadline:          cond.GetDeadline().Add(-time.Duration(channel.SafeOnchainClosePeriod+int64(s.cfg.MinSafeVirtualChannelTimeoutSec)) * time.Second),
+						SenderKey:             data.InstructionKey,
+						LinkedKey:             ourCond.GetKey(), // Link to Our Outgoing
+					},
+					Any:       res.Details,
+					CreatedAt: time.Now(),
+					UpdatedAt: time.Now(),
+				}
+
+				if err = removeAfterTimeout(ctx); err != nil {
+					return err
+				}
+
+				if err = s.db.CreateVirtualChannelMeta(ctx, meta); err != nil {
+					return fmt.Errorf("failed to update virtual channel meta: %w", err)
+				}
+
+				// Save Meta for Our Outgoing (Reciprocal)
+				metaReciprocal := &db.ConditionalMeta{
+					Key:    ourCond.GetKey(),
+					Status: db.ConditionalStateActive,
+					Outgoing: &db.ConditionalMetaSide{
+						ChannelAddress:        channel.Our.Address,
+						Conditional:           ourCond.Serialize(),
+						UncooperativeDeadline: cond.GetDeadline(),
+						SafeDeadline:          cond.GetDeadline().Add(-time.Duration(channel.SafeOnchainClosePeriod+int64(s.cfg.MinSafeVirtualChannelTimeoutSec)) * time.Second),
+						SenderKey:             data.InstructionKey,
+						LinkedKey:             cond.GetKey(), // Link to Their Outgoing (Incoming)
+					},
+					Any:       inCondDetails,
+					CreatedAt: time.Now(),
+					UpdatedAt: time.Now(),
+				}
+				// Save Reciprocal Meta
+				if err = s.db.CreateVirtualChannelMeta(ctx, metaReciprocal); err != nil {
+					return fmt.Errorf("failed to update virtual channel meta (reciprocal): %w", err)
+				}
+
+				// we treat is as virtual channel open for uniformity in events
+				if s.webhook != nil {
+					if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeOpen, meta); err != nil {
+						return fmt.Errorf("failed to push virtual channel close event: %w", err)
+					}
+				}
+
+				log.Info().Str("key", base64.StdEncoding.EncodeToString(cond.GetKey())).Msg("conditional derivative pair added")
+				return nil
+			}
+		} else if !isFinalDest {
 			maxNextDeadline := cond.GetDeadline().Unix() - (channel.SafeOnchainClosePeriod + int64(s.cfg.MinSafeVirtualChannelTimeoutSec))
 			if currentInstruction.NextDeadline > maxNextDeadline {
 				return nil, fmt.Errorf("next deadline too late (not enough safety gap)")
@@ -535,7 +746,7 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 				}
 
 				if currentInstruction.FinalState != nil {
-					if err = meta.AddKnownResolve(cond, currentInstruction.FinalState, false); err != nil {
+					if err = meta.AddKnownResolve(ctx, cond, currentInstruction.FinalState, false); err != nil {
 						return fmt.Errorf("failed to add channel condition resolve: %w", err)
 					}
 

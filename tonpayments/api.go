@@ -10,6 +10,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
+	"strings"
+	"time"
+
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
@@ -19,9 +23,6 @@ import (
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
-	"math/big"
-	"strings"
-	"time"
 )
 
 var ErrNoResolveExists = errors.New("cannot close channel without known state")
@@ -275,6 +276,83 @@ func (s *Service) CreateSendConditional(ctx context.Context, instructionKey ed25
 	return nil
 }
 
+func (s *Service) CreateDerivativeCond(ctx context.Context, instructionKey ed25519.PublicKey, private ed25519.PrivateKey, firstPart transport.TunnelChainPart, instruction transport.AddConditionalInstruction, cc *payments.CoinConfig, amount *big.Int,
+	details conditionals.ConditionalResolvableDetails, resolverAddr *address.Address) error {
+
+	channels, err := s.db.GetChannels(ctx, firstPart.Target, db.ChannelStateActive)
+	if err != nil {
+		return fmt.Errorf("failed to get active channels: %w", err)
+	}
+
+	needAmount := new(big.Int).Add(firstPart.Fee, amount)
+	var channel *db.Channel
+	for _, ch := range channels {
+		balances, err := ch.CalcBalance(ctx, false, s)
+		if err != nil {
+			return fmt.Errorf("failed to calc channel balance: %w", err)
+		}
+
+		if balances[cc.BalanceID].Available().Cmp(needAmount) >= 0 {
+			// we found channel with enough balance
+			channel = ch
+			break
+		}
+	}
+
+	if channel == nil {
+		return fmt.Errorf("failed to open derivative, %w: no active channel with enough balance exists", ErrNotPossible)
+	}
+
+	a, b := channel.Our.Address, channel.Their.Address
+	if !channel.WeLeft {
+		a, b = b, a
+	}
+
+	act, err := actions.NewSendActionFromBalanceID(ctx, cc, a, b)
+	if err != nil {
+		return fmt.Errorf("failed to create action: %w", err)
+	}
+
+	condRes := conditionals.ConditionalResolvable{
+		Key:          private.Public().(ed25519.PublicKey),
+		Amount:       amount,
+		ResolverAddr: resolverAddr,
+		Details:      details,
+		Action:       act,
+	}
+
+	tAct := transport.AddConditionalAction{
+		Conditional:    condRes.Serialize(),
+		InstructionKey: instructionKey,
+	}
+
+	if _, err = channel.Our.Data.ActionStates.LoadValue(act.IDCell()); err != nil {
+		if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
+			return fmt.Errorf("failed to load action state: %w", err)
+		}
+		tAct.NewActionCode = act.Serialize()
+	}
+
+	if err = tAct.SetInstructions([]transport.AddConditionalInstruction{instruction}, private); err != nil {
+		return fmt.Errorf("failed to set instructions: %w", err)
+	}
+
+	err = s.db.CreateTask(ctx, PaymentsTaskPool, "create-derivative-cond", channel.Our.Address,
+		"create-derivative-cond-"+base64.StdEncoding.EncodeToString(condRes.Key),
+		db.AddDerivativeTask{
+			ChannelAddress:  channel.Our.Address,
+			Deadline:        firstPart.Deadline.Unix(),
+			TransportAction: tAct,
+		}, nil, nil,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create open task: %w", err)
+	}
+	s.touchWorker()
+
+	return nil
+}
+
 func (s *Service) CommitAllOurVirtualChannelsAndWait(ctx context.Context) error {
 	list, err := s.ListChannels(ctx, nil, db.ChannelStateActive)
 	if err != nil {
@@ -449,7 +527,7 @@ func (s *Service) AddConditionalResolve(ctx context.Context, virtualKey ed25519.
 		}
 	}
 
-	if err = meta.AddKnownResolve(cond, state, true); err != nil {
+	if err = meta.AddKnownResolve(ctx, cond, state, true); err != nil {
 		return fmt.Errorf("failed to add channel condition resolve: %w", err)
 	}
 
@@ -623,6 +701,89 @@ func (s *Service) requestCommitAction(ctx context.Context, channel *db.Channel, 
 }
 
 var ErrCannotCloseOutgoingVirtual = fmt.Errorf("cannot close outgoing channel")
+
+func (s *Service) CloseDerivative(ctx context.Context, virtualKey ed25519.PublicKey) error {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	meta, err := s.db.GetVirtualChannelMeta(ctx, virtualKey)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return fmt.Errorf("virtual channel is not exists")
+		}
+		return fmt.Errorf("failed to load virtual channel meta: %w", err)
+	}
+
+	if meta.Outgoing == nil {
+		return fmt.Errorf("derivative is not outgoing")
+	}
+
+	ch, err := s.GetActiveChannel(ctx, meta.Outgoing.ChannelAddress)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return fmt.Errorf("onchain channel with target is not active")
+		}
+		return fmt.Errorf("failed to get channel: %w", err)
+	}
+
+	condId := meta.Outgoing.Conditional.Hash()
+	_, cond, err := payments.FindConditional(ctx, ch.Our.Data.Conditionals, condId, s)
+	if err != nil {
+		if errors.Is(err, payments.ErrNotFound) {
+			log.Debug().Err(err).Str("channel", ch.Our.Address).Str("id", base64.StdEncoding.EncodeToString(condId)).Msg("derivative not found, nothing to close")
+			// idempotency
+			return nil
+		}
+		log.Error().Err(err).Str("channel", ch.Our.Address).Msg("failed to find derivative virtual channel")
+		return fmt.Errorf("failed to find derivative virtual channel: %w", err)
+	}
+
+	resolve := meta.LastKnownResolve
+	if resolve == nil {
+		return ErrNoResolveExists
+	}
+
+	actStateSlice, err := ch.Our.Data.ActionStates.LoadValue(cond.GetAction().IDCell())
+	if err != nil {
+		return fmt.Errorf("failed to load active channel state: %w", err)
+	}
+	actState := actStateSlice.MustToCell()
+
+	_, err = cond.Execute(actState, resolve, nil)
+	if err != nil {
+		return fmt.Errorf("failed to execute conditional: %w", err)
+	}
+
+	err = s.db.Transaction(ctx, func(ctx context.Context) error {
+		meta.Status = db.ConditionalStateWantClose
+		meta.UpdatedAt = time.Now()
+		if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
+			return fmt.Errorf("failed to update channel in db: %w", err)
+		}
+
+		till := cond.GetDeadline()
+
+		log.Debug().Str("key", base64.StdEncoding.EncodeToString(meta.Key)).
+			Msg("creating task to close conditional")
+
+		if err = s.db.CreateTask(ctx, PaymentsTaskPool, "close-conditional", ch.Our.Address+"-deriv-close",
+			"close-conditional-"+ch.Our.Address+"-vc-"+base64.StdEncoding.EncodeToString(condId),
+			db.CloseConditionalTask{
+				VirtualKey: meta.Key,
+			}, nil, &till,
+		); err != nil {
+			return fmt.Errorf("failed to create close conditional task: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to execute db tx for close derivative: %w", err)
+	}
+	s.touchWorker()
+
+	return nil
+}
 
 func (s *Service) CloseConditional(ctx context.Context, virtualKey ed25519.PublicKey) error {
 	s.mx.Lock()
@@ -1739,6 +1900,7 @@ func (s *Service) executeSettleStep(ctx context.Context, channelAddr string, raw
 
 	// enrich with seqno and signature only, other data should be fine
 	msg.Signed.WalletSeqno = c.Storage.WalletSeqno
+	msg.Signed.ExpectedSender = nil
 
 	dataCell, err := tlb.ToCell(msg.Signed)
 	if err != nil {

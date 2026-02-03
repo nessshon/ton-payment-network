@@ -8,13 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/xssnick/ton-payment-network/pkg/payments"
-	"github.com/xssnick/tonutils-go/address"
-	"github.com/xssnick/tonutils-go/tvm/cell"
 	"math/big"
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/xssnick/ton-payment-network/pkg/payments"
+	"github.com/xssnick/tonutils-go/address"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 type VirtualChannelEventType string
@@ -96,7 +97,8 @@ type ConditionalMetaSide struct {
 	Conditional           *cell.Cell
 	UncooperativeDeadline time.Time
 	SafeDeadline          time.Time
-	SenderKey             []byte
+	SenderKey             ed25519.PublicKey
+	LinkedKey             ed25519.PublicKey
 }
 
 type ConditionalMeta struct {
@@ -106,6 +108,7 @@ type ConditionalMeta struct {
 	Outgoing         *ConditionalMetaSide
 	LastKnownResolve *cell.Cell
 	FinalDestination ed25519.PublicKey // known only to the first initiator
+	Any              any
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -453,12 +456,12 @@ func (ch *Channel) CalcDepositFee(cc *payments.CoinConfig, newAmount *big.Int, t
 	return result
 }
 
-func (ch *ConditionalMeta) AddKnownResolve(cond payments.Conditional, state *cell.Cell, errOnOlderState bool) error {
+func (ch *ConditionalMeta) AddKnownResolve(ctx context.Context, cond payments.Conditional, state *cell.Cell, errOnOlderState bool) error {
 	if cond.GetDeadline().Before(time.Now()) {
 		return fmt.Errorf("conditional has expired")
 	}
 
-	if err := cond.ValidateState(ch.LastKnownResolve, state); err != nil {
+	if err := cond.ValidateState(ctx, ch.LastKnownResolve, state); err != nil {
 		if !errOnOlderState && errors.Is(err, payments.ErrNewerConditionalStateIsKnown) {
 			return nil
 		}

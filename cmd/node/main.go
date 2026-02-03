@@ -12,6 +12,7 @@ import (
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals/oracle"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/ton-payment-network/tonpayments/api"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain"
@@ -389,7 +390,12 @@ func main() {
 			}
 		}
 
-		srv := api.NewServer(*API, *Webhook, cfg.WebhooksSignatureHMACSHA256Key, svc, fdb, credentials)
+		// Initialize price resolvers (flexible: add more symbols in future)
+		// Use Binance USD-M aggTrades provider with 1e9 scale to match 9-digit precision.
+		oracle.PriceResolvers[oracle.GetResolverID("binance", "BTCUSDT")] = oracle.NewResolver(oracle.NewBinanceProvider("BTCUSDT", 1_000_000_000))
+
+		derivSvc := tonpayments.NewDerivativesService(svc)
+		srv := api.NewServer(*API, *Webhook, cfg.WebhooksSignatureHMACSHA256Key, svc, derivSvc, fdb, credentials)
 		if *Webhook != "" {
 			svc.SetWebhook(srv)
 		}
