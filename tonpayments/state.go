@@ -15,6 +15,7 @@ import (
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -31,10 +32,17 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 	switch act := action.(type) {
 	case transport.IncrementStatesAction:
 	case transport.AddConditionalAction:
-		cond := details.(payments.Conditional)
+		cond, ok := details.(payments.Conditional)
+		if !ok || cond == nil {
+			return nil, nil, fmt.Errorf("missing conditional details for add action")
+		}
 
 		if err := cond.ValidateOnAdd(); err != nil {
 			return nil, nil, err
+		}
+
+		if safe := cond.GetDeadline().UTC().Unix() - (time.Now().UTC().Unix() + channel.SafeOnchainClosePeriod); safe < int64(s.cfg.MinSafeVirtualChannelTimeoutSec) {
+			return nil, nil, fmt.Errorf("safe conditional deadline is less than acceptable: %d, %d", safe, s.cfg.MinSafeVirtualChannelTimeoutSec)
 		}
 
 		val := cond.Serialize()
@@ -58,7 +66,7 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			}
 
 			if act.NewActionCode == nil {
-				return nil, nil, fmt.Errorf("action code myst be set")
+				return nil, nil, fmt.Errorf("action code must be set")
 			}
 
 			if err := channel.Our.Data.ActionStates.Set(actId, cond.GetAction().GetEmptyState()); err != nil {
@@ -73,16 +81,44 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			return nil, nil, fmt.Errorf("failed to set condition: %w", err)
 		}
 
+		var linkedDeriv *conditionals.ConditionalResolvable
+		var saveLinkedAction bool
+		if res, ok := cond.(*conditionals.ConditionalResolvable); ok {
+			linkedDeriv, err = s.buildLinkedDerivativeConditional(res)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to prepare linked derivative conditional: %w", err)
+			}
+
+			if _, err = ensureConditionalOnSide(&channel.Their, linkedDeriv); err != nil {
+				return nil, nil, fmt.Errorf("failed to add linked derivative condition: %w", err)
+			}
+
+			if saveLinkedAction, err = ensureActionStateOnSide(&channel.Their, linkedDeriv.GetAction()); err != nil {
+				return nil, nil, fmt.Errorf("failed to init linked derivative action state: %w", err)
+			}
+		}
+
 		if saveAction {
 			if err = s.SaveAction(ctx, cond.GetAction()); err != nil {
 				return nil, nil, fmt.Errorf("failed to save action: %w", err)
 			}
 		}
+		if saveLinkedAction {
+			if err = s.SaveAction(ctx, linkedDeriv.GetAction()); err != nil {
+				return nil, nil, fmt.Errorf("failed to save linked derivative action: %w", err)
+			}
+		}
 
 		onSuccess = func(ctx context.Context) error {
-			log.Info().Fields(cond.GetLogInfo()).
+			ev := "our conditional added"
+			if linkedDeriv != nil {
+				ev = "our derivative conditional pair added"
+			}
+
+			log.Info().
+				Fields(cond.GetLogInfo()).
 				Str("channel", channel.Our.Address).
-				Msg("our conditional added")
+				Msg(ev)
 			return nil
 		}
 	case transport.CommitVirtualAction:
@@ -181,8 +217,24 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			return nil, nil, fmt.Errorf("conditional has expired")
 		}
 
-		if err = channel.Their.Data.Conditionals.Delete(idx); err != nil {
-			return nil, nil, err
+		var linkedIdx *cell.Cell
+		var linkedCond payments.Conditional
+		if meta.Incoming != nil && len(meta.Incoming.LinkedKey) > 0 {
+			linkedMeta, err := s.db.GetVirtualChannelMeta(ctx, meta.Incoming.LinkedKey)
+			if err != nil && !errors.Is(err, db.ErrNotFound) {
+				return nil, nil, fmt.Errorf("failed to load linked virtual channel meta: %w", err)
+			}
+
+			if err == nil && linkedMeta.Outgoing != nil {
+				linkedIdx, linkedCond, err = payments.FindConditional(ctx, channel.Our.Data.Conditionals, linkedMeta.Outgoing.Conditional.Hash(), s)
+				if err != nil && !errors.Is(err, payments.ErrNotFound) {
+					return nil, nil, fmt.Errorf("failed to find linked conditional: %w", err)
+				}
+				if errors.Is(err, payments.ErrNotFound) {
+					linkedIdx = nil
+					linkedCond = nil
+				}
+			}
 		}
 
 		actId := cond.GetAction().IDCell()
@@ -198,6 +250,38 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 
 		if err = channel.Their.Data.ActionStates.Set(actId, newActState); err != nil {
 			return nil, nil, fmt.Errorf("failed to set action: %w", err)
+		}
+
+		if linkedCond != nil {
+			linkedActID := linkedCond.GetAction().IDCell()
+			linkedActState, err := channel.Our.Data.ActionStates.LoadValue(linkedActID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to load linked action state: %w", err)
+			}
+
+			linkedState := act.State
+			if _, ok := linkedCond.(*conditionals.ConditionalResolvable); ok {
+				linkedState, err = remapDerivativeStateKey(act.State, linkedCond.GetKey())
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to remap linked derivative state: %w", err)
+				}
+			}
+
+			newLinkedActState, err := linkedCond.Execute(linkedActState.MustToCell(), linkedState, channel.Our.LockedDeposits)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to execute linked condition: %w", err)
+			}
+
+			if err = channel.Our.Data.Conditionals.Delete(linkedIdx); err != nil {
+				return nil, nil, fmt.Errorf("failed to remove linked condition: %w", err)
+			}
+			if err = channel.Our.Data.ActionStates.Set(linkedActID, newLinkedActState); err != nil {
+				return nil, nil, fmt.Errorf("failed to set linked action: %w", err)
+			}
+		}
+
+		if err = channel.Their.Data.Conditionals.Delete(idx); err != nil {
+			return nil, nil, err
 		}
 
 		balanceDiff, err := cond.GetAction().StatesDiff(actState.MustToCell(), newActState)

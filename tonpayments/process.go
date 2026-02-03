@@ -172,29 +172,24 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		}
 
 		if meta.Outgoing != nil && len(meta.Outgoing.LinkedKey) > 0 {
-			// TODO: only allow if order is not yet opened, but for now not impled
-			// return nil, fmt.Errorf("not implemented for derivatives")
-			panic("not implemented for derivatives")
-
-			// remove linked conditional
 			linkedMeta, err := s.db.GetVirtualChannelMeta(ctx, meta.Outgoing.LinkedKey)
 			if err != nil {
 				return nil, fmt.Errorf("failed to load linked virtual channel meta: %w", err)
 			}
 
 			if linkedMeta.Incoming != nil {
-				idxIn, _, err = payments.FindConditional(ctx, channel.Our.Data.Conditionals, linkedMeta.Incoming.Conditional.Hash(), s)
+				idxIn, _, err = payments.FindConditional(ctx, channel.Their.Data.Conditionals, linkedMeta.Incoming.Conditional.Hash(), s)
 				if err != nil && !errors.Is(err, payments.ErrNotFound) {
 					return nil, fmt.Errorf("failed to find linked virtual channel: %w", err)
 				}
 			}
 		}
 
-		if err = channel.Their.Data.Conditionals.Delete(idxOut); err != nil {
+		if err = channel.Our.Data.Conditionals.Delete(idxOut); err != nil {
 			return nil, fmt.Errorf("failed to remove condition: %w", err)
 		}
 		if idxIn != nil {
-			if err = channel.Our.Data.Conditionals.Delete(idxIn); err != nil {
+			if err = channel.Their.Data.Conditionals.Delete(idxIn); err != nil {
 				return nil, fmt.Errorf("failed to remove linked condition: %w", err)
 			}
 		}
@@ -278,8 +273,15 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 				return nil, fmt.Errorf("failed to load action state (in): %w", err)
 			}
 
-			// state must be shared for linked channels
-			newActStateIn, err := condIn.Execute(actStateIn.MustToCell(), data.State, channel.Their.LockedDeposits)
+			linkedState := data.State
+			if _, ok := condIn.(*conditionals.ConditionalResolvable); ok {
+				linkedState, err = remapDerivativeStateKey(data.State, condIn.GetKey())
+				if err != nil {
+					return nil, fmt.Errorf("failed to remap linked derivative state: %w", err)
+				}
+			}
+
+			newActStateIn, err := condIn.Execute(actStateIn.MustToCell(), linkedState, channel.Their.LockedDeposits)
 			if err != nil {
 				return nil, fmt.Errorf("failed to execute linked condition: %w", err)
 			}
@@ -491,76 +493,30 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		}
 
 		if res, ok := cond.(*conditionals.ConditionalResolvable); ok {
-			// Atomic Derivative Logic:
-			// If we receive `AddConditionalAction` for a Resolvable (Their Outgoing),
-			// we must also add the Reciprocal (Our Outgoing) -> Their Incoming.
-
-			// 1. Construct Reciprocal Conditional (Our Outgoing)
-			condDetails := res.Details
-			inCondDetails := condDetails
-			inCondDetails.IsLong = !res.Details.IsLong // Derived side is opposite
-
-			inCondResolvable := &conditionals.ConditionalResolvable{
-				Details: inCondDetails,
-				Action:  res.Action, // Is action symmetric? We need to verify who pays whom.
-				// Wait, `res.Action` defines what happens when resolved.
-				// Usually "Send X to Target".
-				// For Derivatives: "If Price > X, Long pays Short".
-				// `res.Action` likely encodes "Pay to Peer".
-				// Reciprocal should also be "Pay to Peer" (from Us).
-				// We reuse `res.Action`?
-				// `res.Action` contains Coin, Address?
-				// If Address is "Target", we need to switch Target?
-				// Actually, `ConditionalResolvable` logic usually handles payout based on State.
-				// If `res.Action` is just "Send X", and the logic says "Execute this action if I lose",
-				// then for Reciprocal (We lose), we also execute "Send X".
-				// So `res.Action` might be reusable if it's generic "Send to Counterparty".
-				// Or we must construct new Action sending to *Them*.
-				// `cond.GetAction()` returns the action.
-				// `data.TransportAction` usually doesn't carry full Action for both sides.
-				// We assume symmetric configuration.
+			linkedCond, err := s.buildLinkedDerivativeConditional(res)
+			if err != nil {
+				return nil, fmt.Errorf("failed to build linked derivative condition: %w", err)
 			}
-			// Important: We need a VALID `inCondResolvable`.
-			// Since we don't have deep context here, we assume `res` logic works for both sides
-			// if configured correctly with `IsLong` flip.
 
-			// 2. Add Reciprocal to Our Conditionals (Our State)
-			ourCond := inCondResolvable // This should be a `Conditional`
-			// We need to ensure `ourCond` is initialized properly (e.g. Action logic).
-			// If `res.Action` relies on `target` being set, `inCondResolvable` needs it.
-			// `res` from `CodeToConditional` has access to `aResolver`.
+			// linked key must also be globally unique
+			if _, err = s.db.GetVirtualChannelMeta(ctx, linkedCond.GetKey()); err != nil && !errors.Is(err, db.ErrNotFound) {
+				return nil, fmt.Errorf("failed to load linked virtual channel meta: %w", err)
+			} else if err == nil {
+				return nil, fmt.Errorf("this linked conditional key %s was already used before", base64.StdEncoding.EncodeToString(linkedCond.GetKey()))
+			}
 
-			// For now, to match the pattern, we assume `inCondResolvable` is enough.
-			// We need to Serializing it.
-			srzIn := ourCond.Serialize()
-			idIn := cell.BeginCell().MustStoreSlice(srzIn.Hash(), 256).EndCell()
+			if _, err = ensureConditionalOnSide(&channel.Our, linkedCond); err != nil {
+				return nil, fmt.Errorf("failed to add linked derivative condition: %w", err)
+			}
 
-			// Check idempotency in Our State
-			if _, err := channel.Our.Data.Conditionals.LoadValue(idIn); err == nil {
-				// already exists
-			} else if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
-				return nil, fmt.Errorf("failed to check our conditional: %w", err)
-			} else {
-				// Add to Our Conditionals
-				if err = channel.Our.Data.Conditionals.Set(idIn, srzIn); err != nil {
-					return nil, fmt.Errorf("failed to set our linked condition: %w", err)
-				}
+			linkedActionAdded, err := ensureActionStateOnSide(&channel.Our, linkedCond.GetAction())
+			if err != nil {
+				return nil, fmt.Errorf("failed to init linked derivative action state: %w", err)
+			}
 
-				// Initialize Action State for Incoming (Our Outgoing)
-				act := ourCond.GetAction()
-				actId := act.IDCell()
-				if _, err := channel.Our.Data.ActionStates.LoadValue(actId); err != nil {
-					if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
-						return nil, err
-					}
-
-					// We need Action Code? `aResolver`?
-					if err = s.SaveAction(ctx, act); err != nil {
-						return nil, fmt.Errorf("failed to save our linked action: %w", err)
-					}
-					if err = channel.Our.Data.ActionStates.Set(actId, act.GetEmptyState()); err != nil {
-						return nil, fmt.Errorf("failed to set our linked action state: %w", err)
-					}
+			if linkedActionAdded {
+				if err = s.SaveAction(ctx, linkedCond.GetAction()); err != nil {
+					return nil, fmt.Errorf("failed to save linked derivative action: %w", err)
 				}
 			}
 
@@ -574,7 +530,7 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 						UncooperativeDeadline: cond.GetDeadline(),
 						SafeDeadline:          cond.GetDeadline().Add(-time.Duration(channel.SafeOnchainClosePeriod+int64(s.cfg.MinSafeVirtualChannelTimeoutSec)) * time.Second),
 						SenderKey:             data.InstructionKey,
-						LinkedKey:             ourCond.GetKey(), // Link to Our Outgoing
+						LinkedKey:             linkedCond.GetKey(),
 					},
 					Any:       res.Details,
 					CreatedAt: time.Now(),
@@ -586,38 +542,39 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 				}
 
 				if err = s.db.CreateVirtualChannelMeta(ctx, meta); err != nil {
-					return fmt.Errorf("failed to update virtual channel meta: %w", err)
+					return fmt.Errorf("failed to create virtual channel meta: %w", err)
 				}
 
-				// Save Meta for Our Outgoing (Reciprocal)
 				metaReciprocal := &db.ConditionalMeta{
-					Key:    ourCond.GetKey(),
+					Key:    linkedCond.GetKey(),
 					Status: db.ConditionalStateActive,
 					Outgoing: &db.ConditionalMetaSide{
 						ChannelAddress:        channel.Our.Address,
-						Conditional:           ourCond.Serialize(),
+						Conditional:           linkedCond.Serialize(),
 						UncooperativeDeadline: cond.GetDeadline(),
 						SafeDeadline:          cond.GetDeadline().Add(-time.Duration(channel.SafeOnchainClosePeriod+int64(s.cfg.MinSafeVirtualChannelTimeoutSec)) * time.Second),
 						SenderKey:             data.InstructionKey,
-						LinkedKey:             cond.GetKey(), // Link to Their Outgoing (Incoming)
+						LinkedKey:             cond.GetKey(),
 					},
-					Any:       inCondDetails,
+					Any:       linkedCond.Details,
 					CreatedAt: time.Now(),
 					UpdatedAt: time.Now(),
 				}
-				// Save Reciprocal Meta
+
 				if err = s.db.CreateVirtualChannelMeta(ctx, metaReciprocal); err != nil {
-					return fmt.Errorf("failed to update virtual channel meta (reciprocal): %w", err)
+					return fmt.Errorf("failed to create linked virtual channel meta: %w", err)
 				}
 
-				// we treat is as virtual channel open for uniformity in events
 				if s.webhook != nil {
 					if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeOpen, meta); err != nil {
-						return fmt.Errorf("failed to push virtual channel close event: %w", err)
+						return fmt.Errorf("failed to push virtual channel open event: %w", err)
 					}
 				}
 
-				log.Info().Str("key", base64.StdEncoding.EncodeToString(cond.GetKey())).Msg("conditional derivative pair added")
+				log.Info().
+					Str("key", base64.StdEncoding.EncodeToString(cond.GetKey())).
+					Str("linked_key", base64.StdEncoding.EncodeToString(linkedCond.GetKey())).
+					Msg("derivative conditional pair added")
 				return nil
 			}
 		} else if !isFinalDest {

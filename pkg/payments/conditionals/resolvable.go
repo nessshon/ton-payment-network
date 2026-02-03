@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals/oracle"
 	"github.com/xssnick/ton-payment-network/pkg/payments/vm"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -159,6 +160,7 @@ func (c *ConditionalResolvable) Parse(ctx context.Context, s *cell.Slice, action
 	c.Amount = amount
 	c.ResolverAddr = resolverAddr
 	c.Details = details
+	c.PriceResolver = oracle.PriceResolvers[details.AssetID]
 
 	return nil
 }
@@ -203,6 +205,10 @@ func (c *ConditionalResolvable) ValidateOnAdd() error {
 func (c *ConditionalResolvable) ValidateState(ctx context.Context, oldState, newState *cell.Cell) error {
 	if oldState != nil {
 		return fmt.Errorf("state already accepted")
+	}
+
+	if c.PriceResolver == nil {
+		return fmt.Errorf("price resolver for asset %d is not configured", c.Details.AssetID)
 	}
 
 	var state ResolvableState
@@ -250,6 +256,10 @@ func (c *ConditionalResolvable) EmulateBalance(balances map[string]*payments.Bal
 	b, err := payments.ResolveActionBalance(balances, c.Action)
 	if err != nil {
 		return fmt.Errorf("failed to resolve balance: %w", err)
+	}
+
+	if c.PriceResolver == nil {
+		return fmt.Errorf("price resolver for asset %d is not configured", c.Details.AssetID)
 	}
 
 	price, err := c.PriceResolver.GetPriceAt(context.Background(), time.Now().Unix())

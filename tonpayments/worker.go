@@ -15,7 +15,6 @@ import (
 
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
-	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
 	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
@@ -107,6 +106,12 @@ func (s *Service) taskExecutor() {
 
 					if meta.LastKnownResolve == nil {
 						log.Warn().Str("key", base64.StdEncoding.EncodeToString(data.VirtualKey)).Msg("no last known resolve, cannot close")
+						return nil
+					}
+
+					if meta.Incoming == nil {
+						log.Warn().Str("key", base64.StdEncoding.EncodeToString(data.VirtualKey)).
+							Msg("virtual channel has no incoming side, close task skipped")
 						return nil
 					}
 
@@ -401,61 +406,17 @@ func (s *Service) taskExecutor() {
 					}
 					defer unlock()
 
-					// Logic to prepare atomic derivative creation
-					// We need to create Incoming Conditional (Partner -> Us)
-					incomingKey, _, err := ed25519.GenerateKey(nil)
-					if err != nil {
-						return fmt.Errorf("failed to generate incoming key: %w", err)
-					}
-
-					// Parse outgoing details to mirror for incoming
-					// We assume conditional is Resolvable (deriv)
 					resOut, ok := cond.(*conditionals.ConditionalResolvable)
 					if !ok {
 						return fmt.Errorf("outgoing conditional is not resolvable")
 					}
 
-					condDetails := resOut.Details
-
-					var targetCC *payments.CoinConfig
-
-					// Try to cast Action
-					// resOut.Action is payments.Action
-					// We need to check its type.
-					switch act := resOut.Action.(type) {
-					case *actions.ActionSendTon:
-						targetCC = act.Coin
-					case *actions.ActionSendJetton:
-						targetCC = act.Coin
-					case *actions.ActionSendEC:
-						targetCC = act.Coin
-					default:
-						// Fallback: try to resolve from channel coin?
-						// derivatives usually settle in the channel's main coin if simplified.
-						// Let's assume TON for now if fails? Or Error.
-						return fmt.Errorf("unsupported action type for derivative: %T", resOut.Action)
-					}
-
-					inCondDetails := condDetails
-					inCondDetails.IsLong = !condDetails.IsLong // Invert direction
-
-					fromAddr, toAddr := address.MustParseAddr(channel.SideA().Address), address.MustParseAddr(channel.SideB().Address)
-					if channel.WeLeft {
-						fromAddr, toAddr = toAddr, fromAddr
-					}
-
-					inAction, err := actions.NewSendActionFromBalanceID(ctx, targetCC, fromAddr.String(), toAddr.String())
+					inCondResolvable, err := s.buildLinkedDerivativeConditional(resOut)
 					if err != nil {
-						return fmt.Errorf("failed to create incoming action: %w", err)
+						return fmt.Errorf("failed to prepare linked derivative conditional: %w", err)
 					}
 
-					inCondResolvable := conditionals.ConditionalResolvable{
-						Key:          incomingKey,
-						Amount:       big.NewInt(0), // No Cap
-						ResolverAddr: resOut.ResolverAddr,
-						Details:      inCondDetails,
-						Action:       inAction,
-					}
+					incomingKey := ed25519.PublicKey(inCondResolvable.GetKey())
 
 					metaOut := &db.ConditionalMeta{
 						Key:    cond.GetKey(),
@@ -483,7 +444,7 @@ func (s *Service) taskExecutor() {
 							SenderKey:             channel.Their.OnchainInfo.Key,
 							LinkedKey:             cond.GetKey(),
 						},
-						Any:       inCondDetails,
+						Any:       inCondResolvable.Details,
 						CreatedAt: time.Now(),
 						UpdatedAt: time.Now(),
 					}
