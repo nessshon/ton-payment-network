@@ -243,40 +243,78 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			return nil, nil, fmt.Errorf("failed to load action state: %w", err)
 		}
 
-		newActState, err := cond.Execute(actState.MustToCell(), act.State, channel.Their.LockedDeposits)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to execute condition: %w", err)
+		var st conditionals.ResolvableState
+		if err = payments.LoadState(&st, act.State); err != nil {
+			return nil, nil, fmt.Errorf("failed to load resolve state: %w", err)
 		}
 
-		if err = channel.Their.Data.ActionStates.Set(actId, newActState); err != nil {
-			return nil, nil, fmt.Errorf("failed to set action: %w", err)
+		newActState := actState.MustToCell()
+		if st.Amount.Sign() > 0 {
+			newActState, err = cond.Execute(actState.MustToCell(), act.State, channel.Their.LockedDeposits)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to execute condition: %w", err)
+			}
+
+			if err = channel.Their.Data.ActionStates.Set(actId, newActState); err != nil {
+				return nil, nil, fmt.Errorf("failed to set action: %w", err)
+			}
 		}
 
+		var linkedBalanceDiff map[string]*big.Int
 		if linkedCond != nil {
-			linkedActID := linkedCond.GetAction().IDCell()
-			linkedActState, err := channel.Our.Data.ActionStates.LoadValue(linkedActID)
-			if err != nil {
-				return nil, nil, fmt.Errorf("failed to load linked action state: %w", err)
-			}
-
-			linkedState := act.State
-			if _, ok := linkedCond.(*conditionals.ConditionalResolvable); ok {
-				linkedState, err = remapDerivativeStateKey(act.State, linkedCond.GetKey())
+			if linkedResolvable, ok := linkedCond.(*conditionals.ConditionalResolvable); ok {
+				// Derivative: only execute the linked side if its settle > 0
+				linkedResolve, err := computeLinkedDerivativeSettle(ctx, act.State, linkedResolvable)
 				if err != nil {
-					return nil, nil, fmt.Errorf("failed to remap linked derivative state: %w", err)
+					return nil, nil, fmt.Errorf("failed to compute linked derivative settle: %w", err)
 				}
-			}
 
-			newLinkedActState, err := linkedCond.Execute(linkedActState.MustToCell(), linkedState, channel.Our.LockedDeposits)
-			if err != nil {
-				return nil, nil, fmt.Errorf("failed to execute linked condition: %w", err)
+				if linkedResolve != nil {
+					linkedActID := linkedCond.GetAction().IDCell()
+					linkedActState, err := channel.Our.Data.ActionStates.LoadValue(linkedActID)
+					if err != nil {
+						return nil, nil, fmt.Errorf("failed to load linked action state: %w", err)
+					}
+
+					newLinkedActState, err := linkedCond.Execute(linkedActState.MustToCell(), linkedResolve, channel.Our.LockedDeposits)
+					if err != nil {
+						return nil, nil, fmt.Errorf("failed to execute linked condition: %w", err)
+					}
+
+					if err = channel.Our.Data.ActionStates.Set(linkedActID, newLinkedActState); err != nil {
+						return nil, nil, fmt.Errorf("failed to set linked action: %w", err)
+					}
+
+					linkedBalanceDiff, err = linkedCond.GetAction().StatesDiff(linkedActState.MustToCell(), newLinkedActState)
+					if err != nil {
+						return nil, nil, fmt.Errorf("failed to calc linked balance diff: %w", err)
+					}
+				}
+			} else {
+				// Non-derivative linked conditional: execute with same state
+				linkedActID := linkedCond.GetAction().IDCell()
+				linkedActState, err := channel.Our.Data.ActionStates.LoadValue(linkedActID)
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to load linked action state: %w", err)
+				}
+
+				newLinkedActState, err := linkedCond.Execute(linkedActState.MustToCell(), act.State, channel.Our.LockedDeposits)
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to execute linked condition: %w", err)
+				}
+
+				if err = channel.Our.Data.ActionStates.Set(linkedActID, newLinkedActState); err != nil {
+					return nil, nil, fmt.Errorf("failed to set linked action: %w", err)
+				}
+
+				linkedBalanceDiff, err = linkedCond.GetAction().StatesDiff(linkedActState.MustToCell(), newLinkedActState)
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to calc linked balance diff: %w", err)
+				}
 			}
 
 			if err = channel.Our.Data.Conditionals.Delete(linkedIdx); err != nil {
 				return nil, nil, fmt.Errorf("failed to remove linked condition: %w", err)
-			}
-			if err = channel.Our.Data.ActionStates.Set(linkedActID, newLinkedActState); err != nil {
-				return nil, nil, fmt.Errorf("failed to set linked action: %w", err)
 			}
 		}
 
@@ -294,13 +332,47 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			senderKey = meta.Incoming.SenderKey
 		}
 
-		evData := db.ChannelHistoryActionTransferInData{
-			Amounts: s.formatDiff(balanceDiff),
-			From:    senderKey,
+		isNonZeroDiff := func(diff map[string]*big.Int) bool {
+			for _, v := range diff {
+				if v != nil && v.Sign() != 0 {
+					return true
+				}
+			}
+			return false
 		}
-		jsonData, err := json.Marshal(evData)
-		if err != nil {
-			log.Error().Err(err).Msg("failed to marshal event data")
+
+		var (
+			historyAction db.ChannelHistoryEventType
+			historyData   []byte
+			historyAmount map[string]string
+			historyLogMsg string
+		)
+
+		switch {
+		case isNonZeroDiff(balanceDiff):
+			historyAction = db.ChannelHistoryActionTransferIn
+			historyAmount = s.formatDiff(balanceDiff)
+			historyLogMsg = "their conditional executed, amounts received"
+			evData := db.ChannelHistoryActionTransferInData{
+				Amounts: historyAmount,
+				From:    senderKey,
+			}
+			historyData, err = json.Marshal(evData)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to marshal transfer-in event data")
+			}
+		case isNonZeroDiff(linkedBalanceDiff):
+			historyAction = db.ChannelHistoryActionTransferOut
+			historyAmount = s.formatDiff(linkedBalanceDiff)
+			historyLogMsg = "their conditional executed, amounts sent"
+			evData := db.ChannelHistoryActionTransferOutData{
+				Amounts: historyAmount,
+				To:      senderKey,
+			}
+			historyData, err = json.Marshal(evData)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to marshal transfer-out event data")
+			}
 		}
 
 		onSuccess = func(ctx context.Context) error {
@@ -310,11 +382,13 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 				return fmt.Errorf("failed to update virtual channel meta: %w", err)
 			}
 
-			if err = s.db.CreateChannelEvent(ctx, channel, time.Now(), db.ChannelHistoryItem{
-				Action: db.ChannelHistoryActionTransferIn,
-				Data:   jsonData,
-			}); err != nil {
-				return fmt.Errorf("failed to create channel event: %w", err)
+			if historyData != nil {
+				if err = s.db.CreateChannelEvent(ctx, channel, time.Now(), db.ChannelHistoryItem{
+					Action: historyAction,
+					Data:   historyData,
+				}); err != nil {
+					return fmt.Errorf("failed to create channel event: %w", err)
+				}
 			}
 
 			if s.webhook != nil {
@@ -323,10 +397,16 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 				}
 			}
 
-			log.Info().Fields(cond.GetLogInfo()).
-				Str("channel", channel.Our.Address).
-				Fields(s.repackDiffForLogs(evData.Amounts)).
-				Msg("their conditional executed, amounts received")
+			if historyData != nil {
+				log.Info().Fields(cond.GetLogInfo()).
+					Str("channel", channel.Our.Address).
+					Fields(s.repackDiffForLogs(historyAmount)).
+					Msg(historyLogMsg)
+			} else {
+				log.Info().Fields(cond.GetLogInfo()).
+					Str("channel", channel.Our.Address).
+					Msg("their conditional executed, no balance change")
+			}
 			return nil
 		}
 	case transport.RentCapacityAction:

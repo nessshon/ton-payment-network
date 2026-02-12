@@ -1,19 +1,21 @@
-import React, {useEffect, useMemo, useState} from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
-import {TonConnectButton, useTonAddress, useTonConnectUI, useTonWallet} from "@tonconnect/ui-react";
+import { TonConnectButton, useTonAddress, useTonConnectUI, useTonWallet } from "@tonconnect/ui-react";
 
-import {Send, ArrowDown, ArrowUp, RefreshCw, Copy, PlusCircle, MinusCircle, Activity, Check, Plus, Repeat} from "lucide-react";
-import {Card, CardContent} from "./components/ui/card";
-import {Input} from "./components/ui/input";
-import {Button} from "./components/ui/button";
-import {PaymentChannelHistoryItem} from "./index";
-import {CHAIN} from "@tonconnect/sdk";
+import { Send, ArrowDown, ArrowUp, RefreshCw, Copy, PlusCircle, MinusCircle, Activity, Check, Plus, Repeat, X, TrendingUp, TrendingDown } from "lucide-react";
+import { Card, CardContent } from "./components/ui/card";
+import { Input } from "./components/ui/input";
+import { Button } from "./components/ui/button";
+import { DerivativesPosition, DerivativesQuote, PaymentChannelHistoryItem, PriceHistoryPoint } from "./index";
+import { CHAIN } from "@tonconnect/sdk";
 
 
 function App() {
   const [tonConnectUI] = useTonConnectUI();
   const wallet = useTonWallet();
   let addr = useTonAddress();
+  const wasmInitializedRef = useRef(false);
+  const [derivativesEnabled, setDerivativesEnabled] = useState(false);
   let [paymentAddr, setPaymentAddr] = useState("Loading...");
   let [balances, setBalances] = useState<Record<string, string>>({});
   let [capacities, setCapacities] = useState<Record<string, string>>({});
@@ -22,12 +24,27 @@ function App() {
   let [history, setHistory] = useState<PaymentChannelHistoryItem[] | null>(null);
   let [supportedCurrencies, setSupportedCurrencies] = useState<string[]>(["TON"]);
 
-  window.onPaymentNetworkLoaded = function(addr) {
+  const updateDerivativesAvailability = () => {
+    if (typeof window.isDerivativesEnabled !== "function") {
+      setDerivativesEnabled(false);
+      return;
+    }
+
+    try {
+      setDerivativesEnabled(Boolean(window.isDerivativesEnabled()));
+    } catch (e) {
+      console.error(e);
+      setDerivativesEnabled(false);
+    }
+  };
+
+  window.onPaymentNetworkLoaded = function (addr) {
     setPaymentAddr(addr);
-    console.log("Payment network loaded: "+addr);
+    updateDerivativesAvailability();
+    console.log("Payment network loaded: " + addr);
   }
-  window.onPaymentChannelUpdated = function(ev) {
-    console.log("Payment channel updated: "+JSON.stringify(ev));
+  window.onPaymentChannelUpdated = function (ev) {
+    console.log("Payment channel updated: " + JSON.stringify(ev));
 
     setBalances(ev.balances || {});
     setCapacities(ev.capacities || {});
@@ -60,47 +77,63 @@ function App() {
     }).catch(e => {
       console.error(e);
     });
+
+    updateDerivativesAvailability();
   }
 
-  window.onPaymentChannelHistoryUpdated = function() {
+  window.onPaymentChannelHistoryUpdated = function () {
     window.getChannelHistory(5).then(history => {
       setHistory(history);
     }).catch(e => {
       console.error(e);
     });
+    updateDerivativesAvailability();
   }
 
   useEffect(() => {
-    if (!wallet) return;
+    if (!wallet) {
+      setDerivativesEnabled(false);
+      return;
+    }
 
-    const initWasm = async () => {
-      window.walletAddress = () => {
-        return addr;
-      };
+    window.walletAddress = () => {
+      return addr;
+    };
 
-      window.doTransaction = async (reason, messages) => {
-        console.log("requested tx: "+ reason);
+    updateDerivativesAvailability();
+    const derivativesAvailabilityInterval = window.setInterval(updateDerivativesAvailability, 1000);
 
-        let list = [];
-        for (let i = 0; i < messages.length; i++) {
-          list.push({
-            address:  messages[i].to,
-            amount:  messages[i].amtNano,
-            stateInit:  messages[i].stateInit,
-            payload:  messages[i].body,
-          })
-        }
+    window.doTransaction = async (reason, messages) => {
+      console.log("requested tx: " + reason);
 
-        const transaction = {
-          validUntil: Math.floor(Date.now() / 1000) + 90,
-          network: CHAIN.TESTNET,
-          messages: list
-        }
-
-        let resp = await tonConnectUI.sendTransaction(transaction);
-        return resp.boc;
+      let list = [];
+      for (let i = 0; i < messages.length; i++) {
+        list.push({
+          address: messages[i].to,
+          amount: messages[i].amtNano,
+          stateInit: messages[i].stateInit,
+          payload: messages[i].body,
+        })
       }
 
+      const transaction = {
+        validUntil: Math.floor(Date.now() / 1000) + 90,
+        network: CHAIN.TESTNET,
+        messages: list
+      }
+
+      let resp = await tonConnectUI.sendTransaction(transaction);
+      return resp.boc;
+    };
+
+    if (wasmInitializedRef.current) {
+      return () => {
+        window.clearInterval(derivativesAvailabilityInterval);
+      };
+    }
+    wasmInitializedRef.current = true;
+
+    const initWasm = async () => {
       const go = new (window as any).Go();
       const wasmUrl = 'web.wasm';
       let wasmModule;
@@ -133,35 +166,42 @@ function App() {
       try {
         await waitForStartPaymentNetwork();
         window.startPaymentNetwork("tAHpSEpUcxpxfqNJVZzYa+5ktseCKMZOw5yMoJnSW4s=", "zT4aAGrfYw57jTWElGQPFPHzqGzaRgpThLaAeUk9sps=");
+        updateDerivativesAvailability();
       } catch (e) {
+        wasmInitializedRef.current = false;
+        setDerivativesEnabled(false);
         console.error(e);
       }
     };
 
     initWasm();
-  }, [wallet]);
+    return () => {
+      window.clearInterval(derivativesAvailabilityInterval);
+    };
+  }, [wallet, addr, tonConnectUI]);
 
   if (!wallet) {
     return (
-        <div className="min-h-screen bg-white text-gray-800 p-6 space-y-6">
-          <div className="flex justify-between items-center">
-            <h1 className="text-2xl font-bold text-[#0098ea]">TON Payments Wallet</h1>
-            <TonConnectButton/>
-          </div>
+      <div className="min-h-screen bg-white text-gray-800 p-6 space-y-6">
+        <div className="flex justify-between items-center">
+          <h1 className="text-2xl font-bold text-[#0098ea]">TON Payments Wallet</h1>
+          <TonConnectButton />
         </div>
+      </div>
     );
   }
 
   return (
-      <WalletUI
-          paymentAddr={paymentAddr}
-          balances={balances}
-          locked={lockedBalance}
-          capacities={capacities}
-          pendingIn={pendingIn}
-          transactions={history}
-          currencies={supportedCurrencies}
-      />
+    <WalletUI
+      paymentAddr={paymentAddr}
+      balances={balances}
+      locked={lockedBalance}
+      capacities={capacities}
+      pendingIn={pendingIn}
+      transactions={history}
+      currencies={supportedCurrencies}
+      derivativesEnabled={derivativesEnabled}
+    />
   );
 }
 
@@ -173,9 +213,10 @@ type WalletUIProps = {
   locked: Record<string, string>;
   currencies: string[];
   transactions: PaymentChannelHistoryItem[] | null;
+  derivativesEnabled: boolean;
 };
 
-const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capacities, pendingIn, transactions, currencies }) => {
+const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capacities, pendingIn, transactions, currencies, derivativesEnabled }) => {
   const [sendTo, setSendTo] = useState("");
   const [sendAmount, setSendAmount] = useState("");
   const [sendFeeAmount, setSendFeeAmount] = useState("");
@@ -192,10 +233,22 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
   const [swapToCurrency, setSwapToCurrency] = useState("USDX");
   const [swapFromAmount, setSwapFromAmount] = useState("");
   const [swapToAmount, setSwapToAmount] = useState("");
+  const [derivativesModalOpen, setDerivativesModalOpen] = useState(false);
+  const [derivativeSymbol, setDerivativeSymbol] = useState("BTCUSDT");
+  const [derivativeAmount, setDerivativeAmount] = useState("");
+  const [derivativeLeverage, setDerivativeLeverage] = useState("3");
+  const [derivativesPositions, setDerivativesPositions] = useState<DerivativesPosition[]>([]);
+  const [derivativeQuote, setDerivativeQuote] = useState<DerivativesQuote | null>(null);
+  const [derivativesLoading, setDerivativesLoading] = useState(false);
+  const [derivativeActionLoading, setDerivativeActionLoading] = useState<"long" | "short" | "close" | null>(null);
+  const [derivativeLimitPrice, setDerivativeLimitPrice] = useState("");
+  const [derivativeOrderType, setDerivativeOrderType] = useState<"market" | "limit">("market");
+  const [priceHistory, setPriceHistory] = useState<PriceHistoryPoint[]>([]);
 
   const availableCurrencies = useMemo(() => currencies.length ? currencies : ["TON"], [currencies]);
   const swapPairs = useMemo(() => [{ from: "TON", to: "USDX", coeff: 2 }], []);
   const activeSwapPair = useMemo(() => swapPairs.find(p => p.from === swapFromCurrency && p.to === swapToCurrency) ?? swapPairs[0], [swapPairs, swapFromCurrency, swapToCurrency]);
+  const derivativeSymbols = useMemo(() => ["BTCUSDT", "TONUSDT"], []);
 
   useEffect(() => {
     if (!availableCurrencies.includes(sendCurrency)) {
@@ -204,13 +257,63 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
     if (!availableCurrencies.includes(modalCurrency)) {
       setModalCurrency(availableCurrencies[0]);
     }
-  }, [availableCurrencies]);
+  }, [availableCurrencies, sendCurrency, modalCurrency]);
 
   useEffect(() => {
-    if (swapFromAmount && activeSwapPair) {
-      updateSwapPreview(swapFromAmount, activeSwapPair.coeff);
+    if (!swapFromAmount || !activeSwapPair) {
+      return;
     }
-  }, [activeSwapPair]);
+
+    const numeric = parseFloat(swapFromAmount);
+    if (isNaN(numeric)) {
+      setSwapToAmount("");
+      return;
+    }
+
+    setSwapToAmount((numeric * activeSwapPair.coeff).toString());
+  }, [activeSwapPair, swapFromAmount]);
+
+  // Poll positions + quote + price history every second when modal is open
+  useEffect(() => {
+    if (!derivativesEnabled || !derivativesModalOpen) {
+      return;
+    }
+    let first = true;
+    const fetchAll = () => {
+      if (first) {
+        setDerivativesLoading(true);
+      }
+      Promise.all([
+        window.getDerivativesPositions(),
+        window.getDerivativeMarketPrice(derivativeSymbol),
+        window.getDerivativePriceHistory(derivativeSymbol),
+      ]).then(([positions, quote, history]) => {
+        setDerivativesPositions(positions ?? []);
+        setDerivativeQuote(quote ?? null);
+        setPriceHistory(history ?? []);
+      }).catch(err => {
+        console.error(err);
+      }).finally(() => {
+        if (first) {
+          setDerivativesLoading(false);
+          first = false;
+        }
+      });
+    };
+    fetchAll();
+    const iv = window.setInterval(fetchAll, 1000);
+    return () => window.clearInterval(iv);
+  }, [derivativesEnabled, derivativesModalOpen, derivativeSymbol]);
+
+  useEffect(() => {
+    if (!derivativesEnabled) {
+      setDerivativesModalOpen(false);
+      setDerivativesPositions([]);
+      setDerivativeQuote(null);
+      setDerivativesLoading(false);
+      setDerivativeActionLoading(null);
+    }
+  }, [derivativesEnabled]);
 
   const handleCopy = () => {
     if (!paymentAddr) return;
@@ -226,9 +329,9 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
   };
 
   const confirmModal = () => {
-    if (modalType == "topup") {
+    if (modalType === "topup") {
       window.topupChannel(modalAmount, modalCurrency);
-    } else if (modalType == "withdraw") {
+    } else if (modalType === "withdraw") {
       if (!withdrawTarget) {
         alert("Please enter withdraw address");
         return;
@@ -246,8 +349,8 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
       return a.localeCompare(b);
     });
     return entries
-        .map(([symbol, amount]) => `${symbol}: ${amount}`)
-        .join(", ");
+      .map(([symbol, amount]) => `${symbol}: ${amount}`)
+      .join(", ");
   };
 
   const updateFeeEstimate = (amount: string, recipient: string, currency: string) => {
@@ -307,306 +410,425 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
     });
   };
 
+  const refreshDerivatives = () => {
+    if (!derivativesEnabled) {
+      return;
+    }
+
+    setDerivativesLoading(true);
+    Promise.all([
+      window.getDerivativesPositions(),
+      window.getDerivativeMarketPrice(derivativeSymbol),
+    ]).then(([positions, quote]) => {
+      setDerivativesPositions(positions ?? []);
+      setDerivativeQuote(quote ?? null);
+      if (derivativeOrderType === "limit" && quote?.price && !derivativeLimitPrice) {
+        setDerivativeLimitPrice(quote.price);
+      }
+    }).catch(err => {
+      alert(err);
+      console.error(err);
+    }).finally(() => {
+      setDerivativesLoading(false);
+    });
+  };
+
+  const openDerivativesModal = () => {
+    if (!derivativesEnabled) {
+      return;
+    }
+
+    setDerivativesModalOpen(true);
+  };
+
+  const openDerivative = (side: "long" | "short") => {
+    if (!derivativeAmount || parseFloat(derivativeAmount) <= 0) {
+      alert("Please enter collateral amount");
+      return;
+    }
+
+    const leverageNum = parseInt(derivativeLeverage, 10);
+    if (!Number.isFinite(leverageNum) || leverageNum <= 0) {
+      alert("Please enter valid leverage");
+      return;
+    }
+
+    if (derivativeOrderType === "limit" && (!derivativeLimitPrice || parseFloat(derivativeLimitPrice) <= 0)) {
+      alert("Please enter limit price");
+      return;
+    }
+
+    setDerivativeActionLoading(side);
+    window.openDerivativePosition(
+      derivativeSymbol,
+      side,
+      leverageNum,
+      derivativeAmount,
+      derivativeOrderType,
+      derivativeOrderType === "limit" ? derivativeLimitPrice : undefined
+    ).then(() => {
+      setDerivativeAmount("");
+      setDerivativeActionLoading(null);
+      refreshDerivatives();
+    }).catch(err => {
+      setDerivativeActionLoading(null);
+      alert(err);
+      console.error(err);
+    });
+  };
+
+  const closeDerivative = (positionId: string) => {
+    setDerivativeActionLoading("close");
+    window.closeDerivativePosition(positionId, "market").then(() => {
+      setDerivativeActionLoading(null);
+      refreshDerivatives();
+    }).catch(err => {
+      setDerivativeActionLoading(null);
+      alert(err);
+      console.error(err);
+    });
+  };
+
   return (
-      <div className="min-h-screen bg-white text-gray-800 p-4 sm:p-6 flex justify-center">
-        <div className="w-full max-w-xl space-y-6">
-          <div className="flex justify-between items-center">
-            <h1 className="text-2xl font-bold text-[#0098ea]">TON Payments Wallet</h1>
-            <h2 className="text-lg font-bold text-[#772233]">Testnet</h2>
-            <TonConnectButton />
-          </div>
+    <div className="min-h-screen bg-white text-gray-800 p-4 sm:p-6 flex justify-center">
+      <div className="w-full max-w-xl space-y-6">
+        <div className="flex justify-between items-center">
+          <h1 className="text-2xl font-bold text-[#0098ea]">TON Payments Wallet</h1>
+          <h2 className="text-lg font-bold text-[#772233]">Testnet</h2>
+          <TonConnectButton />
+        </div>
 
-          <Card className="bg-[#f0f8ff] shadow-md rounded-2xl">
-            <CardContent className="p-6 space-y-4">
-              <h2 className="text-xl font-semibold">Balance</h2>
-              <div className="space-y-2">
-                {availableCurrencies.map((c) => (
-                    <div key={c} className="flex items-center justify-between">
-                      <div className="text-lg text-[#0098ea] font-semibold">{balances[c] ?? "0"} {c}</div>
-                      <div className="space-x-2">
-                        {balances[c] === undefined && capacities[c] === undefined ? (
-                            creationStarted ? (
-                                <Button className="bg-gray-200 text-gray-700 px-4 py-2 rounded-xl" disabled>
-                                  <RefreshCw className="animate-spin inline mr-2" size={16} />
-                                  Creating...
-                                </Button>
-                            ) : (
-                                <Button
-                                    onClick={() => {
-                                      setCreationStarted(true);
-                                      window.openChannel();
-                                    }}
-                                    disabled={paymentAddr === "Loading..."}
-                                    aria-disabled={paymentAddr === "Loading..."}
-                                    title={paymentAddr === "Loading..." ? "Please wait until Your Address is loaded" : undefined}
-                                    className={`px-4 py-2 rounded-xl ${paymentAddr === "Loading..." ? "bg-gray-200 text-gray-500 cursor-not-allowed" : "bg-[#0098ea] text-white"}`}
-                                >
-                                  Create Wallet
-                                </Button>
-                            )
-                        ) : (
-                            <>
-                              <Button
-                                  onClick={() => { setModalType("topup"); setModalCurrency(c); }}
-                                  className="bg-[#0098ea] text-white px-3 py-1 rounded-lg text-sm"
-                              >
-                                Top Up
-                              </Button>
-                              <Button
-                                  onClick={() => { setModalType("withdraw"); setModalCurrency(c); }}
-                                  className="bg-gray-200 text-gray-700 px-3 py-1 rounded-lg text-sm"
-                              >
-                                Withdraw
-                              </Button>
-                            </>
-                        )}
-                      </div>
-                    </div>
-                ))}
-              </div>
-
+        <Card className="bg-[#f0f8ff] shadow-md rounded-2xl">
+          <CardContent className="p-6 space-y-4">
+            <h2 className="text-xl font-semibold">Balance</h2>
+            <div className="space-y-2">
               {availableCurrencies.map((c) => (
-                  <div key={`capacity-${c}`} className="flex items-center justify-between mt-1">
-                    <span className="text-sm text-gray-500">Receive Capacity ({c})</span>
-                    <span className="text-sm font-medium">{capacities[c] ?? "0"} {c}</span>
+                <div key={c} className="flex items-center justify-between">
+                  <div className="text-lg text-[#0098ea] font-semibold">{balances[c] ?? "0"} {c}</div>
+                  <div className="space-x-2">
+                    {balances[c] === undefined && capacities[c] === undefined ? (
+                      creationStarted ? (
+                        <Button className="bg-gray-200 text-gray-700 px-4 py-2 rounded-xl" disabled>
+                          <RefreshCw className="animate-spin inline mr-2" size={16} />
+                          Creating...
+                        </Button>
+                      ) : (
+                        <Button
+                          onClick={() => {
+                            setCreationStarted(true);
+                            window.openChannel();
+                          }}
+                          disabled={paymentAddr === "Loading..."}
+                          aria-disabled={paymentAddr === "Loading..."}
+                          title={paymentAddr === "Loading..." ? "Please wait until Your Address is loaded" : undefined}
+                          className={`px-4 py-2 rounded-xl ${paymentAddr === "Loading..." ? "bg-gray-200 text-gray-500 cursor-not-allowed" : "bg-[#0098ea] text-white"}`}
+                        >
+                          Create Wallet
+                        </Button>
+                      )
+                    ) : (
+                      <>
+                        <Button
+                          onClick={() => { setModalType("topup"); setModalCurrency(c); }}
+                          className="bg-[#0098ea] text-white px-3 py-1 rounded-lg text-sm"
+                        >
+                          Top Up
+                        </Button>
+                        <Button
+                          onClick={() => { setModalType("withdraw"); setModalCurrency(c); }}
+                          className="bg-gray-200 text-gray-700 px-3 py-1 rounded-lg text-sm"
+                        >
+                          Withdraw
+                        </Button>
+                      </>
+                    )}
                   </div>
+                </div>
               ))}
+            </div>
 
-              {Object.keys(locked).length > 0 ?
+            {availableCurrencies.map((c) => (
+              <div key={`capacity-${c}`} className="flex items-center justify-between mt-1">
+                <span className="text-sm text-gray-500">Receive Capacity ({c})</span>
+                <span className="text-sm font-medium">{capacities[c] ?? "0"} {c}</span>
+              </div>
+            ))}
+
+            {Object.keys(locked).length > 0 ?
               <div className="mt-1 space-y-1">
                 {Object.entries(locked).map(([c, val]) => (
-                    <div key={`locked-${c}`} className="flex items-center justify-between">
-                      <span className="text-sm text-gray-500">Balance on hold ({c})</span>
-                      <span className="text-sm font-medium">{val} {c}</span>
-                    </div>
+                  <div key={`locked-${c}`} className="flex items-center justify-between">
+                    <span className="text-sm text-gray-500">Balance on hold ({c})</span>
+                    <span className="text-sm font-medium">{val} {c}</span>
+                  </div>
                 ))}
               </div> : ""}
 
-              {Object.keys(pendingIn).length > 0 ?
+            {Object.keys(pendingIn).length > 0 ?
               <div className="mt-1 space-y-1">
                 {Object.entries(pendingIn).map(([c, val]) => (
-                    <div key={`pending-${c}`} className="flex items-center justify-between">
-                      <span className="text-sm text-gray-500">Pending incoming amount ({c})</span>
-                      <span className="text-sm font-medium">{val} {c}</span>
-                    </div>
+                  <div key={`pending-${c}`} className="flex items-center justify-between">
+                    <span className="text-sm text-gray-500">Pending incoming amount ({c})</span>
+                    <span className="text-sm font-medium">{val} {c}</span>
+                  </div>
                 ))}
               </div> : ""}
 
-              <h2 className="text-xl font-semibold">Your Address</h2>
-              {paymentAddr === "Loading..." ? (
-                  <div className="text-gray-500 flex items-center gap-2">
-                    <RefreshCw className="animate-spin" size={18} /> Loading...
-                  </div>
-              ) : paymentAddr === "" ? (
-                  <div className="relative bg-gradient-to-r from-[#f0f8ff] to-white border border-[#cce5ff] rounded-xl px-4 py-3">
-                    <div className="text-xs text-gray-700 font-mono truncate pr-10">{"Not deployed"}</div>
-                  </div>
-              ) : (
-                  <div className="relative bg-gradient-to-r from-[#f0f8ff] to-white border border-[#cce5ff] rounded-xl px-4 py-3">
-                    <div className="text-xs text-gray-700 font-mono truncate pr-10">{paymentAddr}</div>
-                    <button
-                        onClick={handleCopy}
-                        className="absolute top-1/2 right-3 -translate-y-1/2 text-[#0098ea] hover:text-blue-600"
-                    >
-                      {copied ? <span className="text-sm animate-pulse">Copied!</span> : <Copy size={16} />}
-                    </button>
-                  </div>
-              )}
-            </CardContent>
-          </Card>
-
-          <Card className="bg-[#f9fcff] shadow-md rounded-2xl">
-            <CardContent className="p-6 space-y-4">
-              <h2 className="text-xl font-semibold">Send</h2>
-              <div className="flex items-center gap-3">
-                <span className="text-sm text-gray-600">Currency</span>
-                <select
-                    className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white"
-                    value={sendCurrency}
-                    onChange={(e) => {
-                      setSendCurrency(e.target.value);
-                      updateFeeEstimate(sendAmount, sendTo, e.target.value);
-                    }}
+            <h2 className="text-xl font-semibold">Your Address</h2>
+            {paymentAddr === "Loading..." ? (
+              <div className="text-gray-500 flex items-center gap-2">
+                <RefreshCw className="animate-spin" size={18} /> Loading...
+              </div>
+            ) : paymentAddr === "" ? (
+              <div className="relative bg-gradient-to-r from-[#f0f8ff] to-white border border-[#cce5ff] rounded-xl px-4 py-3">
+                <div className="text-xs text-gray-700 font-mono truncate pr-10">{"Not deployed"}</div>
+              </div>
+            ) : (
+              <div className="relative bg-gradient-to-r from-[#f0f8ff] to-white border border-[#cce5ff] rounded-xl px-4 py-3">
+                <div className="text-xs text-gray-700 font-mono truncate pr-10">{paymentAddr}</div>
+                <button
+                  onClick={handleCopy}
+                  className="absolute top-1/2 right-3 -translate-y-1/2 text-[#0098ea] hover:text-blue-600"
                 >
-                  {availableCurrencies.map((c) => (
-                      <option key={`send-${c}`} value={c}>{c}</option>
-                  ))}
-                </select>
+                  {copied ? <span className="text-sm animate-pulse">Copied!</span> : <Copy size={16} />}
+                </button>
               </div>
+            )}
+          </CardContent>
+        </Card>
 
-              <Input placeholder="Recipient address" value={sendTo} onChange={(e) => {
-                setSendTo(e.target.value)
-                updateFeeEstimate(sendAmount, e.target.value, sendCurrency);
-              }} />
-              <Input placeholder={`Amount in ${sendCurrency}`} value={sendAmount} onChange={(e) => {
-                setSendAmount(e.target.value);
-                updateFeeEstimate(e.target.value, sendTo, sendCurrency);
-              }} />
-              <div className="flex items-center justify-between mt-2">
-                <Button disabled={!sendAmount || !sendTo} className="bg-[#0098ea] text-white px-4 py-2 rounded-xl flex items-center gap-2 disabled:bg-gray-300" onClick={()=>{
-                  setTransferStatus("loading");
-                  setSendFeeAmount("");
+        <Card className="bg-[#f9fcff] shadow-md rounded-2xl">
+          <CardContent className="p-6 space-y-4">
+            <h2 className="text-xl font-semibold">Send</h2>
+            <div className="flex items-center gap-3">
+              <span className="text-sm text-gray-600">Currency</span>
+              <select
+                className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white"
+                value={sendCurrency}
+                onChange={(e) => {
+                  setSendCurrency(e.target.value);
+                  updateFeeEstimate(sendAmount, sendTo, e.target.value);
+                }}
+              >
+                {availableCurrencies.map((c) => (
+                  <option key={`send-${c}`} value={c}>{c}</option>
+                ))}
+              </select>
+            </div>
 
-                  window.sendTransfer(sendAmount, sendTo, sendCurrency).then(res => {
-                    setTransferStatus("success");
-                    console.log("transferred: "+sendAmount+" "+sendCurrency+" to "+sendTo);
-                    setSendAmount("");
-                    setSendTo("");
-                  }).catch(err => {
-                    setTransferStatus(null);
-                    alert(err);
-                    console.error(err);
-                  });
+            <Input placeholder="Recipient address" value={sendTo} onChange={(e) => {
+              setSendTo(e.target.value)
+              updateFeeEstimate(sendAmount, e.target.value, sendCurrency);
+            }} />
+            <Input placeholder={`Amount in ${sendCurrency}`} value={sendAmount} onChange={(e) => {
+              setSendAmount(e.target.value);
+              updateFeeEstimate(e.target.value, sendTo, sendCurrency);
+            }} />
+            <div className="flex items-center justify-between mt-2">
+              <Button disabled={!sendAmount || !sendTo} className="bg-[#0098ea] text-white px-4 py-2 rounded-xl flex items-center gap-2 disabled:bg-gray-300" onClick={() => {
+                setTransferStatus("loading");
+                setSendFeeAmount("");
 
-                }}>
-                  <Send size={16} /> Send
-                </Button>
-                {sendFeeAmount ? <span className="text-sm text-gray-500">Fee: {sendFeeAmount} {sendCurrency}</span> : ""}
-              </div>
-            </CardContent>
-          </Card>
+                window.sendTransfer(sendAmount, sendTo, sendCurrency).then(res => {
+                  setTransferStatus("success");
+                  console.log("transferred: " + sendAmount + " " + sendCurrency + " to " + sendTo);
+                  setSendAmount("");
+                  setSendTo("");
+                }).catch(err => {
+                  setTransferStatus(null);
+                  alert(err);
+                  console.error(err);
+                });
 
+              }}>
+                <Send size={16} /> Send
+              </Button>
+              {sendFeeAmount ? <span className="text-sm text-gray-500">Fee: {sendFeeAmount} {sendCurrency}</span> : ""}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-[#f9fcff] shadow-md rounded-2xl">
+          <CardContent className="p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xl font-semibold">Swap</h2>
+              {activeSwapPair && (
+                <span className="text-sm text-gray-600">Rate: 1 {activeSwapPair.from} = {activeSwapPair.coeff} {activeSwapPair.to}</span>
+              )}
+            </div>
+            <p className="text-sm text-gray-600">Swap TON to USDX using the fixed rate.</p>
+            <Button className="bg-[#0098ea] text-white px-4 py-2 rounded-xl flex items-center gap-2" onClick={() => {
+              const pair = swapPairs[0];
+              setSwapModalOpen(true);
+              setSwapFromCurrency(pair.from);
+              setSwapToCurrency(pair.to);
+              updateSwapPreview("", pair.coeff);
+            }}>
+              <Repeat size={16} /> Start Swap
+            </Button>
+          </CardContent>
+        </Card>
+
+        {derivativesEnabled && (
           <Card className="bg-[#f9fcff] shadow-md rounded-2xl">
             <CardContent className="p-6 space-y-4">
               <div className="flex items-center justify-between">
-                <h2 className="text-xl font-semibold">Swap</h2>
-                {activeSwapPair && (
-                    <span className="text-sm text-gray-600">Rate: 1 {activeSwapPair.from} = {activeSwapPair.coeff} {activeSwapPair.to}</span>
-                )}
+                <h2 className="text-xl font-semibold">Derivatives</h2>
+                <span className="text-sm text-gray-600">Open positions: {derivativesPositions.length}</span>
               </div>
-              <p className="text-sm text-gray-600">Swap TON to USDX using the fixed rate.</p>
-              <Button className="bg-[#0098ea] text-white px-4 py-2 rounded-xl flex items-center gap-2" onClick={() => {
-                const pair = swapPairs[0];
-                setSwapModalOpen(true);
-                setSwapFromCurrency(pair.from);
-                setSwapToCurrency(pair.to);
-                updateSwapPreview("", pair.coeff);
-              }}>
-                <Repeat size={16} /> Start Swap
+              <p className="text-sm text-gray-600">Open/close trustless derivative positions in your channel.</p>
+              <Button className="bg-[#0098ea] text-white px-4 py-2 rounded-xl flex items-center gap-2" onClick={openDerivativesModal}>
+                <Activity size={16} /> Derivatives
               </Button>
             </CardContent>
           </Card>
+        )}
 
-          {transactions && (
-              <Card className="bg-[#f9fcff] shadow-md rounded-2xl">
-                <CardContent className="p-6 space-y-4">
-                  <h2 className="text-xl font-semibold">History</h2>
+        {transactions && (
+          <Card className="bg-[#f9fcff] shadow-md rounded-2xl">
+            <CardContent className="p-6 space-y-4">
+              <h2 className="text-xl font-semibold">History</h2>
 
-                  <div className="space-y-2">
-                    {transactions.map((tx) => (
-                        <div
-                            key={tx.id}
-                            className="flex justify-between items-center border-b border-gray-100 pb-2"
+              <div className="space-y-2">
+                {transactions.map((tx) => (
+                  <div
+                    key={tx.id}
+                    className="flex justify-between items-center border-b border-gray-100 pb-2"
+                  >
+                    <div className="flex items-center gap-2">
+                      {(() => {
+                        const p = { size: 16 };
+                        switch (tx.action) {
+                          case 1: // Balance changed
+                            return <RefreshCw className="text-blue-500"  {...p} />;
+                          case 2: // Transfer-in
+                            return <ArrowDown className="text-green-500" {...p} />;
+                          case 3: // Transfer-out
+                            return <ArrowUp className="text-red-500"   {...p} />;
+                          case 4: // Uncooperative close
+                            return <Activity className="text-orange-500" {...p} />;
+                          case 5: // Closed
+                            return <Check className="text-gray-500"  {...p} />;
+                          case 6: // Their capacity rented
+                            return <PlusCircle className="text-green-500" {...p} />;
+                          case 7: // Our capacity rented
+                            return <Plus className="text-green-500" {...p} />;
+                          case 8: // Withdraw transaction request
+                            return <MinusCircle className="text-red-500"   {...p} />;
+                          default:
+                            return <ArrowDown   {...p} />;
+                        }
+                      })()}
+
+                      <span className="text-sm text-gray-600">{tx.timestamp}</span>
+                    </div>
+
+                    <div className="flex flex-col items-end">
+                      {tx.amounts && (
+                        <div className="text-sm font-medium text-right">{formatAmounts(tx.amounts)}</div>
+                      )}
+                      {tx.isTheir !== undefined && (
+                        <div className="text-xs text-gray-500">{tx.isTheir ? "Counterparty balance changes" : "Our balance changes"}</div>
+                      )}
+
+                      {tx.party && (
+                        <button
+                          className="group flex items-center gap-1 text-xs text-blue-600 hover:underline"
+                          onClick={() => navigator.clipboard.writeText(tx.party!)}
+                          title="Copy address"
                         >
-                          <div className="flex items-center gap-2">
-                            {(() => {
-                              const p = { size: 16 };
-                              switch (tx.action) {
-                                case 1: // Balance changed
-                                  return <RefreshCw   className="text-blue-500"  {...p} />;
-                                case 2: // Transfer-in
-                                  return <ArrowDown   className="text-green-500" {...p} />;
-                                case 3: // Transfer-out
-                                  return <ArrowUp     className="text-red-500"   {...p} />;
-                                case 4: // Uncooperative close
-                                  return <Activity    className="text-orange-500" {...p} />;
-                                case 5: // Closed
-                                  return <Check       className="text-gray-500"  {...p} />;
-                                case 6: // Their capacity rented
-                                  return <PlusCircle  className="text-green-500" {...p} />;
-                                case 7: // Our capacity rented
-                                  return <Plus        className="text-green-500" {...p} />;
-                                case 8: // Withdraw transaction request
-                                  return <MinusCircle className="text-red-500"   {...p} />;
-                                default:
-                                  return <ArrowDown   {...p} />;
-                              }
-                            })()}
-
-                            <span className="text-sm text-gray-600">{tx.timestamp}</span>
-                          </div>
-
-                          <div className="flex flex-col items-end">
-                            {tx.amounts && (
-                                <div className="text-sm font-medium text-right">{formatAmounts(tx.amounts)}</div>
-                            )}
-                            {tx.isTheir !== undefined && (
-                                <div className="text-xs text-gray-500">{tx.isTheir ? "Counterparty balance changes" : "Our balance changes"}</div>
-                            )}
-
-                            {tx.party && (
-                                <button
-                                    className="group flex items-center gap-1 text-xs text-blue-600 hover:underline"
-                                    onClick={() => navigator.clipboard.writeText(tx.party!)}
-                                    title="Copy address"
-                                >
-                                  <Copy
-                                      size={12}
-                                      className="opacity-70 group-hover:opacity-100"
-                                  />
-                                  {tx.party.slice(0, 4)}…{tx.party.slice(-4)}
-                                </button>
-                            )}
-                          </div>
-                        </div>
-                    ))}
+                          <Copy
+                            size={12}
+                            className="opacity-70 group-hover:opacity-100"
+                          />
+                          {tx.party.slice(0, 4)}…{tx.party.slice(-4)}
+                        </button>
+                      )}
+                    </div>
                   </div>
-                </CardContent>
-              </Card>
-          )}
-        </div>
-
-        {modalType && (
-            <ModalAmount
-                title={modalType}
-                value={modalAmount}
-                currency={modalCurrency}
-                currencies={availableCurrencies}
-                withdrawTarget={modalType === "withdraw" ? withdrawTarget : undefined}
-                onChange={setModalAmount}
-                onCurrencyChange={setModalCurrency}
-                onWithdrawTargetChange={setWithdrawTarget}
-                onConfirm={confirmModal}
-                onCancel={closeModal}
-            />
-        )}
-        {swapModalOpen && activeSwapPair && (
-            <SwapModal
-                fromCurrency={swapFromCurrency}
-                toCurrency={swapToCurrency}
-                fromAmount={swapFromAmount}
-                toAmount={swapToAmount}
-                pairs={swapPairs}
-                coefficient={activeSwapPair.coeff}
-                onFromCurrencyChange={handleSwapPairChange}
-                onAmountChange={(val) => updateSwapPreview(val)}
-                onConfirm={confirmSwap}
-                onCancel={() => setSwapModalOpen(false)}
-            />
-        )}
-        {transferStatus && (
-            <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
-              <div className="bg-white p-6 rounded-2xl shadow-xl w-80 space-y-4">
-                <div className="flex items-center justify-center gap-3">
-                  {transferStatus === "loading" ? (
-                      <>
-                        <RefreshCw className="animate-spin" size={24}/>
-                        <span className="text-lg">Connecting to recipient...</span>
-                      </>
-                  ) : (
-                      <>
-                        <Check className="text-green-500" size={24}/>
-                        <span className="text-lg">Transfer on the way</span>
-                        <div className="flex justify-between gap-4">
-                          <Button onClick={() =>{setTransferStatus(null)}} className="bg-[#0098ea] text-white w-full">OK</Button>
-                        </div>
-                      </>
-                  )}
-                </div>
+                ))}
               </div>
-            </div>
+            </CardContent>
+          </Card>
         )}
       </div>
+
+      {modalType && (
+        <ModalAmount
+          title={modalType}
+          value={modalAmount}
+          currency={modalCurrency}
+          currencies={availableCurrencies}
+          withdrawTarget={modalType === "withdraw" ? withdrawTarget : undefined}
+          onChange={setModalAmount}
+          onCurrencyChange={setModalCurrency}
+          onWithdrawTargetChange={setWithdrawTarget}
+          onConfirm={confirmModal}
+          onCancel={closeModal}
+        />
+      )}
+      {swapModalOpen && activeSwapPair && (
+        <SwapModal
+          fromCurrency={swapFromCurrency}
+          toCurrency={swapToCurrency}
+          fromAmount={swapFromAmount}
+          toAmount={swapToAmount}
+          pairs={swapPairs}
+          coefficient={activeSwapPair.coeff}
+          onFromCurrencyChange={handleSwapPairChange}
+          onAmountChange={(val) => updateSwapPreview(val)}
+          onConfirm={confirmSwap}
+          onCancel={() => setSwapModalOpen(false)}
+        />
+      )}
+      {derivativesEnabled && derivativesModalOpen && (
+        <DerivativesModal
+          symbols={derivativeSymbols}
+          selectedSymbol={derivativeSymbol}
+          onSymbolChange={setDerivativeSymbol}
+          quote={derivativeQuote}
+          positions={derivativesPositions}
+          amount={derivativeAmount}
+          leverage={derivativeLeverage}
+          orderType={derivativeOrderType}
+          limitPrice={derivativeLimitPrice}
+          loading={derivativesLoading}
+          actionLoading={derivativeActionLoading}
+          onAmountChange={setDerivativeAmount}
+          onLeverageChange={setDerivativeLeverage}
+          onOrderTypeChange={setDerivativeOrderType}
+          onLimitPriceChange={setDerivativeLimitPrice}
+          onOpenLong={() => openDerivative("long")}
+          onOpenShort={() => openDerivative("short")}
+          onClosePosition={closeDerivative}
+          onRefresh={refreshDerivatives}
+          priceHistory={priceHistory}
+          onCancel={() => setDerivativesModalOpen(false)}
+        />
+      )}
+      {transferStatus && (
+        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
+          <div className="bg-white p-6 rounded-2xl shadow-xl w-80 space-y-4">
+            <div className="flex items-center justify-center gap-3">
+              {transferStatus === "loading" ? (
+                <>
+                  <RefreshCw className="animate-spin" size={24} />
+                  <span className="text-lg">Connecting to recipient...</span>
+                </>
+              ) : (
+                <>
+                  <Check className="text-green-500" size={24} />
+                  <span className="text-lg">Transfer on the way</span>
+                  <div className="flex justify-between gap-4">
+                    <Button onClick={() => { setTransferStatus(null) }} className="bg-[#0098ea] text-white w-full">OK</Button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 };
 
@@ -623,42 +845,498 @@ const ModalAmount: React.FC<{
   onConfirm: () => void;
   onCancel: () => void;
 }> = ({ title, value, currency, currencies, withdrawTarget, onChange, onCurrencyChange, onWithdrawTargetChange, onConfirm, onCancel }) => (
-    <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
-      <div className="bg-white p-6 rounded-2xl shadow-xl w-80 space-y-4">
-        <h2 className="text-lg font-semibold capitalize text-center">{title}</h2>
-        <div className="flex items-center gap-3">
-          <span className="text-sm text-gray-600">Currency</span>
-          <select
-              className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white"
-              value={currency}
-              onChange={(e) => onCurrencyChange(e.target.value)}
-          >
-            {currencies.map((c) => (
-                <option key={`modal-${c}`} value={c}>{c}</option>
-            ))}
-          </select>
-        </div>
+  <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
+    <div className="bg-white p-6 rounded-2xl shadow-xl w-80 space-y-4">
+      <h2 className="text-lg font-semibold capitalize text-center">{title}</h2>
+      <div className="flex items-center gap-3">
+        <span className="text-sm text-gray-600">Currency</span>
+        <select
+          className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white"
+          value={currency}
+          onChange={(e) => onCurrencyChange(e.target.value)}
+        >
+          {currencies.map((c) => (
+            <option key={`modal-${c}`} value={c}>{c}</option>
+          ))}
+        </select>
+      </div>
+      <Input
+        type="number"
+        step="0.000000001"
+        placeholder={`Enter amount in ${currency}`}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      {withdrawTarget !== undefined && (
         <Input
-            type="number"
-            step="0.000000001"
-            placeholder={`Enter amount in ${currency}`}
-            value={value}
-            onChange={(e) => onChange(e.target.value)}
+          placeholder="Target address"
+          value={withdrawTarget}
+          onChange={(e) => onWithdrawTargetChange && onWithdrawTargetChange(e.target.value)}
         />
-        {withdrawTarget !== undefined && (
-            <Input
-                placeholder="Target address"
-                value={withdrawTarget}
-                onChange={(e) => onWithdrawTargetChange && onWithdrawTargetChange(e.target.value)}
-            />
-        )}
-        <div className="flex justify-between gap-4">
-          <Button onClick={onConfirm} className="bg-[#0098ea] text-white w-full">Confirm</Button>
-          <Button onClick={onCancel} className="bg-gray-200 text-gray-700 w-full">Cancel</Button>
-        </div>
+      )}
+      <div className="flex justify-between gap-4">
+        <Button onClick={onConfirm} className="bg-[#0098ea] text-white w-full">Confirm</Button>
+        <Button onClick={onCancel} className="bg-gray-200 text-gray-700 w-full">Cancel</Button>
       </div>
     </div>
+  </div>
 );
+
+const PriceChart: React.FC<{ data: PriceHistoryPoint[] }> = ({ data }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || data.length < 2) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+
+    const w = rect.width;
+    const h = rect.height;
+    const pad = { top: 14, right: 64, bottom: 28, left: 10 };
+    const cw = w - pad.left - pad.right;
+    const ch = h - pad.top - pad.bottom;
+
+    const prices = data.map(d => parseFloat(d.price));
+    const times = data.map(d => d.at);
+    const minP = Math.min(...prices);
+    const maxP = Math.max(...prices);
+    const range = maxP - minP || 1;
+    const minT = Math.min(...times);
+    const maxT = Math.max(...times);
+    const rangeT = maxT - minT || 1;
+
+    // Background
+    ctx.clearRect(0, 0, w, h);
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, h);
+    bgGrad.addColorStop(0, '#f0f8ff');
+    bgGrad.addColorStop(1, '#ffffff');
+    ctx.fillStyle = bgGrad;
+    ctx.beginPath();
+    const r = 12;
+    ctx.moveTo(r, 0); ctx.lineTo(w - r, 0); ctx.quadraticCurveTo(w, 0, w, r);
+    ctx.lineTo(w, h - r); ctx.quadraticCurveTo(w, h, w - r, h);
+    ctx.lineTo(r, h); ctx.quadraticCurveTo(0, h, 0, h - r);
+    ctx.lineTo(0, r); ctx.quadraticCurveTo(0, 0, r, 0);
+    ctx.closePath();
+    ctx.fill();
+
+    // Grid
+    ctx.strokeStyle = '#d0e5f5';
+    ctx.lineWidth = 0.5;
+    ctx.setLineDash([4, 4]);
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.top + (ch * i) / 4;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y);
+      ctx.lineTo(w - pad.right, y);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+
+    // Price labels
+    ctx.fillStyle = '#6b8299';
+    ctx.font = '500 10px -apple-system, BlinkMacSystemFont, sans-serif';
+    ctx.textAlign = 'left';
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.top + (ch * i) / 4;
+      const val = maxP - (range * i) / 4;
+      ctx.fillText('$' + val.toFixed(2), w - pad.right + 6, y + 4);
+    }
+
+    // Time labels
+    ctx.fillStyle = '#8fa4b8';
+    ctx.textAlign = 'center';
+    const lc = Math.min(5, data.length);
+    for (let i = 0; i < lc; i++) {
+      const idx = Math.floor((i * (data.length - 1)) / (lc - 1));
+      const x = pad.left + (cw * (times[idx] - minT)) / rangeT;
+      const d = new Date(times[idx] * 1000);
+      ctx.fillText(d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }), x, h - 6);
+    }
+
+    const toX = (t: number) => pad.left + (cw * (t - minT)) / rangeT;
+    const toY = (p: number) => pad.top + ch - (ch * (p - minP)) / range;
+
+    // Gradient fill under the line
+    const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + ch);
+    grad.addColorStop(0, 'rgba(0,152,234,0.20)');
+    grad.addColorStop(0.6, 'rgba(0,152,234,0.06)');
+    grad.addColorStop(1, 'rgba(0,152,234,0)');
+    ctx.beginPath();
+    ctx.moveTo(toX(times[0]), pad.top + ch);
+    for (let i = 0; i < data.length; i++) ctx.lineTo(toX(times[i]), toY(prices[i]));
+    ctx.lineTo(toX(times[times.length - 1]), pad.top + ch);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Line shadow
+    ctx.beginPath();
+    ctx.moveTo(toX(times[0]), toY(prices[0]));
+    for (let i = 1; i < data.length; i++) ctx.lineTo(toX(times[i]), toY(prices[i]));
+    ctx.strokeStyle = 'rgba(0,152,234,0.2)';
+    ctx.lineWidth = 4;
+    ctx.stroke();
+
+    // Main line
+    ctx.beginPath();
+    ctx.moveTo(toX(times[0]), toY(prices[0]));
+    for (let i = 1; i < data.length; i++) ctx.lineTo(toX(times[i]), toY(prices[i]));
+    ctx.strokeStyle = '#0098ea';
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.stroke();
+
+    // End dot glow
+    const lastX = toX(times[times.length - 1]);
+    const lastY = toY(prices[prices.length - 1]);
+    ctx.beginPath();
+    ctx.arc(lastX, lastY, 6, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,152,234,0.15)';
+    ctx.fill();
+
+    // End dot
+    ctx.beginPath();
+    ctx.arc(lastX, lastY, 3.5, 0, Math.PI * 2);
+    ctx.fillStyle = '#0098ea';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(lastX, lastY, 2, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffffff';
+    ctx.fill();
+  }, [data]);
+
+  if (data.length < 2) {
+    return (
+      <div className="bg-gradient-to-b from-[#f0f8ff] to-white rounded-xl p-6 text-center text-sm text-gray-400 flex items-center justify-center" style={{ height: 180 }}>
+        <div>
+          <RefreshCw className="animate-spin mx-auto mb-2 text-[#0098ea] opacity-40" size={20} />
+          Waiting for price data…
+        </div>
+      </div>
+    );
+  }
+
+  return <canvas ref={canvasRef} style={{ width: '100%', height: 180, display: 'block' }} className="rounded-xl" />;
+};
+
+/* Leverage slider tick marks */
+const LEVERAGE_TICKS = [1, 5, 10, 15, 20];
+
+const DerivativesModal: React.FC<{
+  symbols: string[];
+  selectedSymbol: string;
+  onSymbolChange: (value: string) => void;
+  quote: DerivativesQuote | null;
+  positions: DerivativesPosition[];
+  amount: string;
+  leverage: string;
+  orderType: "market" | "limit";
+  limitPrice: string;
+  loading: boolean;
+  actionLoading: "long" | "short" | "close" | null;
+  priceHistory: PriceHistoryPoint[];
+  onAmountChange: (value: string) => void;
+  onLeverageChange: (value: string) => void;
+  onOrderTypeChange: (value: "market" | "limit") => void;
+  onLimitPriceChange: (value: string) => void;
+  onOpenLong: () => void;
+  onOpenShort: () => void;
+  onClosePosition: (positionId: string) => void;
+  onRefresh: () => void;
+  onCancel: () => void;
+}> = ({
+  symbols,
+  selectedSymbol,
+  onSymbolChange,
+  quote,
+  positions,
+  amount,
+  leverage,
+  orderType,
+  limitPrice,
+  loading,
+  actionLoading,
+  priceHistory,
+  onAmountChange,
+  onLeverageChange,
+  onOrderTypeChange,
+  onLimitPriceChange,
+  onOpenLong,
+  onOpenShort,
+  onClosePosition,
+  onRefresh,
+  onCancel,
+}) => {
+    const leverageNum = parseInt(leverage, 10) || 1;
+
+    return (
+      <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50" onClick={onCancel}>
+        {/* Range slider custom styles */}
+        <style>{`
+        .deriv-slider { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; border-radius: 3px; outline: none; cursor: pointer; }
+        .deriv-slider::-webkit-slider-runnable-track { height: 6px; border-radius: 3px; background: linear-gradient(90deg, #0098ea 0%, #66c4f0 100%); }
+        .deriv-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 22px; height: 22px; border-radius: 50%; background: #0098ea; border: 3px solid #fff; box-shadow: 0 1px 6px rgba(0,152,234,0.4); margin-top: -8px; cursor: pointer; transition: box-shadow 0.15s; }
+        .deriv-slider::-webkit-slider-thumb:hover { box-shadow: 0 2px 10px rgba(0,152,234,0.6); }
+        .deriv-slider::-moz-range-track { height: 6px; border-radius: 3px; background: linear-gradient(90deg, #0098ea 0%, #66c4f0 100%); border: none; }
+        .deriv-slider::-moz-range-thumb { width: 22px; height: 22px; border-radius: 50%; background: #0098ea; border: 3px solid #fff; box-shadow: 0 1px 6px rgba(0,152,234,0.4); cursor: pointer; }
+      `}</style>
+        <div
+          className="bg-white rounded-2xl shadow-2xl w-[min(95vw,540px)] max-h-[90vh] overflow-y-auto border border-[#e0ecf5]"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* Header */}
+          <div className="sticky top-0 bg-white/95 backdrop-blur-sm z-10 px-6 pt-5 pb-3 border-b border-[#eef4fa] rounded-t-2xl">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-[#0098ea] to-[#0077bb] flex items-center justify-center">
+                  <Activity size={18} className="text-white" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-bold text-gray-800">Derivatives</h2>
+                  <div className="flex items-center gap-1.5 text-xs text-gray-500">
+                    {loading && <RefreshCw size={10} className="animate-spin" />}
+                    {quote ? (
+                      <>
+                        <span className="inline-block w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+                        <span>${quote.price}</span>
+                        <span className="text-gray-400">·</span>
+                        <span>{new Date(quote.at * 1000).toLocaleTimeString()}</span>
+                      </>
+                    ) : (
+                      <span>Connecting…</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={onCancel}
+                className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"
+              >
+                <X size={20} />
+              </button>
+            </div>
+          </div>
+
+          <div className="px-6 pb-6 pt-4 space-y-5">
+            {/* Symbol selector */}
+            <div className="flex items-center gap-2">
+              {symbols.map((s) => (
+                <button
+                  key={`sym-${s}`}
+                  onClick={() => onSymbolChange(s)}
+                  className={`px-4 py-1.5 rounded-full text-sm font-medium transition-all ${selectedSymbol === s
+                      ? 'bg-[#0098ea] text-white shadow-sm shadow-[#0098ea]/20'
+                      : 'bg-[#f0f8ff] text-gray-600 hover:bg-[#e0ecf5]'
+                    }`}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+
+            {/* Chart */}
+            <PriceChart data={priceHistory} />
+
+            {/* Order type pills */}
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-medium text-gray-500 uppercase tracking-wide">Order</span>
+              <div className="flex bg-[#f0f8ff] rounded-lg p-0.5">
+                <button
+                  onClick={() => onOrderTypeChange('market')}
+                  className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${orderType === 'market'
+                      ? 'bg-white text-[#0098ea] shadow-sm'
+                      : 'text-gray-500 hover:text-gray-700'
+                    }`}
+                >
+                  Market
+                </button>
+                <button
+                  onClick={() => onOrderTypeChange('limit')}
+                  className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${orderType === 'limit'
+                      ? 'bg-white text-[#0098ea] shadow-sm'
+                      : 'text-gray-500 hover:text-gray-700'
+                    }`}
+                >
+                  Limit
+                </button>
+              </div>
+            </div>
+
+            {/* Leverage slider */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-medium text-gray-500 uppercase tracking-wide">Leverage</span>
+                <span className="text-sm font-bold text-[#0098ea] bg-[#f0f8ff] px-3 py-0.5 rounded-full">
+                  {leverageNum}x
+                </span>
+              </div>
+              <input
+                type="range"
+                min={1}
+                max={20}
+                step={1}
+                value={leverageNum}
+                onChange={(e) => onLeverageChange(e.target.value)}
+                className="deriv-slider"
+              />
+              <div className="flex justify-between mt-1.5 px-0.5">
+                {LEVERAGE_TICKS.map((t) => (
+                  <button
+                    key={`tick-${t}`}
+                    onClick={() => onLeverageChange(String(t))}
+                    className={`text-[10px] font-medium transition-colors ${leverageNum === t ? 'text-[#0098ea]' : 'text-gray-400 hover:text-gray-600'
+                      }`}
+                  >
+                    {t}x
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Collateral input */}
+            <div className="space-y-3">
+              <div className="relative">
+                <input
+                  type="number"
+                  step="0.000000001"
+                  placeholder="0.00"
+                  value={amount}
+                  onChange={(e) => onAmountChange(e.target.value)}
+                  className="w-full pl-4 pr-16 py-3 bg-[#f8fbff] border border-[#dce8f3] rounded-xl text-base font-medium text-gray-800 placeholder-gray-300 focus:outline-none focus:ring-2 focus:ring-[#0098ea]/20 focus:border-[#0098ea] transition-all"
+                />
+                <span className="absolute right-4 top-1/2 -translate-y-1/2 text-sm font-semibold text-[#0098ea]">TON</span>
+              </div>
+
+              {orderType === 'limit' && (
+                <div className="relative">
+                  <input
+                    type="number"
+                    step="0.000000001"
+                    placeholder="Limit price"
+                    value={limitPrice}
+                    onChange={(e) => onLimitPriceChange(e.target.value)}
+                    className="w-full pl-4 pr-12 py-3 bg-[#f8fbff] border border-[#dce8f3] rounded-xl text-base font-medium text-gray-800 placeholder-gray-300 focus:outline-none focus:ring-2 focus:ring-[#0098ea]/20 focus:border-[#0098ea] transition-all"
+                  />
+                  <span className="absolute right-4 top-1/2 -translate-y-1/2 text-sm font-medium text-gray-400">$</span>
+                </div>
+              )}
+            </div>
+
+            {/* Long / Short */}
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                onClick={onOpenLong}
+                disabled={actionLoading !== null}
+                className="flex items-center justify-center gap-2 py-3 rounded-xl font-semibold text-white transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                style={{ background: 'linear-gradient(135deg, #16a34a, #22c55e)' }}
+              >
+                {actionLoading === 'long' ? (
+                  <RefreshCw className="animate-spin" size={18} />
+                ) : (
+                  <>
+                    <TrendingUp size={18} />
+                    Long
+                  </>
+                )}
+              </button>
+              <button
+                onClick={onOpenShort}
+                disabled={actionLoading !== null}
+                className="flex items-center justify-center gap-2 py-3 rounded-xl font-semibold text-white transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                style={{ background: 'linear-gradient(135deg, #dc2626, #ef4444)' }}
+              >
+                {actionLoading === 'short' ? (
+                  <RefreshCw className="animate-spin" size={18} />
+                ) : (
+                  <>
+                    <TrendingDown size={18} />
+                    Short
+                  </>
+                )}
+              </button>
+            </div>
+
+            {/* Positions */}
+            {(positions.length > 0 || true) && (
+              <div>
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="text-sm font-semibold text-gray-700">Open Positions</h3>
+                  {positions.length > 0 && (
+                    <span className="text-xs font-medium text-[#0098ea] bg-[#f0f8ff] px-2 py-0.5 rounded-full">
+                      {positions.length}
+                    </span>
+                  )}
+                </div>
+                {positions.length === 0 ? (
+                  <div className="text-center py-6 text-sm text-gray-400 bg-[#fafcff] rounded-xl border border-dashed border-[#dce8f3]">
+                    No active positions
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {positions.map((p) => (
+                      <div key={`deriv-pos-${p.id}`} className="bg-[#f8fbff] border border-[#e0ecf5] rounded-xl p-4">
+                        <div className="flex items-center justify-between mb-3">
+                          <div className="flex items-center gap-2">
+                            <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-bold text-white ${p.is_long ? 'bg-green-500' : 'bg-red-500'
+                              }`}>
+                              {p.is_long ? <TrendingUp size={12} /> : <TrendingDown size={12} />}
+                              {p.is_long ? 'LONG' : 'SHORT'}
+                            </span>
+                            <span className="text-sm font-semibold text-gray-700">{p.symbol}</span>
+                            <span className="text-xs text-gray-400 font-medium">×{p.leverage}</span>
+                          </div>
+                          <button
+                            onClick={() => onClosePosition(p.id)}
+                            disabled={actionLoading !== null}
+                            className="px-3 py-1 rounded-lg text-xs font-medium bg-gray-100 text-gray-600 hover:bg-red-50 hover:text-red-600 transition-colors disabled:opacity-40"
+                          >
+                            {actionLoading === 'close' ? <RefreshCw className="animate-spin" size={12} /> : 'Close'}
+                          </button>
+                        </div>
+                        <div className="grid grid-cols-3 gap-2 text-xs">
+                          <div>
+                            <div className="text-gray-400 mb-0.5">Collateral</div>
+                            <div className="font-semibold text-gray-700">{p.collateral} TON</div>
+                          </div>
+                          <div>
+                            <div className="text-gray-400 mb-0.5">Entry</div>
+                            <div className="font-semibold text-gray-700">${p.entry_price}</div>
+                          </div>
+                          <div>
+                            <div className="text-gray-400 mb-0.5">Current</div>
+                            <div className="font-semibold text-gray-700">${p.current_price}</div>
+                          </div>
+                        </div>
+                        <div className="flex items-center justify-between mt-3 pt-2 border-t border-[#e8f0f8]">
+                          <div className="text-xs text-gray-400">
+                            Liq. <span className="text-gray-600 font-medium">${p.liquidation_price}</span>
+                          </div>
+                          <div className={`text-sm font-bold ${p.pnl_percent >= 0 ? 'text-green-600' : 'text-red-500'
+                            }`}>
+                            {p.pnl_percent >= 0 ? '+' : ''}{p.pnl_percent.toFixed(2)}%
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
 
 const SwapModal: React.FC<{
   fromCurrency: string;
@@ -672,45 +1350,45 @@ const SwapModal: React.FC<{
   onConfirm: () => void;
   onCancel: () => void;
 }> = ({ fromCurrency, toCurrency, fromAmount, toAmount, pairs, coefficient, onFromCurrencyChange, onAmountChange, onConfirm, onCancel }) => (
-    <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
-      <div className="bg-white p-6 rounded-2xl shadow-xl w-80 space-y-4">
-        <h2 className="text-lg font-semibold capitalize text-center">Swap</h2>
-        <div className="flex items-center gap-3">
-          <span className="text-sm text-gray-600">From</span>
-          <select
-              className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white"
-              value={fromCurrency}
-              onChange={(e) => onFromCurrencyChange(e.target.value)}
-          >
-            {pairs.map((p) => (
-                <option key={`swap-from-${p.from}`} value={p.from}>{p.from}</option>
-            ))}
-          </select>
-        </div>
-        <div className="flex items-center gap-3">
-          <span className="text-sm text-gray-600">To</span>
-          <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-gray-100" value={toCurrency} disabled />
-        </div>
-        <Input
-            type="number"
-            step="0.000000001"
-            placeholder={`Enter amount in ${fromCurrency}`}
-            value={fromAmount}
-            onChange={(e) => onAmountChange(e.target.value)}
-        />
-        <Input
-            disabled
-            value={toAmount}
-            placeholder={`You will receive in ${toCurrency}`}
-            className="bg-gray-100"
-        />
-        <div className="text-sm text-gray-600 text-center">Rate: 1 {fromCurrency} = {coefficient} {toCurrency}</div>
-        <div className="flex justify-between gap-4">
-          <Button onClick={onConfirm} className="bg-[#0098ea] text-white w-full">Confirm</Button>
-          <Button onClick={onCancel} className="bg-gray-200 text-gray-700 w-full">Cancel</Button>
-        </div>
+  <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
+    <div className="bg-white p-6 rounded-2xl shadow-xl w-80 space-y-4">
+      <h2 className="text-lg font-semibold capitalize text-center">Swap</h2>
+      <div className="flex items-center gap-3">
+        <span className="text-sm text-gray-600">From</span>
+        <select
+          className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white"
+          value={fromCurrency}
+          onChange={(e) => onFromCurrencyChange(e.target.value)}
+        >
+          {pairs.map((p) => (
+            <option key={`swap-from-${p.from}`} value={p.from}>{p.from}</option>
+          ))}
+        </select>
+      </div>
+      <div className="flex items-center gap-3">
+        <span className="text-sm text-gray-600">To</span>
+        <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-gray-100" value={toCurrency} disabled />
+      </div>
+      <Input
+        type="number"
+        step="0.000000001"
+        placeholder={`Enter amount in ${fromCurrency}`}
+        value={fromAmount}
+        onChange={(e) => onAmountChange(e.target.value)}
+      />
+      <Input
+        disabled
+        value={toAmount}
+        placeholder={`You will receive in ${toCurrency}`}
+        className="bg-gray-100"
+      />
+      <div className="text-sm text-gray-600 text-center">Rate: 1 {fromCurrency} = {coefficient} {toCurrency}</div>
+      <div className="flex justify-between gap-4">
+        <Button onClick={onConfirm} className="bg-[#0098ea] text-white w-full">Confirm</Button>
+        <Button onClick={onCancel} className="bg-gray-200 text-gray-700 w-full">Cancel</Button>
       </div>
     </div>
+  </div>
 );
 
 

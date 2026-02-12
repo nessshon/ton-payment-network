@@ -6,6 +6,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"math"
+	"math/big"
+	"net"
+	"net/http"
+	"net/netip"
+	"strings"
+	"time"
+
 	"github.com/natefinch/lumberjack"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
@@ -35,14 +44,6 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/ton/wallet"
 	"golang.org/x/crypto/ed25519"
-	"io"
-	"math"
-	"math/big"
-	"net"
-	"net/http"
-	"net/netip"
-	"strings"
-	"time"
 
 	_ "net/http/pprof"
 )
@@ -376,6 +377,11 @@ func main() {
 		}()
 	}
 
+	if err = initDerivativesResolvers(); err != nil {
+		log.Fatal().Err(err).Msg("failed to initialize derivatives price resolvers")
+		return
+	}
+
 	if *API != "" {
 		var credentials *api.Credentials
 		if *APICredentialsLogin != "" || *APICredentialsPassword != "" {
@@ -389,10 +395,6 @@ func main() {
 				Password: *APICredentialsPassword,
 			}
 		}
-
-		// Initialize price resolvers (flexible: add more symbols in future)
-		// Use Binance USD-M aggTrades provider with 1e9 scale to match 9-digit precision.
-		oracle.PriceResolvers[oracle.GetResolverID("binance", "BTCUSDT")] = oracle.NewResolver(oracle.NewBinanceProvider("BTCUSDT", 1_000_000_000))
 
 		derivSvc := tonpayments.NewDerivativesService(svc)
 		srv := api.NewServer(*API, *Webhook, cfg.WebhooksSignatureHMACSHA256Key, svc, derivSvc, fdb, credentials)
@@ -410,6 +412,25 @@ func main() {
 	}
 
 	svc.Start()
+}
+
+func initDerivativesResolvers() error {
+	const binancePriceScale = int64(1_000_000_000)
+
+	register := func(symbol string, ids ...uint32) {
+		resolver := oracle.NewResolver(oracle.NewBinanceProvider(symbol, binancePriceScale))
+		for _, id := range ids {
+			if prev := oracle.PriceResolvers[id]; prev != nil {
+				prev.Close()
+			}
+			oracle.PriceResolvers[id] = resolver
+		}
+		log.Info().Str("symbol", symbol).Msg("binance derivatives price resolver initialized")
+	}
+
+	register("BTCUSDT", oracle.GetResolverID("binance", "BTCUSDT"), 2)
+	register("TONUSDT", oracle.GetResolverID("binance", "TONUSDT"), 1)
+	return nil
 }
 
 func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt *wallet.Wallet, apiClient ton.APIClientWrapped) error {

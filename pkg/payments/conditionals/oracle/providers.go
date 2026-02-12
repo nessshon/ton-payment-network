@@ -1,7 +1,10 @@
+//go:build !(js && wasm)
+
 package oracle
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,7 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
+
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 // BinanceProvider implements PriceProvider using Binance public REST API.
@@ -24,18 +28,42 @@ import (
 // Network errors or no-trade seconds are tolerated by the resolver (such seconds
 // will simply be marked unavailable).
 type BinanceProvider struct {
-	client *http.Client
-	symbol string
-	scale  int64
+	client      *http.Client
+	symbol      string
+	scale       int64
+	proofSigner ed25519.PrivateKey
 }
 
 // NewBinanceProvider creates a provider for the given symbol, e.g. "BTCUSDT".
 func NewBinanceProvider(symbol string, scale int64) *BinanceProvider {
 	return &BinanceProvider{
-		client: &http.Client{Timeout: 3 * time.Second},
-		symbol: strings.ToUpper(symbol),
-		scale:  scale,
+		client:      http.DefaultClient,
+		symbol:      strings.ToUpper(symbol),
+		scale:       scale,
+		proofSigner: append(ed25519.PrivateKey(nil), binanceProofSignerKey...),
 	}
+}
+
+func (b *BinanceProvider) ProofPublicKey() ed25519.PublicKey {
+	if len(b.proofSigner) != ed25519.PrivateKeySize {
+		return nil
+	}
+	return append(ed25519.PublicKey(nil), b.proofSigner.Public().(ed25519.PublicKey)...)
+}
+
+func (b *BinanceProvider) SignProofCell(proof *cell.Cell) ([]byte, error) {
+	if proof == nil {
+		return nil, errors.New("proof cell is nil")
+	}
+	if len(b.proofSigner) != ed25519.PrivateKeySize {
+		return nil, errors.New("binance proof signer key is invalid")
+	}
+	return proof.Sign(b.proofSigner), nil
+}
+
+// BuildProofCell builds a signed PriceInner cell from raw price data.
+func (b *BinanceProvider) BuildProofCell(at int64, price *big.Int) (*cell.Cell, error) {
+	return BuildPriceInnerCell(at, price, b.proofSigner)
 }
 
 type binanceAggTrade struct {
@@ -46,13 +74,26 @@ type binanceAggTrade struct {
 // Fetch returns the price at a specific second `at` by querying Binance aggTrades within that second.
 // If there are no trades during that exact second, it returns ErrUnavailable.
 func (b *BinanceProvider) Fetch(ctx context.Context, at int64) (int64, *big.Int, error) {
+	if b == nil {
+		return 0, nil, errors.New("binance provider is nil")
+	}
+
 	start := at * 1000
 	end := start + 999
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://fapi.binance.com/fapi/v1/aggTrades", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.binance.com/api/v3/aggTrades", nil)
 	if err != nil {
 		return 0, nil, err
 	}
+
+	client := b.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if client == nil {
+		return 0, nil, errors.New("binance http client is unavailable")
+	}
+
 	q := req.URL.Query()
 	q.Set("symbol", b.symbol)
 	q.Set("startTime", strconv.FormatInt(start, 10))
@@ -60,9 +101,12 @@ func (b *BinanceProvider) Fetch(ctx context.Context, at int64) (int64, *big.Int,
 	q.Set("limit", "1000")
 	req.URL.RawQuery = q.Encode()
 
-	resp, err := b.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, err
+	}
+	if resp == nil || resp.Body == nil {
+		return 0, nil, errors.New("binance: empty http response")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -84,85 +128,6 @@ func (b *BinanceProvider) Fetch(ctx context.Context, at int64) (int64, *big.Int,
 		return 0, nil, err
 	}
 	return at, pi, nil
-}
-
-// parsePriceToScaledInt converts a decimal price string (e.g., "43123.42") to an
-// integer scaled by scale (e.g., 1e9). It truncates extra fractional digits without rounding.
-func parsePriceToScaledInt(s string, scale int64) (*big.Int, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil, errors.New("empty price")
-	}
-	neg := false
-	if s[0] == '-' {
-		neg = true
-		s = s[1:]
-	}
-	parts := strings.SplitN(s, ".", 2)
-	intPart := parts[0]
-	fracPart := ""
-	if len(parts) == 2 {
-		fracPart = parts[1]
-	}
-
-	res := new(big.Int)
-	if intPart != "" {
-		ip, ok := new(big.Int).SetString(intPart, 10)
-		if !ok {
-			return nil, errors.New("invalid integer part")
-		}
-		res.Set(ip)
-	}
-	res.Mul(res, big.NewInt(scale))
-
-	if fracPart != "" {
-		// keep up to scale digits
-		scaleDigits := numDigits(scale) - 1 // since scale is power of 10
-		if len(fracPart) > scaleDigits {
-			fracPart = fracPart[:scaleDigits]
-		}
-		fp := new(big.Int)
-		if fracPart != "" {
-			v, ok := new(big.Int).SetString(fracPart, 10)
-			if !ok {
-				return nil, errors.New("invalid fractional part")
-			}
-			// multiply by 10^(scaleDigits - len(fracPart))
-			pow := pow10(scaleDigits - len(fracPart))
-			v.Mul(v, pow)
-			fp.Set(v)
-		}
-		res.Add(res, fp)
-	}
-	if neg {
-		res.Neg(res)
-	}
-	return res, nil
-}
-
-func numDigits(scale int64) int {
-	// scale is expected to be a power of 10
-	if scale <= 0 {
-		return 0
-	}
-	c := 0
-	for scale > 0 {
-		scale /= 10
-		c++
-	}
-	return c
-}
-
-func pow10(n int) *big.Int {
-	if n <= 0 {
-		return big.NewInt(1)
-	}
-	res := big.NewInt(1)
-	ten := big.NewInt(10)
-	for i := 0; i < n; i++ {
-		res.Mul(res, ten)
-	}
-	return res
 }
 
 // MockProvider is an in-memory price provider useful for tests.

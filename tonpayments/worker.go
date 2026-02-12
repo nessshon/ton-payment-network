@@ -20,6 +20,7 @@ import (
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 var ErrWaitingForCapacity = errors.New("capacity request was sent, waiting for it")
@@ -411,6 +412,17 @@ func (s *Service) taskExecutor() {
 						return fmt.Errorf("outgoing conditional is not resolvable")
 					}
 
+					var resolverDetailsCell *cell.Cell
+					if _, _, instruction, buildErr := s.buildDerivativeResolverContract(channel, resOut.GetKey(), resOut.Amount, resOut.Details); buildErr == nil {
+						if resolverDetailsCell, buildErr = tlb.ToCell(instruction); buildErr != nil {
+							log.Warn().Err(buildErr).Str("key", base64.StdEncoding.EncodeToString(resOut.GetKey())).
+								Msg("failed to serialize derivative resolver instruction details")
+						}
+					} else {
+						log.Warn().Err(buildErr).Str("key", base64.StdEncoding.EncodeToString(resOut.GetKey())).
+							Msg("failed to rebuild derivative resolver instruction details")
+					}
+
 					inCondResolvable, err := s.buildLinkedDerivativeConditional(resOut)
 					if err != nil {
 						return fmt.Errorf("failed to prepare linked derivative conditional: %w", err)
@@ -428,9 +440,9 @@ func (s *Service) taskExecutor() {
 							SafeDeadline:          time.Unix(data.Deadline, 0).Add(-time.Duration(channel.SafeOnchainClosePeriod+int64(s.cfg.MinSafeVirtualChannelTimeoutSec)) * time.Second),
 							LinkedKey:             incomingKey,
 						},
-						Any:       resOut.Details,
-						CreatedAt: time.Now(),
-						UpdatedAt: time.Now(),
+						SpecialDetails: buildDerivativeMetaAny(resOut.Details, resolverDetailsCell),
+						CreatedAt:      time.Now(),
+						UpdatedAt:      time.Now(),
 					}
 
 					metaIn := &db.ConditionalMeta{
@@ -444,9 +456,9 @@ func (s *Service) taskExecutor() {
 							SenderKey:             channel.Their.OnchainInfo.Key,
 							LinkedKey:             cond.GetKey(),
 						},
-						Any:       inCondResolvable.Details,
-						CreatedAt: time.Now(),
-						UpdatedAt: time.Now(),
+						SpecialDetails: buildDerivativeMetaAny(inCondResolvable.Details, resolverDetailsCell),
+						CreatedAt:      time.Now(),
+						UpdatedAt:      time.Now(),
 					}
 
 					if err := s.db.CreateVirtualChannelMeta(ctx, metaOut); err != nil && !errors.Is(err, db.ErrAlreadyExists) {
@@ -771,6 +783,10 @@ func (s *Service) taskExecutor() {
 						return nil
 					}
 
+					if err = s.scheduleDerivativeResolverDeployTask(ctx, channel.Our.Address, &channel.InitAt, nil); err != nil {
+						log.Warn().Err(err).Str("channel", channel.Our.Address).Msg("failed to schedule derivative resolvers deployment")
+					}
+
 					ctxTx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 					defer cancel()
 
@@ -778,10 +794,27 @@ func (s *Service) taskExecutor() {
 						log.Error().Err(err).Str("channel", data.Address).Msg("failed to start uncooperative close")
 						return err
 					}
+				case "deploy-derivative-resolvers":
+					var data db.ChannelTask
+					if err = json.Unmarshal(task.Data, &data); err != nil {
+						return fmt.Errorf("invalid json: %w", err)
+					}
+
+					ctxTx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+					defer cancel()
+
+					if err = s.deployChannelDerivativeResolvers(ctxTx, data.Address); err != nil {
+						log.Error().Err(err).Str("channel", data.Address).Msg("failed to deploy derivative resolvers")
+						return err
+					}
 				case "challenge":
 					var data db.ChannelTask
 					if err = json.Unmarshal(task.Data, &data); err != nil {
 						return fmt.Errorf("invalid json: %w", err)
+					}
+
+					if err = s.scheduleDerivativeResolverDeployTask(ctx, data.Address, nil, nil); err != nil {
+						log.Warn().Err(err).Str("channel", data.Address).Msg("failed to schedule derivative resolvers deployment")
 					}
 
 					ctxTx, cancel := context.WithTimeout(context.Background(), 120*time.Second)

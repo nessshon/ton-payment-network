@@ -60,6 +60,7 @@ type DB interface {
 	GetVirtualChannelMeta(ctx context.Context, key []byte) (*db.ConditionalMeta, error)
 	UpdateVirtualChannelMeta(ctx context.Context, meta *db.ConditionalMeta) error
 	CreateVirtualChannelMeta(ctx context.Context, meta *db.ConditionalMeta) error
+	ForEachActiveSpecialMetaKey(ctx context.Context, fn func(key ed25519.PublicKey) error) error
 
 	SetBlockOffset(ctx context.Context, seqno uint32) error
 	GetBlockOffset(ctx context.Context) (*db.BlockOffset, error)
@@ -904,6 +905,7 @@ func (s *Service) processSideUpdate(ctx context.Context, ch *db.Channel, isOur b
 
 func (s *Service) Start() {
 	go s.taskExecutor()
+	go s.derivativePriceWorker()
 	if s.useMetrics {
 		go s.channelsMonitor()
 		go s.walletMonitor()

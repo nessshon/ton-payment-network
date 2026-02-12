@@ -7,9 +7,16 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"math/big"
+	"strings"
+	"syscall/js"
+	"time"
+
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals/oracle"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain/client"
@@ -21,15 +28,12 @@ import (
 	"github.com/xssnick/ton-payment-network/tonpayments/wallet"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
-	"math/big"
-	"strings"
-	"syscall/js"
-	"time"
 )
 
 var DB *db.DB
 var Service *tonpayments.Service
 var Config *config.Config
+var DerivativesEnabled bool
 
 const MinFee = "0.000000001"
 const FeePercentDiv100 = 0
@@ -37,6 +41,10 @@ const FeePercentDiv100 = 0
 func main() {
 	var started bool
 	var sPub ed25519.PublicKey
+
+	js.Global().Set("isDerivativesEnabled", js.FuncOf(func(this js.Value, args []js.Value) any {
+		return js.ValueOf(started && DerivativesEnabled)
+	}))
 
 	js.Global().Set("openChannel", js.FuncOf(func(this js.Value, args []js.Value) any {
 		if !started {
@@ -255,6 +263,256 @@ func main() {
 
 				resolve.Invoke(js.Null())
 				return
+			}()
+
+			return nil
+		}))
+	}))
+
+	js.Global().Set("getDerivativesPositions", js.FuncOf(func(this js.Value, args []js.Value) any {
+		promiseCtor := js.Global().Get("Promise")
+
+		return promiseCtor.New(js.FuncOf(func(this js.Value, prArgs []js.Value) any {
+			resolve := prArgs[0]
+			reject := prArgs[1]
+
+			go func() {
+				if !started {
+					resolve.Invoke(js.Global().Get("Array").New(0))
+					return
+				}
+				if !DerivativesEnabled {
+					resolve.Invoke(js.Global().Get("Array").New(0))
+					return
+				}
+
+				ch, err := getPrimaryChanel(sPub)
+				if err != nil {
+					resolve.Invoke(js.Global().Get("Array").New(0))
+					return
+				}
+
+				symbol := ""
+				if len(args) > 0 && args[0].Type() == js.TypeString {
+					symbol = args[0].String()
+				}
+
+				list, err := tonpayments.NewDerivativesService(Service).ListDerivativesPositions(context.Background(), ch.Our.Address, symbol)
+				if err != nil {
+					reject.Invoke("failed to get derivative positions: " + err.Error())
+					return
+				}
+
+				raw, err := json.Marshal(list)
+				if err != nil {
+					reject.Invoke("failed to serialize derivative positions: " + err.Error())
+					return
+				}
+
+				resolve.Invoke(js.Global().Get("JSON").Call("parse", string(raw)))
+			}()
+
+			return nil
+		}))
+	}))
+
+	js.Global().Set("getDerivativeMarketPrice", js.FuncOf(func(this js.Value, args []js.Value) any {
+		promiseCtor := js.Global().Get("Promise")
+
+		return promiseCtor.New(js.FuncOf(func(this js.Value, prArgs []js.Value) any {
+			resolve := prArgs[0]
+			reject := prArgs[1]
+
+			go func() {
+				if !started {
+					reject.Invoke("not started")
+					return
+				}
+				if !DerivativesEnabled {
+					reject.Invoke("derivatives are unavailable")
+					return
+				}
+
+				if len(args) != 1 || args[0].Type() != js.TypeString {
+					reject.Invoke("wrong number of arguments")
+					return
+				}
+
+				quote, err := tonpayments.NewDerivativesService(Service).GetMarketPrice(context.Background(), args[0].String())
+				if err != nil {
+					reject.Invoke("failed to get derivative market price: " + err.Error())
+					return
+				}
+
+				raw, err := json.Marshal(quote)
+				if err != nil {
+					reject.Invoke("failed to serialize derivative market price: " + err.Error())
+					return
+				}
+
+				resolve.Invoke(js.Global().Get("JSON").Call("parse", string(raw)))
+			}()
+
+			return nil
+		}))
+	}))
+
+	js.Global().Set("getDerivativePriceHistory", js.FuncOf(func(this js.Value, args []js.Value) any {
+		promiseCtor := js.Global().Get("Promise")
+
+		return promiseCtor.New(js.FuncOf(func(this js.Value, prArgs []js.Value) any {
+			resolve := prArgs[0]
+			reject := prArgs[1]
+
+			go func() {
+				if !started {
+					reject.Invoke("not started")
+					return
+				}
+				if !DerivativesEnabled {
+					reject.Invoke("derivatives are unavailable")
+					return
+				}
+
+				if len(args) != 1 || args[0].Type() != js.TypeString {
+					reject.Invoke("wrong number of arguments")
+					return
+				}
+
+				history, err := tonpayments.NewDerivativesService(Service).GetPriceHistory(context.Background(), args[0].String())
+				if err != nil {
+					reject.Invoke("failed to get price history: " + err.Error())
+					return
+				}
+
+				raw, err := json.Marshal(history)
+				if err != nil {
+					reject.Invoke("failed to serialize price history: " + err.Error())
+					return
+				}
+
+				resolve.Invoke(js.Global().Get("JSON").Call("parse", string(raw)))
+			}()
+
+			return nil
+		}))
+	}))
+
+	js.Global().Set("openDerivativePosition", js.FuncOf(func(this js.Value, args []js.Value) any {
+		promiseCtor := js.Global().Get("Promise")
+
+		return promiseCtor.New(js.FuncOf(func(this js.Value, prArgs []js.Value) any {
+			resolve := prArgs[0]
+			reject := prArgs[1]
+
+			go func() {
+				if !started {
+					reject.Invoke("not started")
+					return
+				}
+				if !DerivativesEnabled {
+					reject.Invoke("derivatives are unavailable")
+					return
+				}
+
+				if len(args) < 4 {
+					reject.Invoke("wrong number of arguments")
+					return
+				}
+
+				symbol := args[0].String()
+				side := strings.ToLower(strings.TrimSpace(args[1].String()))
+				leverage := args[2].Int()
+				amount := args[3].String()
+				typ := "market"
+				price := ""
+				if len(args) > 4 && args[4].Type() == js.TypeString && strings.TrimSpace(args[4].String()) != "" {
+					typ = strings.ToLower(strings.TrimSpace(args[4].String()))
+				}
+				if len(args) > 5 && args[5].Type() == js.TypeString {
+					price = strings.TrimSpace(args[5].String())
+				}
+
+				if side != "long" && side != "short" {
+					reject.Invoke("side should be long or short")
+					return
+				}
+				if leverage <= 0 {
+					reject.Invoke("leverage should be positive")
+					return
+				}
+				if typ != "market" && typ != "limit" {
+					reject.Invoke("type should be market or limit")
+					return
+				}
+				if typ == "limit" && price == "" {
+					reject.Invoke("limit order requires price")
+					return
+				}
+
+				ch, err := getPrimaryChanel(sPub)
+				if err != nil {
+					reject.Invoke("failed to get primary channel: " + err.Error())
+					return
+				}
+
+				id, err := tonpayments.NewDerivativesService(Service).OpenPosition(context.Background(), ch.Our.Address, symbol, side, leverage, amount, typ, price)
+				if err != nil {
+					reject.Invoke("failed to open derivative position: " + err.Error())
+					return
+				}
+
+				resolve.Invoke(id)
+			}()
+
+			return nil
+		}))
+	}))
+
+	js.Global().Set("closeDerivativePosition", js.FuncOf(func(this js.Value, args []js.Value) any {
+		promiseCtor := js.Global().Get("Promise")
+
+		return promiseCtor.New(js.FuncOf(func(this js.Value, prArgs []js.Value) any {
+			resolve := prArgs[0]
+			reject := prArgs[1]
+
+			go func() {
+				if !started {
+					reject.Invoke("not started")
+					return
+				}
+				if !DerivativesEnabled {
+					reject.Invoke("derivatives are unavailable")
+					return
+				}
+
+				if len(args) < 1 {
+					reject.Invoke("wrong number of arguments")
+					return
+				}
+
+				positionIdentifier := strings.TrimSpace(args[0].String())
+				typ := "market"
+				if len(args) > 1 && args[1].Type() == js.TypeString && strings.TrimSpace(args[1].String()) != "" {
+					typ = strings.ToLower(strings.TrimSpace(args[1].String()))
+				}
+				if positionIdentifier == "" {
+					reject.Invoke("position id or symbol is required")
+					return
+				}
+
+				ch, err := getPrimaryChanel(sPub)
+				if err != nil {
+					reject.Invoke("failed to get primary channel: " + err.Error())
+					return
+				}
+
+				if err = tonpayments.NewDerivativesService(Service).ClosePosition(context.Background(), ch.Our.Address, positionIdentifier, typ); err != nil {
+					reject.Invoke("failed to close derivative position: " + err.Error())
+					return
+				}
+
+				resolve.Invoke(js.Null())
 			}()
 
 			return nil
@@ -669,6 +927,13 @@ func start(peerKey, channelKey []byte) {
 		panic(err)
 	}
 
+	if err = initWebDerivativesResolvers(peerKey); err != nil {
+		DerivativesEnabled = false
+		log.Warn().Err(err).Msg("failed to initialize derivatives price resolvers for web")
+	} else {
+		DerivativesEnabled = true
+	}
+
 	idb, freshDb, err := browser.NewIndexedDB(userId + ".v2")
 	if err != nil {
 		panic(err.Error())
@@ -890,4 +1155,26 @@ func mapConvert(m map[string]string) map[string]any {
 		res[k] = v
 	}
 	return res
+}
+
+func initWebDerivativesResolvers(peerKey ed25519.PublicKey) error {
+	proofKey := oracle.BinanceProofPublicKey()
+
+	pairs := []struct {
+		symbol string
+		ids    []uint32
+	}{
+		{"BTCUSDT", []uint32{oracle.GetResolverID("binance", "BTCUSDT"), 2}},
+		{"TONUSDT", []uint32{oracle.GetResolverID("binance", "TONUSDT"), 1}},
+	}
+
+	for _, pair := range pairs {
+		provider := oracle.NewWebProvider(pair.symbol, proofKey)
+		resolver := oracle.NewResolver(provider)
+		for _, id := range pair.ids {
+			oracle.PriceResolvers[id] = resolver
+		}
+	}
+
+	return nil
 }

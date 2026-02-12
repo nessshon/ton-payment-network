@@ -763,13 +763,71 @@ func (s *Service) CloseDerivative(ctx context.Context, virtualKey ed25519.Public
 
 		till := cond.GetDeadline()
 
-		log.Debug().Str("key", base64.StdEncoding.EncodeToString(meta.Key)).
+		// For derivatives, the close-conditional worker requires meta.Incoming != nil.
+		// The outgoing meta only has Outgoing, so we must create the task for the
+		// linked incoming key instead.
+		taskKey := meta.Key
+		if len(meta.Outgoing.LinkedKey) == ed25519.PublicKeySize {
+			linkedMeta, lErr := s.db.GetVirtualChannelMeta(ctx, meta.Outgoing.LinkedKey)
+			if lErr != nil {
+				return fmt.Errorf("failed to load linked incoming meta: %w", lErr)
+			}
+
+			// Propagate resolve to the incoming meta.
+			// If outgoing settle is already > 0 (our loss), incoming settle is
+			// deterministically 0 and does not require oracle access.
+			if meta.LastKnownResolve != nil {
+				var outResolve conditionals.ResolvableState
+				if rErr := payments.LoadState(&outResolve, meta.LastKnownResolve); rErr != nil {
+					return fmt.Errorf("failed to parse outgoing derivative resolve: %w", rErr)
+				}
+
+				if outResolve.Amount.Sign() > 0 {
+					zeroIncoming, zErr := tlb.ToCell(conditionals.ResolvableState{
+						Key:    linkedMeta.Key,
+						Amount: big.NewInt(0),
+						At:     outResolve.At,
+					})
+					if zErr != nil {
+						return fmt.Errorf("failed to build incoming zero resolve: %w", zErr)
+					}
+					linkedMeta.LastKnownResolve = zeroIncoming
+				}
+			}
+
+			if linkedMeta.LastKnownResolve == nil && meta.LastKnownResolve != nil {
+				if res, ok := cond.(*conditionals.ConditionalResolvable); ok {
+					incomingResolve, rErr := s.buildIncomingDerivativeResolve(res, linkedMeta.Key)
+					if rErr != nil {
+						return fmt.Errorf("failed to build incoming derivative resolve: %w", rErr)
+					} else {
+						linkedMeta.LastKnownResolve = incomingResolve
+					}
+				} else {
+					return fmt.Errorf("conditional is not derivative resolvable")
+				}
+			}
+
+			if linkedMeta.LastKnownResolve == nil {
+				return fmt.Errorf("linked incoming resolve is not set")
+			}
+
+			linkedMeta.Status = db.ConditionalStateWantClose
+			linkedMeta.UpdatedAt = time.Now()
+			if lErr = s.db.UpdateVirtualChannelMeta(ctx, linkedMeta); lErr != nil {
+				return fmt.Errorf("failed to update linked incoming meta: %w", lErr)
+			}
+
+			taskKey = linkedMeta.Key
+		}
+
+		log.Debug().Str("key", base64.StdEncoding.EncodeToString(taskKey)).
 			Msg("creating task to close conditional")
 
 		if err = s.db.CreateTask(ctx, PaymentsTaskPool, "close-conditional", ch.Our.Address+"-deriv-close",
 			"close-conditional-"+ch.Our.Address+"-vc-"+base64.StdEncoding.EncodeToString(condId),
 			db.CloseConditionalTask{
-				VirtualKey: meta.Key,
+				VirtualKey: taskKey,
 			}, nil, &till,
 		); err != nil {
 			return fmt.Errorf("failed to create close conditional task: %w", err)
@@ -1483,6 +1541,7 @@ func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr str
 
 	var condMessages []*cell.Cell
 	var resolved int
+	var pending int
 
 	addMessage := func(data *payments.SettleMsg, condProofPath, actProofPath *cell.ProofSkeleton) error {
 		condDictProof, err := channel.Their.Data.Conditionals.AsCell().CreateProof(condProofPath)
@@ -1525,6 +1584,7 @@ func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr str
 			// executed
 			continue
 		}
+		pending++
 		key := kv.Key.MustToCell()
 
 		vch, err := payments.CodeToConditional(ctx, kv.Value.MustToCell(), s)
@@ -1601,11 +1661,8 @@ func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr str
 		}
 	}
 
-	if resolved != len(all) {
-		log.Warn().
-			Int("with_resolves", resolved).
-			Int("all", len(all)).
-			Msg("not all conditions has resolves yet, settling as is")
+	if resolved != pending {
+		return fmt.Errorf("cannot settle conditionals partially: resolved=%d pending=%d", resolved, pending)
 	}
 
 	expectedActionsHash := updatedActions.AsCell().Hash()
@@ -1765,16 +1822,20 @@ func (s *Service) settleChannelActions(ctx context.Context, channelAddr string) 
 		messages = append(messages, msgCell)
 	}
 
-	if len(messages) == 0 {
+	pendingActions := 0
+	for _, kv := range allTheir {
+		if kv.Value.RefsNum() == 0 && kv.Value.BitsLeft() == 0 {
+			continue
+		}
+		pendingActions++
+	}
+	if pendingActions == 0 {
 		log.Warn().Msg("nothing to commit")
 		return nil
 	}
 
-	if len(messages) != len(allTheir) {
-		log.Warn().
-			Int("resolved", len(messages)).
-			Int("all", len(allTheir)).
-			Msg("not all actions has resolves yet, settling as is")
+	if len(messages) != pendingActions {
+		return fmt.Errorf("cannot settle actions partially: resolved=%d pending=%d", len(messages), pendingActions)
 	}
 
 	log.Info().Str("address", channel.Our.Address).Int("steps", len(messages)).Msg("calculated settle action steps")

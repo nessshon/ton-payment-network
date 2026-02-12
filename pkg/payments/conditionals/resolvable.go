@@ -6,16 +6,19 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"math/big"
+	"time"
+
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
+	condcontracts "github.com/xssnick/ton-payment-network/pkg/payments/conditionals/contracts"
 	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals/oracle"
 	"github.com/xssnick/ton-payment-network/pkg/payments/vm"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
-	"math/big"
-	"time"
 )
 
 func init() {
@@ -23,6 +26,8 @@ func init() {
 		return &ConditionalResolvable{}
 	}
 }
+
+const maxSupportedLeverage = uint16(20)
 
 type ConditionalResolvableDetails struct {
 	AssetID    uint32        `tlb:"## 32"`
@@ -41,8 +46,12 @@ type ConditionalResolvable struct {
 	Action        payments.Action
 }
 
+const derivativeResolveAcceptanceWindowSec int64 = 10
+
 type PriceResolver interface {
 	GetPriceAt(ctx context.Context, at int64) (*big.Int, error)
+	GetLastPrice() (int64, *big.Int, error)
+	GetPricesSince(from int64) []oracle.RangePrice
 }
 
 type ConditionalResolvableInstructionDetails struct {
@@ -198,6 +207,10 @@ func (c *ConditionalResolvable) ValidateOnAdd() error {
 		return fmt.Errorf("invalid amount")
 	}
 
+	if c.Details.Leverage == 0 || c.Details.Leverage > maxSupportedLeverage {
+		return fmt.Errorf("unsupported leverage: %d (max %d)", c.Details.Leverage, maxSupportedLeverage)
+	}
+
 	// TODO: check resolver addr match
 	return nil
 }
@@ -220,6 +233,21 @@ func (c *ConditionalResolvable) ValidateState(ctx context.Context, oldState, new
 		return fmt.Errorf("incorrect key")
 	}
 
+	latestAt, _, err := c.PriceResolver.GetLastPrice()
+	if err != nil || latestAt <= 0 {
+		return fmt.Errorf("price resolver is not ready, cannot validate state")
+	}
+	if state.At > latestAt+2 {
+		return fmt.Errorf("state timestamp is too far in the future")
+	}
+	if latestAt-state.At > derivativeResolveAcceptanceWindowSec {
+		return fmt.Errorf("state timestamp is too old")
+	}
+
+	if state.Amount.Sign() < 0 {
+		return fmt.Errorf("amount cannot be negative")
+	}
+
 	price, err := c.PriceResolver.GetPriceAt(ctx, state.At)
 	if err != nil {
 		return fmt.Errorf("failed to get price: %w", err)
@@ -230,7 +258,7 @@ func (c *ConditionalResolvable) ValidateState(ctx context.Context, oldState, new
 		return fmt.Errorf("invalid entry price")
 	}
 
-	// Calculate current ROI amount: amount * leverage * max(0, signed_delta) / entryPrice
+	// Calculate current ROI amount: amount * leverage * signed_delta / entryPrice
 	// signed_delta = (price - entryPrice) for long, (entryPrice - price) for short
 	var delta *big.Int
 	if c.Details.IsLong {
@@ -244,8 +272,24 @@ func (c *ConditionalResolvable) ValidateState(ctx context.Context, oldState, new
 	num.Mul(num, big.NewInt(int64(c.Details.Leverage)))
 	roi := new(big.Int).Div(num, entryPrice)
 
-	if state.Amount.Cmp(roi) > 0 {
-		return fmt.Errorf("incorrect amount")
+	// In the zero-sum derivative model:
+	// - When roi > 0 (this conditional profits): Amount must be 0,
+	//   payment is received via the linked conditional.
+	// - When roi <= 0 (this conditional loses): Amount must equal |roi|
+	//   (capped at collateral), representing the loss payment.
+	expectedAmount := new(big.Int)
+	if roi.Sign() <= 0 {
+		expectedAmount.Abs(roi)
+		if c.Amount != nil && c.Amount.Sign() > 0 && expectedAmount.Cmp(c.Amount) > 0 {
+			expectedAmount.Set(c.Amount)
+		}
+	}
+
+	// Allow ±1 tolerance for integer division rounding.
+	diff := new(big.Int).Sub(state.Amount, expectedAmount)
+	diff.Abs(diff)
+	if diff.Cmp(big.NewInt(1)) > 0 {
+		return fmt.Errorf("incorrect amount: expected %s, got %s", expectedAmount, state.Amount)
 	}
 
 	return nil
@@ -262,7 +306,7 @@ func (c *ConditionalResolvable) EmulateBalance(balances map[string]*payments.Bal
 		return fmt.Errorf("price resolver for asset %d is not configured", c.Details.AssetID)
 	}
 
-	price, err := c.PriceResolver.GetPriceAt(context.Background(), time.Now().Unix())
+	price, err := c.getBestEffortCurrentPrice()
 	if err != nil {
 		return fmt.Errorf("failed to get price: %w", err)
 	}
@@ -300,6 +344,40 @@ func (c *ConditionalResolvable) EmulateBalance(balances map[string]*payments.Bal
 	return nil
 }
 
+func (c *ConditionalResolvable) getBestEffortCurrentPrice() (*big.Int, error) {
+	now := time.Now().Unix()
+	var lastErr error
+
+	// Try current and a few previous seconds to avoid transient `ErrTooNew`
+	// during boundary races around resolver updates.
+	for back := int64(0); back <= 3; back++ {
+		price, err := c.PriceResolver.GetPriceAt(context.Background(), now-back)
+		if err == nil && price != nil {
+			return price, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+		if err != nil && !errors.Is(err, oracle.ErrTooNew) && !errors.Is(err, oracle.ErrUnavailable) && !errors.Is(err, oracle.ErrNoData) {
+			break
+		}
+	}
+
+	// Fallback to the latest known sample.
+	_, price, err := c.PriceResolver.GetLastPrice()
+	if err == nil && price != nil {
+		return price, nil
+	}
+	if err != nil {
+		lastErr = err
+	}
+
+	if lastErr == nil {
+		lastErr = oracle.ErrNoData
+	}
+	return nil, lastErr
+}
+
 func (c *ConditionalResolvable) Commit(updated payments.Conditional, actState *cell.Cell) (*cell.Cell, error) {
 	return nil, fmt.Errorf("derivative conditionals cannot be committed")
 }
@@ -326,7 +404,29 @@ func (c *ConditionalResolvable) CheckInstruction(detailsCell *cell.Cell, isFinal
 		return err
 	}
 
-	// TODO: check resolver contract
+	if len(details.ResolverContractCodeHash) != 32 {
+		return fmt.Errorf("incorrect resolver contract code hash length")
+	}
+	if details.ResolverContractData == nil {
+		return fmt.Errorf("missing resolver contract data")
+	}
+
+	stateInit, err := condcontracts.BuildDerivativeStateInit(details.ResolverContractData)
+	if err != nil {
+		return fmt.Errorf("failed to build resolver state init: %w", err)
+	}
+
+	if !bytes.Equal(stateInit.Code.Hash(), details.ResolverContractCodeHash) {
+		return fmt.Errorf("incorrect resolver contract code hash")
+	}
+
+	resolverAddr, err := condcontracts.CalcDerivativeAddress(stateInit)
+	if err != nil {
+		return fmt.Errorf("failed to calc resolver address: %w", err)
+	}
+	if c.ResolverAddr == nil || !resolverAddr.Equals(c.ResolverAddr) {
+		return fmt.Errorf("resolver address mismatch")
+	}
 
 	return nil
 }

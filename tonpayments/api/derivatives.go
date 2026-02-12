@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -19,11 +20,19 @@ type openReq struct {
 
 type closeReq struct {
 	Channel string `json:"channel"`
+	ID      string `json:"id"`
 	Symbol  string `json:"symbol"`
 	Type    string `json:"type"`
 }
 
+const maxDerivativesRequestBodyBytes = 16 * 1024
+
 func (s *Server) handleDerivativesPosition(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
+
 	q := r.URL.Query()
 	channel := q.Get("channel")
 	symbol := q.Get("symbol")
@@ -40,9 +49,33 @@ func (s *Server) handleDerivativesPosition(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleDerivativesOpen(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
+	if r.Method != http.MethodPost {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxDerivativesRequestBodyBytes+1))
+	if err != nil {
+		writeErr(w, 400, "failed to read request body")
+		return
+	}
+	if len(body) > maxDerivativesRequestBodyBytes {
+		writeErr(w, 413, "request body too large")
+		return
+	}
+
 	var req openReq
-	_ = json.Unmarshal(body, &req)
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err = dec.Decode(&req); err != nil {
+		writeErr(w, 400, "invalid json")
+		return
+	}
+	if err = dec.Decode(&struct{}{}); err != io.EOF {
+		writeErr(w, 400, "invalid json")
+		return
+	}
+
 	if req.Channel == "" || req.Symbol == "" || req.Side == "" || req.Leverage <= 0 || req.Type == "" || req.Amount == "" {
 		writeErr(w, 400, "channel, symbol, side, leverage, amount, type required")
 		return
@@ -65,14 +98,43 @@ func (s *Server) handleDerivativesOpen(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDerivativesClose(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
-	var req closeReq
-	_ = json.Unmarshal(body, &req)
-	if req.Channel == "" || req.Symbol == "" || req.Type == "" {
-		writeErr(w, 400, "channel, symbol, type required")
+	if r.Method != http.MethodPost {
+		writeErr(w, 405, "method not allowed")
 		return
 	}
-	if err := s.deriv.ClosePosition(r.Context(), req.Channel, req.Symbol, req.Type); err != nil {
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxDerivativesRequestBodyBytes+1))
+	if err != nil {
+		writeErr(w, 400, "failed to read request body")
+		return
+	}
+	if len(body) > maxDerivativesRequestBodyBytes {
+		writeErr(w, 413, "request body too large")
+		return
+	}
+
+	var req closeReq
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err = dec.Decode(&req); err != nil {
+		writeErr(w, 400, "invalid json")
+		return
+	}
+	if err = dec.Decode(&struct{}{}); err != io.EOF {
+		writeErr(w, 400, "invalid json")
+		return
+	}
+
+	identifier := req.ID
+	if identifier == "" {
+		identifier = req.Symbol
+	}
+
+	if req.Channel == "" || identifier == "" || req.Type == "" {
+		writeErr(w, 400, "channel, id|symbol, type required")
+		return
+	}
+	if err = s.deriv.ClosePosition(r.Context(), req.Channel, identifier, req.Type); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}

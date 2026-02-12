@@ -9,3 +9,4 @@ build
 *.gz
 *.br
 ./test
+.gocache

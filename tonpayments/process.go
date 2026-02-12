@@ -171,6 +171,12 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 			return nil, fmt.Errorf("failed to load virtual channel meta: %w", err)
 		}
 
+		if _, ok := vchOut.(*conditionals.ConditionalResolvable); ok {
+			if err = s.ensureDerivativeRemovable(ctx, meta); err != nil {
+				return nil, fmt.Errorf("failed to remove derivative conditional: %w", err)
+			}
+		}
+
 		if meta.Outgoing != nil && len(meta.Outgoing.LinkedKey) > 0 {
 			linkedMeta, err := s.db.GetVirtualChannelMeta(ctx, meta.Outgoing.LinkedKey)
 			if err != nil {
@@ -260,37 +266,68 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 			return nil, fmt.Errorf("failed to load action state (out): %w", err)
 		}
 
-		newActStateOut, err := condOut.Execute(actStateOut.MustToCell(), data.State, channel.Our.LockedDeposits)
-		if err != nil {
-			return nil, fmt.Errorf("failed to execute condition: %w", err)
+		var st conditionals.ResolvableState
+		if err = payments.LoadState(&st, data.State); err != nil {
+			return nil, fmt.Errorf("failed to load resolve state: %w", err)
+		}
+
+		newActStateOut := actStateOut.MustToCell()
+		if st.Amount.Sign() > 0 {
+			newActStateOut, err = condOut.Execute(actStateOut.MustToCell(), data.State, channel.Our.LockedDeposits)
+			if err != nil {
+				return nil, fmt.Errorf("failed to execute condition: %w", err)
+			}
+
+			if err = channel.Our.Data.ActionStates.Set(actIdOut, newActStateOut); err != nil {
+				return nil, fmt.Errorf("failed to set action state (out): %w", err)
+			}
 		}
 
 		// Execute Their Linked (if exists)
 		if condIn != nil {
-			actIdIn := condIn.GetAction().IDCell()
-			actStateIn, err := channel.Their.Data.ActionStates.LoadValue(actIdIn)
-			if err != nil {
-				return nil, fmt.Errorf("failed to load action state (in): %w", err)
-			}
-
-			linkedState := data.State
-			if _, ok := condIn.(*conditionals.ConditionalResolvable); ok {
-				linkedState, err = remapDerivativeStateKey(data.State, condIn.GetKey())
+			if linkedResolvable, ok := condIn.(*conditionals.ConditionalResolvable); ok {
+				// Derivative: only execute the linked side if its settle > 0
+				linkedResolve, err := computeLinkedDerivativeSettle(ctx, data.State, linkedResolvable)
 				if err != nil {
-					return nil, fmt.Errorf("failed to remap linked derivative state: %w", err)
+					return nil, fmt.Errorf("failed to compute linked derivative settle: %w", err)
 				}
-			}
 
-			newActStateIn, err := condIn.Execute(actStateIn.MustToCell(), linkedState, channel.Their.LockedDeposits)
-			if err != nil {
-				return nil, fmt.Errorf("failed to execute linked condition: %w", err)
+				if linkedResolve != nil {
+					actIdIn := condIn.GetAction().IDCell()
+					actStateIn, err := channel.Their.Data.ActionStates.LoadValue(actIdIn)
+					if err != nil {
+						return nil, fmt.Errorf("failed to load action state (in): %w", err)
+					}
+
+					newActStateIn, err := condIn.Execute(actStateIn.MustToCell(), linkedResolve, channel.Their.LockedDeposits)
+					if err != nil {
+						return nil, fmt.Errorf("failed to execute linked condition: %w", err)
+					}
+
+					if err = channel.Their.Data.ActionStates.Set(actIdIn, newActStateIn); err != nil {
+						return nil, fmt.Errorf("failed to set action state (in): %w", err)
+					}
+				}
+			} else {
+				// Non-derivative linked conditional: execute with same state
+				actIdIn := condIn.GetAction().IDCell()
+				actStateIn, err := channel.Their.Data.ActionStates.LoadValue(actIdIn)
+				if err != nil {
+					return nil, fmt.Errorf("failed to load action state (in): %w", err)
+				}
+
+				newActStateIn, err := condIn.Execute(actStateIn.MustToCell(), data.State, channel.Their.LockedDeposits)
+				if err != nil {
+					return nil, fmt.Errorf("failed to execute linked condition: %w", err)
+				}
+
+				if err = channel.Their.Data.ActionStates.Set(actIdIn, newActStateIn); err != nil {
+					return nil, fmt.Errorf("failed to set action state (in): %w", err)
+				}
 			}
 
 			if err = channel.Their.Data.Conditionals.Delete(idxIn); err != nil {
 				return nil, fmt.Errorf("failed to remove condition (in): %w", err)
-			}
-			if err = channel.Their.Data.ActionStates.Set(actIdIn, newActStateIn); err != nil {
-				return nil, fmt.Errorf("failed to set action state (in): %w", err)
 			}
 		}
 
@@ -532,14 +569,13 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 						SenderKey:             data.InstructionKey,
 						LinkedKey:             linkedCond.GetKey(),
 					},
-					Any:       res.Details,
-					CreatedAt: time.Now(),
-					UpdatedAt: time.Now(),
+					SpecialDetails: buildDerivativeMetaAny(res.Details, currentInstruction.Details),
+					CreatedAt:      time.Now(),
+					UpdatedAt:      time.Now(),
 				}
 
-				if err = removeAfterTimeout(ctx); err != nil {
-					return err
-				}
+				// Derivatives have no real deadline (year 3000); skip removeAfterTimeout.
+				// Positions are closed via explicit ClosePosition or liquidation worker.
 
 				if err = s.db.CreateVirtualChannelMeta(ctx, meta); err != nil {
 					return fmt.Errorf("failed to create virtual channel meta: %w", err)
@@ -556,9 +592,9 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 						SenderKey:             data.InstructionKey,
 						LinkedKey:             cond.GetKey(),
 					},
-					Any:       linkedCond.Details,
-					CreatedAt: time.Now(),
-					UpdatedAt: time.Now(),
+					SpecialDetails: buildDerivativeMetaAny(linkedCond.Details, currentInstruction.Details),
+					CreatedAt:      time.Now(),
+					UpdatedAt:      time.Now(),
 				}
 
 				if err = s.db.CreateVirtualChannelMeta(ctx, metaReciprocal); err != nil {

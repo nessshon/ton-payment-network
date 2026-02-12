@@ -108,7 +108,7 @@ type ConditionalMeta struct {
 	Outgoing         *ConditionalMetaSide
 	LastKnownResolve *cell.Cell
 	FinalDestination ed25519.PublicKey // known only to the first initiator
-	Any              any
+	SpecialDetails   any
 
 	CreatedAt time.Time
 	UpdatedAt time.Time

@@ -1,6 +1,7 @@
 package tonpayments
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
@@ -72,9 +73,14 @@ func (s *Service) buildLinkedDerivativeConditional(base *conditionals.Conditiona
 	details := base.Details
 	details.IsLong = !details.IsLong
 
+	linkedAmount := big.NewInt(0)
+	if base.Amount != nil {
+		linkedAmount = new(big.Int).Set(base.Amount)
+	}
+
 	return &conditionals.ConditionalResolvable{
 		Key:           derivativeLinkedKey(base.GetKey()),
-		Amount:        big.NewInt(0), // reciprocal side has no hard cap
+		Amount:        linkedAmount,
 		ResolverAddr:  base.ResolverAddr,
 		Details:       details,
 		PriceResolver: base.PriceResolver,
@@ -117,16 +123,62 @@ func ensureActionStateOnSide(side *db.Side, act payments.Action) (bool, error) {
 	return true, nil
 }
 
-func remapDerivativeStateKey(state *cell.Cell, key []byte) (*cell.Cell, error) {
-	var st conditionals.ResolvableState
-	if err := payments.LoadState(&st, state); err != nil {
-		return nil, fmt.Errorf("failed to parse derivative resolve state: %w", err)
+// computeLinkedDerivativeSettle computes the resolve state for the linked
+// (inverse) derivative conditional. Because derivative PnL is zero-sum,
+// exactly one side has a positive settle and the other is 0.
+// Returns nil when the linked settle is 0 (the linked conditional should
+// just be deleted without execution).
+func computeLinkedDerivativeSettle(ctx context.Context, primaryResolve *cell.Cell, linked *conditionals.ConditionalResolvable) (*cell.Cell, error) {
+	var primaryState conditionals.ResolvableState
+	if err := payments.LoadState(&primaryState, primaryResolve); err != nil {
+		return nil, fmt.Errorf("failed to parse primary resolve state: %w", err)
 	}
 
-	st.Key = key
-	mapped, err := tlb.ToCell(st)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize derivative resolve state: %w", err)
+	// Zero-sum: if primary settle > 0, linked settle is always 0.
+	if primaryState.Amount.Sign() > 0 {
+		return nil, nil
 	}
-	return mapped, nil
+
+	// Primary settle == 0 -> linked side may need to pay the loss.
+	if linked.PriceResolver == nil {
+		return nil, fmt.Errorf("no price resolver for linked asset %d", linked.Details.AssetID)
+	}
+
+	price, err := linked.PriceResolver.GetPriceAt(ctx, primaryState.At)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get price at %d: %w", primaryState.At, err)
+	}
+
+	entryPrice := linked.Details.EntryPrice.Nano()
+	if entryPrice == nil || entryPrice.Sign() <= 0 {
+		return nil, fmt.Errorf("invalid linked entry price")
+	}
+
+	var delta *big.Int
+	if linked.Details.IsLong {
+		delta = new(big.Int).Sub(price, entryPrice)
+	} else {
+		delta = new(big.Int).Sub(entryPrice, price)
+	}
+
+	positionSize := new(big.Int).Mul(linked.Amount, big.NewInt(int64(linked.Details.Leverage)))
+	pnl := new(big.Int).Mul(positionSize, delta)
+	pnl.Div(pnl, entryPrice)
+
+	if pnl.Sign() >= 0 {
+		// Linked side has no loss to pay.
+		return nil, nil
+	}
+
+	settle := new(big.Int).Abs(pnl)
+	if linked.Amount.Sign() > 0 && settle.Cmp(linked.Amount) > 0 {
+		settle.Set(linked.Amount) // cap at collateral
+	}
+
+	st := conditionals.ResolvableState{
+		Key:    linked.Key,
+		Amount: settle,
+		At:     primaryState.At,
+	}
+	return tlb.ToCell(st)
 }
