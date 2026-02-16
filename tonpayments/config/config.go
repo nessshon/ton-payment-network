@@ -17,6 +17,7 @@ type VirtualConfig struct {
 	ProxyMaxCapacity            string
 	ProxyMinFee                 string
 	ProxyFeePercent             float64
+	DerivativeFeePercent        float64
 	AllowTunneling              bool
 }
 
@@ -138,6 +139,7 @@ func Generate() (*Config, error) {
 						ProxyMaxCapacity:            "5",
 						ProxyMinFee:                 "0.0005",
 						ProxyFeePercent:             0.5,
+						DerivativeFeePercent:        0.5,
 						AllowTunneling:              true,
 					},
 					Symbol:                "TON",
@@ -160,6 +162,7 @@ func Generate() (*Config, error) {
 							ProxyMaxCapacity:            "15.5",
 							ProxyMinFee:                 "0.002",
 							ProxyFeePercent:             0.8,
+							DerivativeFeePercent:        0.5,
 							AllowTunneling:              false,
 						},
 						Symbol:                "USDT",

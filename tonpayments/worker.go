@@ -589,7 +589,12 @@ func (s *Service) taskExecutor() {
 						return nil
 					}
 
-					channel, lockId, unlock, err := s.AcquireChannel(ctx, meta.Outgoing.ChannelAddress)
+					channelAddr := meta.Incoming.ChannelAddress
+					if meta.Outgoing != nil && meta.Outgoing.ChannelAddress != "" {
+						channelAddr = meta.Outgoing.ChannelAddress
+					}
+
+					channel, lockId, unlock, err := s.AcquireChannel(ctx, channelAddr)
 					if err != nil {
 						return fmt.Errorf("failed to acquire channel: %w", err)
 					}
@@ -612,7 +617,7 @@ func (s *Service) taskExecutor() {
 
 							// Creating aggressive onchain close task, for the future,
 							// in case we will not be able to communicate with party
-							if err = s.db.CreateTask(ctx, PaymentsTaskPool, "uncooperative-close", meta.Incoming.ChannelAddress+"-uncoop",
+							if err := s.db.CreateTask(ctx, PaymentsTaskPool, "uncooperative-close", meta.Incoming.ChannelAddress+"-uncoop",
 								"uncooperative-close-"+meta.Incoming.ChannelAddress+"-vc-"+base64.StdEncoding.EncodeToString(id),
 								db.ChannelUncooperativeCloseTask{
 									Address:              meta.Incoming.ChannelAddress,
@@ -624,9 +629,7 @@ func (s *Service) taskExecutor() {
 						}
 
 						if errors.Is(err, ErrNotPossible) || errors.Is(err, ErrDenied) {
-							// we don't have this channel or they don't
 							log.Warn().Err(err).Msg("it is not possible to remove virtual channel")
-							return nil
 						}
 						return fmt.Errorf("failed to propose remove virtual action: %w", err)
 					}

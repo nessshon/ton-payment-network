@@ -3,6 +3,7 @@ package tonpayments
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -181,8 +182,53 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			return nil, nil, fmt.Errorf("failed to load virtual channel meta: %w", err)
 		}
 
+		if _, ok := vch.(*conditionals.ConditionalResolvable); ok {
+			if err = s.ensureDerivativeRemovable(ctx, meta); err != nil {
+				return nil, nil, fmt.Errorf("failed to remove derivative conditional: %w", err)
+			}
+		}
+
+		var linkedIdx *cell.Cell
+		var linkedKey ed25519.PublicKey
+		if meta.Incoming != nil && len(meta.Incoming.LinkedKey) > 0 {
+			linkedKey = meta.Incoming.LinkedKey
+		} else if meta.Outgoing != nil && len(meta.Outgoing.LinkedKey) > 0 {
+			linkedKey = meta.Outgoing.LinkedKey
+		}
+
+		if len(linkedKey) > 0 {
+			linkedMeta, err := s.db.GetVirtualChannelMeta(ctx, linkedKey)
+			if err != nil && !errors.Is(err, db.ErrNotFound) {
+				return nil, nil, fmt.Errorf("failed to load linked virtual channel meta: %w", err)
+			}
+
+			if err == nil {
+				var linkedHash []byte
+				if linkedMeta.Outgoing != nil {
+					linkedHash = linkedMeta.Outgoing.Conditional.Hash()
+				} else if linkedMeta.Incoming != nil {
+					linkedHash = linkedMeta.Incoming.Conditional.Hash()
+				}
+
+				if len(linkedHash) > 0 {
+					linkedIdx, _, err = payments.FindConditional(ctx, channel.Our.Data.Conditionals, linkedHash, s)
+					if err != nil && !errors.Is(err, payments.ErrNotFound) {
+						return nil, nil, fmt.Errorf("failed to find linked conditional: %w", err)
+					}
+					if errors.Is(err, payments.ErrNotFound) {
+						linkedIdx = nil
+					}
+				}
+			}
+		}
+
 		if err = channel.Their.Data.Conditionals.Delete(idx); err != nil {
 			return nil, nil, err
+		}
+		if linkedIdx != nil {
+			if err = channel.Our.Data.Conditionals.Delete(linkedIdx); err != nil {
+				return nil, nil, fmt.Errorf("failed to remove linked condition: %w", err)
+			}
 		}
 
 		onSuccess = func(_ context.Context) error {
@@ -193,7 +239,7 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			}
 
 			log.Info().Fields(vch.GetLogInfo()).
-				Msg("their conditional successfully removed")
+				Msg("their conditional successfully removed (and linked if present)")
 			return nil
 		}
 	case transport.ExecuteConditionalAction:

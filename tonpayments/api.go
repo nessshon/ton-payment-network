@@ -276,15 +276,22 @@ func (s *Service) CreateSendConditional(ctx context.Context, instructionKey ed25
 	return nil
 }
 
-func (s *Service) CreateDerivativeCond(ctx context.Context, instructionKey ed25519.PublicKey, private ed25519.PrivateKey, firstPart transport.TunnelChainPart, instruction transport.AddConditionalInstruction, cc *payments.CoinConfig, amount *big.Int,
+func (s *Service) CreateDerivativeCond(ctx context.Context, instructionKey ed25519.PublicKey, private ed25519.PrivateKey, firstPart transport.TunnelChainPart, instruction transport.AddConditionalInstruction, cc *payments.CoinConfig,
+	amount, fee *big.Int,
 	details conditionals.ConditionalResolvableDetails, resolverAddr *address.Address) error {
+	if amount == nil || amount.Sign() <= 0 {
+		return fmt.Errorf("invalid derivative amount")
+	}
+	if fee == nil || fee.Sign() < 0 {
+		return fmt.Errorf("invalid derivative fee")
+	}
 
 	channels, err := s.db.GetChannels(ctx, firstPart.Target, db.ChannelStateActive)
 	if err != nil {
 		return fmt.Errorf("failed to get active channels: %w", err)
 	}
 
-	needAmount := new(big.Int).Add(firstPart.Fee, amount)
+	needAmount := new(big.Int).Add(amount, fee)
 	var channel *db.Channel
 	for _, ch := range channels {
 		balances, err := ch.CalcBalance(ctx, false, s)
@@ -316,6 +323,8 @@ func (s *Service) CreateDerivativeCond(ctx context.Context, instructionKey ed255
 	condRes := conditionals.ConditionalResolvable{
 		Key:          private.Public().(ed25519.PublicKey),
 		Amount:       amount,
+		Fee:          fee,
+		IsInitiator:  true,
 		ResolverAddr: resolverAddr,
 		Details:      details,
 		Action:       act,

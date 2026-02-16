@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
 import { TonConnectButton, useTonAddress, useTonConnectUI, useTonWallet } from "@tonconnect/ui-react";
 
@@ -6,8 +6,7 @@ import { Send, ArrowDown, ArrowUp, RefreshCw, Copy, PlusCircle, MinusCircle, Act
 import { Card, CardContent } from "./components/ui/card";
 import { Input } from "./components/ui/input";
 import { Button } from "./components/ui/button";
-import { DerivativesPosition, DerivativesQuote, PaymentChannelHistoryItem, PriceHistoryPoint } from "./index";
-import { CHAIN } from "@tonconnect/sdk";
+import { DerivativesPosition, DerivativesQuote, PaymentChannelHistoryItem, PriceHistoryPoint, TxMessage } from "./index";
 
 
 function App() {
@@ -103,22 +102,27 @@ function App() {
     updateDerivativesAvailability();
     const derivativesAvailabilityInterval = window.setInterval(updateDerivativesAvailability, 1000);
 
-    window.doTransaction = async (reason, messages) => {
+    window.doTransaction = async (reason: string, messages: TxMessage[]) => {
       console.log("requested tx: " + reason);
 
-      let list = [];
+      const list: Array<{ address: string; amount: string; payload?: string; stateInit?: string }> = [];
       for (let i = 0; i < messages.length; i++) {
-        list.push({
+        const msg: { address: string; amount: string; payload?: string; stateInit?: string } = {
           address: messages[i].to,
           amount: messages[i].amtNano,
-          stateInit: messages[i].stateInit,
-          payload: messages[i].body,
-        })
+        };
+        if (messages[i].body) {
+          msg.payload = messages[i].body;
+        }
+        if (messages[i].stateInit) {
+          msg.stateInit = messages[i].stateInit;
+        }
+        list.push(msg);
       }
 
       const transaction = {
-        validUntil: Math.floor(Date.now() / 1000) + 90,
-        network: CHAIN.TESTNET,
+        validUntil: Math.floor(Date.now() / 1000) + 300,
+        network: wallet.account.chain,
         messages: list
       }
 
@@ -240,7 +244,8 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
   const [derivativesPositions, setDerivativesPositions] = useState<DerivativesPosition[]>([]);
   const [derivativeQuote, setDerivativeQuote] = useState<DerivativesQuote | null>(null);
   const [derivativesLoading, setDerivativesLoading] = useState(false);
-  const [derivativeActionLoading, setDerivativeActionLoading] = useState<"long" | "short" | "close" | null>(null);
+  const [derivativeActionLoading, setDerivativeActionLoading] = useState<"long" | "short" | "close" | "cancel" | null>(null);
+  const [cancellingDerivativeIds, setCancellingDerivativeIds] = useState<string[]>([]);
   const [derivativeLimitPrice, setDerivativeLimitPrice] = useState("");
   const [derivativeOrderType, setDerivativeOrderType] = useState<"market" | "limit">("market");
   const [priceHistory, setPriceHistory] = useState<PriceHistoryPoint[]>([]);
@@ -249,6 +254,11 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
   const swapPairs = useMemo(() => [{ from: "TON", to: "USDX", coeff: 2 }], []);
   const activeSwapPair = useMemo(() => swapPairs.find(p => p.from === swapFromCurrency && p.to === swapToCurrency) ?? swapPairs[0], [swapPairs, swapFromCurrency, swapToCurrency]);
   const derivativeSymbols = useMemo(() => ["BTCUSDT", "TONUSDT"], []);
+
+  const syncCancellingDerivativeIds = (positions: DerivativesPosition[]) => {
+    const activeIDs = new Set(positions.map((p) => p.id));
+    setCancellingDerivativeIds((prev) => prev.filter((id) => activeIDs.has(id)));
+  };
 
   useEffect(() => {
     if (!availableCurrencies.includes(sendCurrency)) {
@@ -288,7 +298,9 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
         window.getDerivativeMarketPrice(derivativeSymbol),
         window.getDerivativePriceHistory(derivativeSymbol),
       ]).then(([positions, quote, history]) => {
-        setDerivativesPositions(positions ?? []);
+        const nextPositions = positions ?? [];
+        setDerivativesPositions(nextPositions);
+        syncCancellingDerivativeIds(nextPositions);
         setDerivativeQuote(quote ?? null);
         setPriceHistory(history ?? []);
       }).catch(err => {
@@ -312,6 +324,7 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
       setDerivativeQuote(null);
       setDerivativesLoading(false);
       setDerivativeActionLoading(null);
+      setCancellingDerivativeIds([]);
     }
   }, [derivativesEnabled]);
 
@@ -420,7 +433,9 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
       window.getDerivativesPositions(),
       window.getDerivativeMarketPrice(derivativeSymbol),
     ]).then(([positions, quote]) => {
-      setDerivativesPositions(positions ?? []);
+      const nextPositions = positions ?? [];
+      setDerivativesPositions(nextPositions);
+      syncCancellingDerivativeIds(nextPositions);
       setDerivativeQuote(quote ?? null);
       if (derivativeOrderType === "limit" && quote?.price && !derivativeLimitPrice) {
         setDerivativeLimitPrice(quote.price);
@@ -484,6 +499,18 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
       refreshDerivatives();
     }).catch(err => {
       setDerivativeActionLoading(null);
+      alert(err);
+      console.error(err);
+    });
+  };
+
+  const cancelDerivative = (positionId: string) => {
+    setCancellingDerivativeIds((prev) => prev.includes(positionId) ? prev : [...prev, positionId]);
+    window.closeDerivativePosition(positionId, "cancel").then(() => {
+      // Keep loading on the order until it disappears from the next refresh/poll.
+      refreshDerivatives();
+    }).catch(err => {
+      setCancellingDerivativeIds((prev) => prev.filter((id) => id !== positionId));
       alert(err);
       console.error(err);
     });
@@ -794,6 +821,7 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
           limitPrice={derivativeLimitPrice}
           loading={derivativesLoading}
           actionLoading={derivativeActionLoading}
+          cancellingPositionIds={cancellingDerivativeIds}
           onAmountChange={setDerivativeAmount}
           onLeverageChange={setDerivativeLeverage}
           onOrderTypeChange={setDerivativeOrderType}
@@ -801,6 +829,7 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
           onOpenLong={() => openDerivative("long")}
           onOpenShort={() => openDerivative("short")}
           onClosePosition={closeDerivative}
+          onCancelPosition={cancelDerivative}
           onRefresh={refreshDerivatives}
           priceHistory={priceHistory}
           onCancel={() => setDerivativesModalOpen(false)}
@@ -1043,7 +1072,8 @@ const DerivativesModal: React.FC<{
   orderType: "market" | "limit";
   limitPrice: string;
   loading: boolean;
-  actionLoading: "long" | "short" | "close" | null;
+  actionLoading: "long" | "short" | "close" | "cancel" | null;
+  cancellingPositionIds: string[];
   priceHistory: PriceHistoryPoint[];
   onAmountChange: (value: string) => void;
   onLeverageChange: (value: string) => void;
@@ -1052,6 +1082,7 @@ const DerivativesModal: React.FC<{
   onOpenLong: () => void;
   onOpenShort: () => void;
   onClosePosition: (positionId: string) => void;
+  onCancelPosition: (positionId: string) => void;
   onRefresh: () => void;
   onCancel: () => void;
 }> = ({
@@ -1066,6 +1097,7 @@ const DerivativesModal: React.FC<{
   limitPrice,
   loading,
   actionLoading,
+  cancellingPositionIds,
   priceHistory,
   onAmountChange,
   onLeverageChange,
@@ -1074,24 +1106,35 @@ const DerivativesModal: React.FC<{
   onOpenLong,
   onOpenShort,
   onClosePosition,
+  onCancelPosition,
   onRefresh,
   onCancel,
 }) => {
-    const leverageNum = parseInt(leverage, 10) || 1;
+  const leverageNum = parseInt(leverage, 10) || 1;
+    const leverageFillPercent = Math.max(0, Math.min(100, ((leverageNum - 1) / 19) * 100));
+    const pendingPositions = positions.filter((p) => !p.opened);
+    const openPositions = positions.filter((p) => p.opened);
+    const positionNetRoiPercent = (p: DerivativesPosition) => {
+      const collateral = parseFloat(p.collateral);
+      if (collateral <= 0) {
+        return p.pnl_percent;
+      }
+      return p.pnl_percent - (parseFloat(p.fee) / collateral) * 100;
+    };
 
     return (
       <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50" onClick={onCancel}>
         {/* Range slider custom styles */}
         <style>{`
-        .deriv-slider { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; border-radius: 3px; outline: none; cursor: pointer; }
-        .deriv-slider::-webkit-slider-runnable-track { height: 6px; border-radius: 3px; background: linear-gradient(90deg, #0098ea 0%, #66c4f0 100%); }
+        .deriv-slider { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; border-radius: 3px; outline: none; cursor: pointer; background: transparent; }
+        .deriv-slider::-webkit-slider-runnable-track { height: 6px; border-radius: 3px; background: transparent; }
         .deriv-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 22px; height: 22px; border-radius: 50%; background: #0098ea; border: 3px solid #fff; box-shadow: 0 1px 6px rgba(0,152,234,0.4); margin-top: -8px; cursor: pointer; transition: box-shadow 0.15s; }
         .deriv-slider::-webkit-slider-thumb:hover { box-shadow: 0 2px 10px rgba(0,152,234,0.6); }
-        .deriv-slider::-moz-range-track { height: 6px; border-radius: 3px; background: linear-gradient(90deg, #0098ea 0%, #66c4f0 100%); border: none; }
+        .deriv-slider::-moz-range-track { height: 6px; border-radius: 3px; background: transparent; border: none; }
         .deriv-slider::-moz-range-thumb { width: 22px; height: 22px; border-radius: 50%; background: #0098ea; border: 3px solid #fff; box-shadow: 0 1px 6px rgba(0,152,234,0.4); cursor: pointer; }
       `}</style>
         <div
-          className="bg-white rounded-2xl shadow-2xl w-[min(95vw,540px)] max-h-[90vh] overflow-y-auto border border-[#e0ecf5]"
+          className="bg-white rounded-2xl shadow-2xl w-[min(95vw,1100px)] max-h-[90vh] overflow-y-auto border border-[#e0ecf5]"
           onClick={(e) => e.stopPropagation()}
         >
           {/* Header */}
@@ -1127,8 +1170,9 @@ const DerivativesModal: React.FC<{
             </div>
           </div>
 
-          <div className="px-6 pb-6 pt-4 space-y-5">
-            {/* Symbol selector */}
+          <div className="px-6 pb-6 pt-4 lg:grid lg:grid-cols-[minmax(0,1fr)_430px] lg:gap-6">
+            <div className="space-y-5">
+              {/* Symbol selector */}
             <div className="flex items-center gap-2">
               {symbols.map((s) => (
                 <button
@@ -1187,6 +1231,9 @@ const DerivativesModal: React.FC<{
                 step={1}
                 value={leverageNum}
                 onChange={(e) => onLeverageChange(e.target.value)}
+                style={{
+                  background: `linear-gradient(90deg, #0098ea 0%, #0098ea ${leverageFillPercent}%, #d9edf9 ${leverageFillPercent}%, #d9edf9 100%)`,
+                }}
                 className="deriv-slider"
               />
               <div className="flex justify-between mt-1.5 px-0.5">
@@ -1266,25 +1313,30 @@ const DerivativesModal: React.FC<{
               </button>
             </div>
 
-            {/* Positions */}
-            {(positions.length > 0 || true) && (
-              <div>
-                <div className="flex items-center justify-between mb-3">
-                  <h3 className="text-sm font-semibold text-gray-700">Open Positions</h3>
-                  {positions.length > 0 && (
-                    <span className="text-xs font-medium text-[#0098ea] bg-[#f0f8ff] px-2 py-0.5 rounded-full">
-                      {positions.length}
-                    </span>
-                  )}
+            </div>
+
+            <div className="space-y-4">
+
+            {/* Pending Orders */}
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-amber-800">Pending Orders</h3>
+                {pendingPositions.length > 0 && (
+                  <span className="text-xs font-medium text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full">
+                    {pendingPositions.length}
+                  </span>
+                )}
+              </div>
+              {pendingPositions.length === 0 ? (
+                <div className="text-center py-4 text-sm text-gray-400 bg-[#fafcff] rounded-xl border border-dashed border-[#dce8f3]">
+                  No pending orders
                 </div>
-                {positions.length === 0 ? (
-                  <div className="text-center py-6 text-sm text-gray-400 bg-[#fafcff] rounded-xl border border-dashed border-[#dce8f3]">
-                    No active positions
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    {positions.map((p) => (
-                      <div key={`deriv-pos-${p.id}`} className="bg-[#f8fbff] border border-[#e0ecf5] rounded-xl p-4">
+              ) : (
+                <div className="space-y-2">
+                  {pendingPositions.map((p) => {
+                    const isCancelling = cancellingPositionIds.includes(p.id);
+                    return (
+                      <div key={`deriv-pending-${p.id}`} className={`bg-amber-50 border border-amber-200 rounded-xl p-4 ${isCancelling ? "opacity-80" : ""}`}>
                         <div className="flex items-center justify-between mb-3">
                           <div className="flex items-center gap-2">
                             <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-bold text-white ${p.is_long ? 'bg-green-500' : 'bg-red-500'
@@ -1292,24 +1344,31 @@ const DerivativesModal: React.FC<{
                               {p.is_long ? <TrendingUp size={12} /> : <TrendingDown size={12} />}
                               {p.is_long ? 'LONG' : 'SHORT'}
                             </span>
+                            <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-semibold text-amber-700 bg-amber-100">
+                              Waiting open
+                            </span>
                             <span className="text-sm font-semibold text-gray-700">{p.symbol}</span>
                             <span className="text-xs text-gray-400 font-medium">×{p.leverage}</span>
                           </div>
                           <button
-                            onClick={() => onClosePosition(p.id)}
-                            disabled={actionLoading !== null}
-                            className="px-3 py-1 rounded-lg text-xs font-medium bg-gray-100 text-gray-600 hover:bg-red-50 hover:text-red-600 transition-colors disabled:opacity-40"
+                            onClick={() => onCancelPosition(p.id)}
+                            disabled={actionLoading !== null || isCancelling}
+                            className="px-3 py-1 rounded-lg text-xs font-medium bg-white text-amber-800 border border-amber-200 hover:bg-amber-100 transition-colors disabled:opacity-40"
                           >
-                            {actionLoading === 'close' ? <RefreshCw className="animate-spin" size={12} /> : 'Close'}
+                            {isCancelling ? <RefreshCw className="animate-spin" size={12} /> : 'Cancel'}
                           </button>
                         </div>
-                        <div className="grid grid-cols-3 gap-2 text-xs">
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
                           <div>
                             <div className="text-gray-400 mb-0.5">Collateral</div>
                             <div className="font-semibold text-gray-700">{p.collateral} TON</div>
                           </div>
                           <div>
-                            <div className="text-gray-400 mb-0.5">Entry</div>
+                            <div className="text-gray-400 mb-0.5">Fee</div>
+                            <div className="font-semibold text-gray-700">{p.fee} TON</div>
+                          </div>
+                          <div>
+                            <div className="text-gray-400 mb-0.5">Limit Entry</div>
                             <div className="font-semibold text-gray-700">${p.entry_price}</div>
                           </div>
                           <div>
@@ -1317,21 +1376,86 @@ const DerivativesModal: React.FC<{
                             <div className="font-semibold text-gray-700">${p.current_price}</div>
                           </div>
                         </div>
-                        <div className="flex items-center justify-between mt-3 pt-2 border-t border-[#e8f0f8]">
-                          <div className="text-xs text-gray-400">
-                            Liq. <span className="text-gray-600 font-medium">${p.liquidation_price}</span>
-                          </div>
-                          <div className={`text-sm font-bold ${p.pnl_percent >= 0 ? 'text-green-600' : 'text-red-500'
-                            }`}>
-                            {p.pnl_percent >= 0 ? '+' : ''}{p.pnl_percent.toFixed(2)}%
-                          </div>
-                        </div>
                       </div>
-                    ))}
-                  </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Open Positions */}
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-gray-700">Open Positions</h3>
+                {openPositions.length > 0 && (
+                  <span className="text-xs font-medium text-[#0098ea] bg-[#f0f8ff] px-2 py-0.5 rounded-full">
+                    {openPositions.length}
+                  </span>
                 )}
               </div>
-            )}
+              {openPositions.length === 0 ? (
+                <div className="text-center py-4 text-sm text-gray-400 bg-[#fafcff] rounded-xl border border-dashed border-[#dce8f3]">
+                  No open positions
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {openPositions.map((p) => {
+                    const netRoiPercent = positionNetRoiPercent(p);
+                    return (
+                    <div key={`deriv-open-${p.id}`} className="bg-[#f8fbff] border border-[#e0ecf5] rounded-xl p-4">
+                      <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-center gap-2">
+                          <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-bold text-white ${p.is_long ? 'bg-green-500' : 'bg-red-500'
+                            }`}>
+                            {p.is_long ? <TrendingUp size={12} /> : <TrendingDown size={12} />}
+                            {p.is_long ? 'LONG' : 'SHORT'}
+                          </span>
+                          <span className="text-sm font-semibold text-gray-700">{p.symbol}</span>
+                          <span className="text-xs text-gray-400 font-medium">×{p.leverage}</span>
+                        </div>
+                        <button
+                          onClick={() => onClosePosition(p.id)}
+                          disabled={actionLoading !== null}
+                          className="px-3 py-1 rounded-lg text-xs font-medium bg-gray-100 text-gray-600 hover:bg-red-50 hover:text-red-600 transition-colors disabled:opacity-40"
+                        >
+                          {actionLoading === 'close' ? <RefreshCw className="animate-spin" size={12} /> : 'Close'}
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+                        <div>
+                          <div className="text-gray-400 mb-0.5">Collateral</div>
+                          <div className="font-semibold text-gray-700">{p.collateral} TON</div>
+                        </div>
+                        <div>
+                          <div className="text-gray-400 mb-0.5">Fee</div>
+                          <div className="font-semibold text-gray-700">{p.fee} TON</div>
+                        </div>
+                        <div>
+                          <div className="text-gray-400 mb-0.5">Entry</div>
+                          <div className="font-semibold text-gray-700">${p.entry_price}</div>
+                        </div>
+                        <div>
+                          <div className="text-gray-400 mb-0.5">Current</div>
+                          <div className="font-semibold text-gray-700">${p.current_price}</div>
+                        </div>
+                      </div>
+                      <div className="flex items-center justify-between mt-3 pt-2 border-t border-[#e8f0f8]">
+                        <div className="text-xs text-gray-400">
+                          Liq. <span className="text-gray-600 font-medium">${p.liquidation_price}</span>
+                        </div>
+                        <div className={`text-sm font-bold ${netRoiPercent >= 0 ? 'text-green-600' : 'text-red-500'
+                          }`}>
+                          {netRoiPercent >= 0 ? '+' : ''}{netRoiPercent.toFixed(2)}%
+                        </div>
+                      </div>
+                    </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            </div>
           </div>
         </div>
       </div>

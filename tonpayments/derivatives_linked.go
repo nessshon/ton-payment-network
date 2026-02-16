@@ -57,10 +57,6 @@ func reverseDerivativeAction(act payments.Action) (payments.Action, error) {
 }
 
 func (s *Service) buildLinkedDerivativeConditional(base *conditionals.ConditionalResolvable) (*conditionals.ConditionalResolvable, error) {
-	if base == nil {
-		return nil, fmt.Errorf("base derivative conditional is nil")
-	}
-
 	if len(base.GetKey()) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("invalid derivative key size: %d", len(base.GetKey()))
 	}
@@ -73,14 +69,11 @@ func (s *Service) buildLinkedDerivativeConditional(base *conditionals.Conditiona
 	details := base.Details
 	details.IsLong = !details.IsLong
 
-	linkedAmount := big.NewInt(0)
-	if base.Amount != nil {
-		linkedAmount = new(big.Int).Set(base.Amount)
-	}
-
 	return &conditionals.ConditionalResolvable{
 		Key:           derivativeLinkedKey(base.GetKey()),
-		Amount:        linkedAmount,
+		Amount:        new(big.Int).Set(base.Amount),
+		Fee:           new(big.Int).Set(base.Fee),
+		IsInitiator:   !base.IsInitiator,
 		ResolverAddr:  base.ResolverAddr,
 		Details:       details,
 		PriceResolver: base.PriceResolver,

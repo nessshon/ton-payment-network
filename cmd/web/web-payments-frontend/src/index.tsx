@@ -28,8 +28,12 @@ export interface DerivativesPosition {
     symbol: string;
     channel_address: string;
     collateral: string;
+    fee: string;
     is_long: boolean;
     leverage: number;
+    status: "open" | "pending_open";
+    opened: boolean;
+    opened_at?: number;
     entry_at: number;
     entry_price: string;
     current_price: string;
@@ -52,7 +56,7 @@ export interface PriceHistoryPoint {
 export interface TxMessage {
     to: string;
     amtNano: string;
-    body: string;
+    body?: string;
     stateInit?: string;
 }
 
@@ -71,10 +75,11 @@ declare global {
         getDerivativeMarketPrice: (symbol: string) => Promise<DerivativesQuote>;
         getDerivativePriceHistory: (symbol: string) => Promise<PriceHistoryPoint[]>;
         openDerivativePosition: (symbol: string, side: "long" | "short", leverage: number, amount: string, type?: "market" | "limit", price?: string) => Promise<string>;
-        closeDerivativePosition: (positionIdOrSymbol: string, type?: "market" | "limit") => Promise<void>;
+        closeDerivativePosition: (positionIdOrSymbol: string, type?: "market" | "cancel") => Promise<void>;
         isDerivativesEnabled: () => boolean;
         getChannelHistory: (limit: number) => Promise<PaymentChannelHistoryItem[] | null>;
         openChannel: () => void;
+        closeChannelUncooperative: (channelAddress: string) => void;
         withdrawChannel: (amount: string, currency: string, target: string) => void;
         doTransaction: (reason: string, messages: TxMessage[]) => Promise<string>;
     }

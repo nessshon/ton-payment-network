@@ -1,6 +1,7 @@
 package tonpayments
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
@@ -69,8 +70,8 @@ func (s *Service) derivativePriceWorker() {
 				return nil
 			}
 
-			// Liquidation reached on our incoming derivative condition:
-			// request execution to pull payout from the counterparty.
+			// Liquidation reached on incoming derivative monitor.
+			// Beneficiary side must trigger liquidation of the linked outgoing side.
 			if err = s.triggerIncomingDerivativeLiquidation(s.globalCtx, key); err != nil {
 				log.Warn().Err(err).Msg("failed to trigger incoming derivative liquidation")
 			}
@@ -206,8 +207,7 @@ func (s *Service) triggerIncomingDerivativeLiquidation(ctx context.Context, key 
 	if err != nil {
 		return fmt.Errorf("failed to parse derivative conditional: %w", err)
 	}
-	cond, ok := condRaw.(*conditionals.ConditionalResolvable)
-	if !ok {
+	if _, ok := condRaw.(*conditionals.ConditionalResolvable); !ok {
 		return nil
 	}
 
@@ -219,22 +219,52 @@ func (s *Service) triggerIncomingDerivativeLiquidation(ctx context.Context, key 
 		return nil
 	}
 
+	// Liquidation is detected by the incoming monitor, but settle must be posted
+	// on the linked outgoing derivative (losing side). Incoming side gets zero
+	// settle via CloseDerivative propagation.
+	outgoingKey, ok := derivativeOutgoingKeyForLiquidation(meta)
+	if !ok {
+		return fmt.Errorf("incoming derivative has no linked outgoing key")
+	}
+
+	outgoingMeta, err := s.db.GetVirtualChannelMeta(ctx, outgoingKey)
+	if err != nil {
+		return fmt.Errorf("failed to load linked outgoing derivative meta: %w", err)
+	}
+	if outgoingMeta.Status != db.ConditionalStateActive || outgoingMeta.Outgoing == nil || outgoingMeta.Outgoing.Conditional == nil {
+		return nil
+	}
+
+	outRaw, err := payments.CodeToConditional(ctx, outgoingMeta.Outgoing.Conditional, s)
+	if err != nil {
+		return fmt.Errorf("failed to parse linked outgoing derivative conditional: %w", err)
+	}
+	outCond, ok := outRaw.(*conditionals.ConditionalResolvable)
+	if !ok {
+		return nil
+	}
+
 	amount := parseBigIntString(monitor.LiquidationPayout)
 	if amount == nil || amount.Sign() <= 0 {
-		amount = new(big.Int).Set(cond.Amount)
+		if outCond.Amount != nil {
+			amount = new(big.Int).Set(outCond.Amount)
+		}
 	}
 	if amount == nil || amount.Sign() <= 0 {
 		return nil
 	}
+	if outCond.Amount != nil && outCond.Amount.Sign() > 0 && amount.Cmp(outCond.Amount) > 0 {
+		amount = new(big.Int).Set(outCond.Amount)
+	}
 
-	if meta.LastKnownResolve == nil {
+	if outgoingMeta.LastKnownResolve == nil {
 		at := monitor.LiquidatedAt
 		if at == 0 {
 			at = time.Now().UTC().Unix()
 		}
 
 		state, err := tlb.ToCell(conditionals.ResolvableState{
-			Key:    cond.GetKey(),
+			Key:    outCond.GetKey(),
 			Amount: amount,
 			At:     at,
 		})
@@ -242,12 +272,12 @@ func (s *Service) triggerIncomingDerivativeLiquidation(ctx context.Context, key 
 			return fmt.Errorf("failed to serialize derivative resolve state: %w", err)
 		}
 
-		if err = s.AddConditionalResolve(ctx, cond.GetKey(), state); err != nil && !errors.Is(err, payments.ErrNewerConditionalStateIsKnown) {
+		if err = s.AddConditionalResolve(ctx, outCond.GetKey(), state); err != nil && !errors.Is(err, payments.ErrNewerConditionalStateIsKnown) {
 			return fmt.Errorf("failed to add derivative liquidation resolve: %w", err)
 		}
 	}
 
-	if err = s.CloseConditional(ctx, cond.GetKey()); err != nil {
+	if err = s.CloseDerivative(ctx, outCond.GetKey()); err != nil {
 		return fmt.Errorf("failed to trigger derivative liquidation close: %w", err)
 	}
 
@@ -255,23 +285,110 @@ func (s *Service) triggerIncomingDerivativeLiquidation(ctx context.Context, key 
 }
 
 func (s *Service) ensureDerivativeRemovable(ctx context.Context, outgoingMeta *db.ConditionalMeta) error {
-	if outgoingMeta == nil || outgoingMeta.Outgoing == nil || len(outgoingMeta.Outgoing.LinkedKey) == 0 {
-		return fmt.Errorf("linked incoming derivative meta is required to validate remove")
+	incomingKey, ok := derivativeIncomingKeyForRemove(outgoingMeta)
+	if !ok {
+		return fmt.Errorf("incoming derivative key is required to validate remove")
 	}
 
 	checkCtx, cancel := context.WithTimeout(ctx, derivativeRemoveRefreshTimeout)
 	defer cancel()
 
-	_, _, monitor, _, err := s.refreshIncomingDerivativeMeta(checkCtx, outgoingMeta.Outgoing.LinkedKey)
+	meta, cond, monitor, _, err := s.refreshIncomingDerivativeMeta(checkCtx, incomingKey)
 	if err != nil {
 		return fmt.Errorf("failed to refresh derivative monitor before remove: %w", err)
 	}
 
-	if monitor.EntryCrossed {
+	if derivativeOrderOpenedFromMonitor(meta, cond, monitor) {
 		return fmt.Errorf("derivative order already opened, remove is denied")
 	}
 
 	return nil
+}
+
+func derivativeIncomingKeyForRemove(meta *db.ConditionalMeta) (ed25519.PublicKey, bool) {
+	if meta == nil {
+		return nil, false
+	}
+
+	// Incoming derivative meta keeps monitor directly under its own key.
+	if meta.Incoming != nil && len(meta.Key) == ed25519.PublicKeySize {
+		return append(ed25519.PublicKey(nil), meta.Key...), true
+	}
+
+	// Outgoing derivative meta references incoming side via linked key.
+	if meta.Outgoing != nil && len(meta.Outgoing.LinkedKey) == ed25519.PublicKeySize {
+		return append(ed25519.PublicKey(nil), meta.Outgoing.LinkedKey...), true
+	}
+
+	return nil, false
+}
+
+func derivativeOutgoingKeyForLiquidation(meta *db.ConditionalMeta) (ed25519.PublicKey, bool) {
+	if meta == nil || meta.Incoming == nil || len(meta.Incoming.LinkedKey) != ed25519.PublicKeySize {
+		return nil, false
+	}
+	return append(ed25519.PublicKey(nil), meta.Incoming.LinkedKey...), true
+}
+
+func derivativeOrderOpenedFromMonitor(meta *db.ConditionalMeta, cond *conditionals.ConditionalResolvable, monitor *derivativeMonitorState) bool {
+	if monitor == nil || cond == nil {
+		return false
+	}
+
+	entry := cond.Details.EntryPrice.Nano()
+	if entry == nil || entry.Sign() <= 0 {
+		// Malformed records should keep legacy conservative behavior.
+		return monitor.EntryCrossed
+	}
+
+	isOrderLong := derivativeCanonicalIsLong(meta, cond)
+	min := parseBigIntString(monitor.MinPrice)
+	max := parseBigIntString(monitor.MaxPrice)
+
+	if isOrderLong {
+		if min != nil {
+			return min.Cmp(entry) <= 0
+		}
+	} else {
+		if max != nil {
+			return max.Cmp(entry) >= 0
+		}
+	}
+
+	// If price history is incomplete (e.g. too old), keep conservative fallback.
+	return monitor.EntryCrossed
+}
+
+func derivativeCanonicalIsLong(meta *db.ConditionalMeta, cond *conditionals.ConditionalResolvable) bool {
+	if cond == nil {
+		return false
+	}
+
+	isLong := cond.Details.IsLong
+	if meta == nil {
+		return isLong
+	}
+
+	var linked []byte
+	if meta.Incoming != nil && len(meta.Incoming.LinkedKey) == ed25519.PublicKeySize {
+		linked = meta.Incoming.LinkedKey
+	} else if meta.Outgoing != nil && len(meta.Outgoing.LinkedKey) == ed25519.PublicKeySize {
+		linked = meta.Outgoing.LinkedKey
+	} else {
+		return isLong
+	}
+
+	key := cond.GetKey()
+	if len(key) != ed25519.PublicKeySize {
+		return isLong
+	}
+
+	// Linked side keeps inverted IsLong; normalize back to canonical order side.
+	if bytes.Equal(key, derivativeLinkedKey(linked)) {
+		return !isLong
+	}
+
+	return isLong
 }
 
 func parseDerivativeMonitor(meta *db.ConditionalMeta) (*derivativeMonitorState, bool, error) {
@@ -319,7 +436,17 @@ func applyDerivativePriceSample(m *derivativeMonitorState, cond *conditionals.Co
 	if !m.EntryCrossed && entry != nil && entry.Sign() > 0 {
 		min := parseBigIntString(m.MinPrice)
 		max := parseBigIntString(m.MaxPrice)
-		if min != nil && max != nil && min.Cmp(entry) <= 0 && max.Cmp(entry) >= 0 {
+		crossed := false
+		if cond.Details.IsLong {
+			// Incoming long corresponds to our short order:
+			// it opens once price reaches entry or higher.
+			crossed = max != nil && max.Cmp(entry) >= 0
+		} else {
+			// Incoming short corresponds to our long order:
+			// it opens once price reaches entry or lower.
+			crossed = min != nil && min.Cmp(entry) <= 0
+		}
+		if crossed {
 			m.EntryCrossed = true
 			if m.EntryCrossedAt == 0 {
 				m.EntryCrossedAt = at

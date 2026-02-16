@@ -28,6 +28,7 @@ type VirtualConfig struct {
 	ProxyMaxCapacity            tlb.Coins
 	ProxyMinFee                 tlb.Coins
 	ProxyFeePercent             float64
+	DerivativeFeePercent        float64
 	AllowTunneling              bool
 }
 

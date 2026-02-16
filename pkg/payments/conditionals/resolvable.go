@@ -39,6 +39,8 @@ type ConditionalResolvableDetails struct {
 type ConditionalResolvable struct {
 	Key          ed25519.PublicKey
 	Amount       *big.Int
+	Fee          *big.Int
+	IsInitiator  bool
 	ResolverAddr *address.Address
 	Details      ConditionalResolvableDetails
 
@@ -71,21 +73,30 @@ func (c *ConditionalResolvable) Serialize() *cell.Cell {
 		panic(err)
 	}
 
+	isInitiator := int64(0)
+	if c.IsInitiator {
+		isInitiator = 1
+	}
+
 	return cell.BeginCell().
 		MustStoreBuilder(vm.PushIntOP(new(big.Int).SetBytes(c.Action.Serialize().Hash()))).
 		MustStoreBuilder(vm.PushIntOP(new(big.Int).SetBytes(c.Key))).
 		MustStoreBuilder(vm.PushIntOP(c.Amount)).
-		MustStoreBuilder(vm.PushSliceRef(cell.BeginCell().MustStoreAddr(c.ResolverAddr).ToSlice())).
+		MustStoreBuilder(vm.PushIntOP(c.Fee)).
+		MustStoreBuilder(vm.PushIntOP(big.NewInt(isInitiator))).
 		MustStoreBuilder(vm.PushRef(det)).
-		// we pack immutable part of code to ref for better BoC compression and cheaper transactions
-		MustStoreRef(resolvableStaticCode). // implicit jump
+		MustStoreRef(cell.BeginCell().
+			MustStoreBuilder(vm.PushSliceRef(cell.BeginCell().MustStoreAddr(c.ResolverAddr).ToSlice())).
+			// we pack immutable part of code to ref for better BoC compression and cheaper transactions
+			MustStoreRef(resolvableStaticCode). // implicit jump
+			EndCell()).
 		EndCell()
 }
 
 func (c *ConditionalResolvable) Parse(ctx context.Context, s *cell.Slice, actions payments.ActionResolver) error {
 	actHashInt, err := vm.ReadIntOP(s)
 	if err != nil {
-		return fmt.Errorf("failed to parse fee: %w", err)
+		return fmt.Errorf("failed to parse hash: %w", err)
 	}
 
 	keyInt, err := vm.ReadIntOP(s)
@@ -105,17 +116,27 @@ func (c *ConditionalResolvable) Parse(ctx context.Context, s *cell.Slice, action
 	if amount.BitLen() > 127 {
 		return fmt.Errorf("failed to parse amount: incorrect bits len")
 	}
-	if amount.Sign() < 0 {
-		return fmt.Errorf("failed to parse amount: cannot be negative")
+	if amount.Sign() <= 0 {
+		return fmt.Errorf("failed to parse amount: cannot be negative or zero")
 	}
 
-	slc, err := vm.ReadSliceOP(s)
+	fee, err := vm.ReadIntOP(s)
 	if err != nil {
-		return fmt.Errorf("failed to parse addr slice: %w", err)
+		return fmt.Errorf("failed to parse fee: %w", err)
 	}
-	resolverAddr, err := slc.LoadAddr()
+	if fee.BitLen() > 127 {
+		return fmt.Errorf("failed to parse fee: incorrect bits len")
+	}
+	if fee.Sign() < 0 {
+		return fmt.Errorf("failed to parse fee: cannot be negative")
+	}
+
+	isInitiator, err := vm.ReadIntOP(s)
 	if err != nil {
-		return fmt.Errorf("failed to parse addr: %w", err)
+		return fmt.Errorf("failed to parse is initiator: %w", err)
+	}
+	if isInitiator.Sign() != 0 && isInitiator.Cmp(big.NewInt(1)) != 0 {
+		return fmt.Errorf("failed to parse is initiator: incorrect value")
 	}
 
 	dc, err := vm.ReadCellOP(s)
@@ -125,6 +146,20 @@ func (c *ConditionalResolvable) Parse(ctx context.Context, s *cell.Slice, action
 	var details ConditionalResolvableDetails
 	if err = payments.LoadState(&details, dc); err != nil {
 		return fmt.Errorf("failed to load details: %w", err)
+	}
+
+	s, err = s.LoadRef()
+	if err != nil {
+		return fmt.Errorf("failed to parse resolver ref: %w", err)
+	}
+
+	slc, err := vm.ReadSliceOP(s)
+	if err != nil {
+		return fmt.Errorf("failed to parse addr slice: %w", err)
+	}
+	resolverAddr, err := slc.LoadAddr()
+	if err != nil {
+		return fmt.Errorf("failed to parse addr: %w", err)
 	}
 
 	if len(key) < 32 {
@@ -167,6 +202,8 @@ func (c *ConditionalResolvable) Parse(ctx context.Context, s *cell.Slice, action
 	c.Action = a
 	c.Key = key
 	c.Amount = amount
+	c.Fee = fee
+	c.IsInitiator = isInitiator.Sign() != 0
 	c.ResolverAddr = resolverAddr
 	c.Details = details
 	c.PriceResolver = oracle.PriceResolvers[details.AssetID]
@@ -191,24 +228,49 @@ func (c *ConditionalResolvable) GetLogInfo() map[string]any {
 	ccs := c.Action.GetAffectedCoins()
 
 	return map[string]any{
-		"cond_type":   "resolvable",
-		"key":         base64.StdEncoding.EncodeToString(c.Key),
-		"amount":      ccs[0].MustAmount(c.Amount).String(),
-		"contract":    c.ResolverAddr.String(),
-		"asset_id":    c.Details.AssetID,
-		"is_long":     c.Details.IsLong,
-		"leverage":    c.Details.Leverage,
-		"entry_price": c.Details.EntryPrice.Nano().String(),
+		"cond_type":    "resolvable",
+		"key":          base64.StdEncoding.EncodeToString(c.Key),
+		"amount":       ccs[0].MustAmount(c.Amount).String(),
+		"fee":          ccs[0].MustAmount(c.Fee).String(),
+		"is_initiator": c.IsInitiator,
+		"contract":     c.ResolverAddr.String(),
+		"asset_id":     c.Details.AssetID,
+		"is_long":      c.Details.IsLong,
+		"leverage":     c.Details.Leverage,
+		"entry_price":  c.Details.EntryPrice.Nano().String(),
 	}
 }
 
 func (c *ConditionalResolvable) ValidateOnAdd() error {
+	if c.Amount == nil {
+		return fmt.Errorf("invalid amount")
+	}
+	if c.Fee == nil {
+		return fmt.Errorf("invalid fee")
+	}
 	if c.Amount.Sign() < 0 {
 		return fmt.Errorf("invalid amount")
+	}
+	if c.Fee.Sign() < 0 {
+		return fmt.Errorf("invalid fee")
 	}
 
 	if c.Details.Leverage == 0 || c.Details.Leverage > maxSupportedLeverage {
 		return fmt.Errorf("unsupported leverage: %d (max %d)", c.Details.Leverage, maxSupportedLeverage)
+	}
+
+	if c.Action == nil {
+		return fmt.Errorf("action is required")
+	}
+	ccs := c.Action.GetAffectedCoins()
+	if len(ccs) != 1 || ccs[0] == nil {
+		return fmt.Errorf("unexpected number of affected coins")
+	}
+
+	minFee := payments.CalcPercentFeeCeil(c.Amount, ccs[0].VirtualTunnelConfig.DerivativeFeePercent)
+	minFee.Mul(minFee, big.NewInt(int64(c.Details.Leverage)))
+	if c.Fee.Cmp(minFee) < 0 {
+		return fmt.Errorf("invalid fee: expected at least %s, got %s", minFee.String(), c.Fee.String())
 	}
 
 	// TODO: check resolver addr match
@@ -334,8 +396,24 @@ func (c *ConditionalResolvable) EmulateBalance(balances map[string]*payments.Bal
 		if roi.Sign() < 0 && roi.CmpAbs(c.Amount) > 0 {
 			locked.Abs(roi)
 		}
+		if c.IsInitiator {
+			locked.Add(locked, c.Fee)
+		} else {
+			locked.Sub(locked, c.Fee)
+			if locked.Sign() < 0 {
+				locked.SetInt64(0)
+			}
+		}
 		b.ConditionalLocked.Add(b.ConditionalLocked, locked)
 	} else {
+		if c.IsInitiator {
+			roi.Add(roi, c.Fee)
+		} else {
+			roi.Sub(roi, c.Fee)
+			if roi.Sign() < 0 {
+				roi.SetInt64(0)
+			}
+		}
 		if roi.Sign() > 0 {
 			b.ConditionalPending.Add(b.ConditionalPending, roi)
 		}
@@ -450,6 +528,10 @@ func (c *ConditionalResolvable) Execute(actionState, latestCondState *cell.Cell,
 		return nil, fmt.Errorf("incorrect key")
 	}
 
+	if condState.Amount.Sign() < 0 {
+		return nil, fmt.Errorf("amount cannot be negative")
+	}
+
 	// cap by configured amount if provided (non-zero)
 	toAdd := new(big.Int).Set(condState.Amount)
 	if c.Amount != nil && c.Amount.Sign() > 0 && toAdd.Cmp(c.Amount) > 0 {
@@ -458,6 +540,14 @@ func (c *ConditionalResolvable) Execute(actionState, latestCondState *cell.Cell,
 
 	// add resolved amount to the linked action's state
 	if sendAct, ok := c.Action.(payments.ActionSend); ok {
+		if c.IsInitiator {
+			toAdd.Add(toAdd, c.Fee)
+		} else {
+			toAdd.Sub(toAdd, c.Fee)
+			if toAdd.Sign() < 0 {
+				toAdd.SetInt64(0)
+			}
+		}
 		return sendAct.AddCoins(actionState, toAdd, locked)
 	}
 
@@ -467,29 +557,35 @@ func (c *ConditionalResolvable) Execute(actionState, latestCondState *cell.Cell,
 var resolvableStaticCode = func() *cell.Cell {
 	// compiled using code:
 	/*
-		fun conditional_derivative(targetActionsInput: dict, condInput: slice, sender: address, actionHash: int, id: int256, amount: coins, expectedSender: address): dict {
+		@method_id(46)
+		fun conditional_derivative(targetActionsInput: dict, condInput: slice, sender: address, actionHash: int, id: uint256, maxAmount: coins, fee: coins, isInitiator: bool, details: cell, expectedSender: address): dict {
 			if (sender != expectedSender) {
-				return targetActionsInput;
+				throw 201;
 			}
 
 			var input = condInput.loadAny<DerivativeResolve>();
 			if (input.id != id) {
-				return targetActionsInput;
+				throw 202;
 			}
 
-			if (amount != 0 && input.amount > amount) {
+			if (maxAmount != 0 && input.amount > maxAmount) {
 				// hard cap of liquidation
-				input.amount = amount;
+				input.amount = maxAmount;
 			}
 
 			var (actInput, _) = targetActionsInput.uDictGet(256, actionHash);
 			if (actInput == null) {
 				// we must always have action to execute condition
-				return targetActionsInput;
+				throw 203;
 			}
 
 			var v = actInput.loadAny<FeeActionInput>();
-			v.amount += input.amount;
+
+			if (isInitiator) {
+				v.amount += input.amount + fee;
+			} else if (fee < input.amount) {
+				v.amount += input.amount - fee;
+			}
 
 			targetActionsInput.uDictSet(256, actionHash, v.toCell().beginParse());
 
@@ -497,7 +593,7 @@ var resolvableStaticCode = func() *cell.Cell {
 		}
 	*/
 
-	data, err := hex.DecodeString("b5ee9c724101010100550000a63014c70593f2c0c9e103d3fffa003004bd93f2c0cae021c300955321bcc3009170e2926c129131e253028307f40e6fa130206e93f2c0cbe0fa00fa00d70b3f5024a0c801fa0201fa0212cb3fc9d0028307f4168f27983f")
+	data, err := hex.DecodeString("b5ee9c724101010100660000c83116c70593f2c0c9e105d3fffa003003bd93f2c0cae020c300945cbcc3009170e291319130e253148307f40e6fa130206e93f2c0cbe0fa00fa00d70b3f05945025a0a09e5352b9955025a1a003923234e203e2c801fa025003fa02cb3fc9d0028307f416927501c7")
 	if err != nil {
 		panic(err.Error())
 	}

@@ -530,6 +530,10 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		}
 
 		if res, ok := cond.(*conditionals.ConditionalResolvable); ok {
+			if !res.IsInitiator {
+				return nil, fmt.Errorf("resolvable condition must be initiated by proposer side")
+			}
+
 			linkedCond, err := s.buildLinkedDerivativeConditional(res)
 			if err != nil {
 				return nil, fmt.Errorf("failed to build linked derivative condition: %w", err)

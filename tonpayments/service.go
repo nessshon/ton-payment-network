@@ -252,6 +252,7 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 				ProxyMaxCapacity:            tlb.MustFromDecimal(cfg.VirtualTunnelConfig.ProxyMaxCapacity, int(cfg.Decimals)),
 				ProxyMinFee:                 tlb.MustFromDecimal(cfg.VirtualTunnelConfig.ProxyMinFee, int(cfg.Decimals)),
 				ProxyFeePercent:             cfg.VirtualTunnelConfig.ProxyFeePercent,
+				DerivativeFeePercent:        cfg.VirtualTunnelConfig.DerivativeFeePercent,
 				AllowTunneling:              cfg.VirtualTunnelConfig.AllowTunneling,
 			},
 			Symbol:                strings.ToUpper(cfg.Symbol),

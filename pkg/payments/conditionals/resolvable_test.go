@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
 	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals/oracle"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -55,6 +56,18 @@ func (r *hardErrorResolver) GetLastPrice() (int64, *big.Int, error) {
 }
 
 func (r *hardErrorResolver) GetPricesSince(_ int64) []oracle.RangePrice { return nil }
+
+func testResolvableActionWithFeePercent(percent float64) *actions.ActionSendTon {
+	return &actions.ActionSendTon{
+		Coin: &payments.CoinConfig{
+			Symbol:   "TON",
+			Decimals: 9,
+			VirtualTunnelConfig: payments.VirtualConfig{
+				DerivativeFeePercent: percent,
+			},
+		},
+	}
+}
 
 func TestGetBestEffortCurrentPrice_UsesPreviousSecondOnTooNew(t *testing.T) {
 	want := big.NewInt(123)
@@ -227,6 +240,8 @@ func TestValidateState_RejectsWhenResolverNotReady(t *testing.T) {
 func TestValidateOnAdd_RejectsExcessiveLeverage(t *testing.T) {
 	cond := &ConditionalResolvable{
 		Amount: big.NewInt(100),
+		Fee:    big.NewInt(0),
+		Action: testResolvableActionWithFeePercent(0),
 		Details: ConditionalResolvableDetails{
 			Leverage: 21,
 		},
@@ -248,6 +263,26 @@ func TestValidateOnAdd_RejectsExcessiveLeverage(t *testing.T) {
 	cond.Details.Leverage = 1
 	if err := cond.ValidateOnAdd(); err != nil {
 		t.Fatalf("ValidateOnAdd should accept leverage == 1, got: %v", err)
+	}
+}
+
+func TestValidateOnAdd_RejectsFeeBelowConfiguredPercent(t *testing.T) {
+	cond := &ConditionalResolvable{
+		Amount: big.NewInt(1_000_000_000),
+		Fee:    big.NewInt(9_999_999), // below 1% of amount
+		Action: testResolvableActionWithFeePercent(1),
+		Details: ConditionalResolvableDetails{
+			Leverage: 10,
+		},
+	}
+
+	if err := cond.ValidateOnAdd(); err == nil {
+		t.Fatal("ValidateOnAdd should reject fee below configured percent")
+	}
+
+	cond.Fee = big.NewInt(10_000_000)
+	if err := cond.ValidateOnAdd(); err != nil {
+		t.Fatalf("ValidateOnAdd should accept fee equal to configured percent, got: %v", err)
 	}
 }
 

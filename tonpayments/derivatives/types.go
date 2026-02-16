@@ -7,8 +7,12 @@ type PositionView struct {
 	Symbol           string  `json:"symbol"`
 	ChannelAddress   string  `json:"channel_address"`
 	Collateral       string  `json:"collateral"`
+	Fee              string  `json:"fee"`
 	IsLong           bool    `json:"is_long"`
 	Leverage         int     `json:"leverage"`
+	Status           string  `json:"status"`
+	Opened           bool    `json:"opened"`
+	OpenedAt         int64   `json:"opened_at,omitempty"`
 	EntryAt          int64   `json:"entry_at"`
 	EntryPrice       string  `json:"entry_price"`
 	CurrentPrice     string  `json:"current_price"`

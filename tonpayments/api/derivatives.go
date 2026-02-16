@@ -22,7 +22,7 @@ type closeReq struct {
 	Channel string `json:"channel"`
 	ID      string `json:"id"`
 	Symbol  string `json:"symbol"`
-	Type    string `json:"type"`
+	Type    string `json:"type"` // market/cancel
 }
 
 const maxDerivativesRequestBodyBytes = 16 * 1024

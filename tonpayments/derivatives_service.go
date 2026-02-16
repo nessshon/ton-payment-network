@@ -31,12 +31,18 @@ type DerivativesService struct {
 const defaultDerivativesCollateralSymbol = "TON"
 const maxSupportedLeverage = 20
 
+const (
+	derivativePositionStatusOpen        = "open"
+	derivativePositionStatusPendingOpen = "pending_open"
+)
+
 // TODO: make dynamic if needed
 var supportedSymbols = []struct {
 	Provider string
 	Symbol   string
 }{
 	{"binance", "BTCUSDT"},
+	{"binance", "TONUSDT"},
 }
 
 func NewDerivativesService(core *Service) *DerivativesService {
@@ -107,13 +113,9 @@ func (s *DerivativesService) findResolvableByKey(ctx context.Context, ch *db.Cha
 	return nil, nil
 }
 
-func (s *DerivativesService) closePositionByID(ctx context.Context, ch *db.Channel, positionID ed25519.PublicKey) error {
-	meta, err := s.core.GetVirtualChannelMeta(ctx, positionID)
-	if err != nil {
-		return fmt.Errorf("failed to load position metadata: %w", err)
-	}
-	if meta.Status != db.ConditionalStateActive {
-		return fmt.Errorf("position is not active")
+func resolveDerivativePositionKeys(meta *db.ConditionalMeta, positionID ed25519.PublicKey) (ed25519.PublicKey, ed25519.PublicKey, error) {
+	if meta == nil {
+		return nil, nil, fmt.Errorf("position metadata is missing")
 	}
 
 	var outgoingKey, incomingKey ed25519.PublicKey
@@ -130,7 +132,74 @@ func (s *DerivativesService) closePositionByID(ctx context.Context, ch *db.Chann
 		}
 	}
 	if outgoingKey == nil && incomingKey == nil {
-		return fmt.Errorf("position metadata is inconsistent")
+		return nil, nil, fmt.Errorf("position metadata is inconsistent")
+	}
+	return outgoingKey, incomingKey, nil
+}
+
+func (s *DerivativesService) derivativePositionOpened(ctx context.Context, incomingKey ed25519.PublicKey) (bool, int64, error) {
+	// Legacy records may miss linked incoming key; treat them as already opened.
+	if len(incomingKey) != ed25519.PublicKeySize {
+		return true, 0, nil
+	}
+
+	refreshCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	metaFresh, condFresh, monitor, _, err := s.core.refreshIncomingDerivativeMeta(refreshCtx, incomingKey)
+	if err == nil && monitor != nil {
+		return derivativeOrderOpenedFromMonitor(metaFresh, condFresh, monitor), monitor.EntryCrossedAt, nil
+	}
+
+	meta, metaErr := s.core.GetVirtualChannelMeta(ctx, incomingKey)
+	if metaErr != nil {
+		if err != nil {
+			return false, 0, fmt.Errorf("failed to refresh derivative monitor: %w", err)
+		}
+		return false, 0, fmt.Errorf("failed to load incoming derivative metadata: %w", metaErr)
+	}
+
+	monitor, _, parseErr := parseDerivativeMonitor(meta)
+	if parseErr != nil {
+		if err != nil {
+			return false, 0, fmt.Errorf("failed to refresh derivative monitor: %w", err)
+		}
+		return false, 0, fmt.Errorf("failed to parse derivative monitor: %w", parseErr)
+	}
+
+	opened := monitor.EntryCrossed
+	if meta.Incoming != nil && meta.Incoming.Conditional != nil {
+		condRaw, condErr := payments.CodeToConditional(ctx, meta.Incoming.Conditional, s.core)
+		if condErr == nil {
+			if cond, ok := condRaw.(*conditionals.ConditionalResolvable); ok {
+				opened = derivativeOrderOpenedFromMonitor(meta, cond, monitor)
+			}
+		}
+	}
+
+	return opened, monitor.EntryCrossedAt, nil
+}
+
+func (s *DerivativesService) closePositionByID(ctx context.Context, ch *db.Channel, positionID ed25519.PublicKey) error {
+	meta, err := s.core.GetVirtualChannelMeta(ctx, positionID)
+	if err != nil {
+		return fmt.Errorf("failed to load position metadata: %w", err)
+	}
+	if meta.Status != db.ConditionalStateActive {
+		return fmt.Errorf("position is not active")
+	}
+
+	outgoingKey, incomingKey, err := resolveDerivativePositionKeys(meta, positionID)
+	if err != nil {
+		return err
+	}
+
+	opened, _, err := s.derivativePositionOpened(ctx, incomingKey)
+	if err != nil {
+		return fmt.Errorf("failed to check derivative open status: %w", err)
+	}
+	if !opened {
+		return fmt.Errorf("position is not opened yet, cancel it instead")
 	}
 
 	outgoingCond, err := s.findResolvableByKey(ctx, ch, outgoingKey)
@@ -234,6 +303,38 @@ func (s *DerivativesService) closePositionByID(ctx context.Context, ch *db.Chann
 	return nil
 }
 
+func (s *DerivativesService) cancelPositionByID(ctx context.Context, positionID ed25519.PublicKey) error {
+	meta, err := s.core.GetVirtualChannelMeta(ctx, positionID)
+	if err != nil {
+		return fmt.Errorf("failed to load position metadata: %w", err)
+	}
+	if meta.Status != db.ConditionalStateActive {
+		return fmt.Errorf("position is not active")
+	}
+
+	_, incomingKey, err := resolveDerivativePositionKeys(meta, positionID)
+	if err != nil {
+		return err
+	}
+
+	opened, _, err := s.derivativePositionOpened(ctx, incomingKey)
+	if err != nil {
+		return fmt.Errorf("failed to check derivative open status: %w", err)
+	}
+	if opened {
+		return fmt.Errorf("position is already opened, use market close")
+	}
+
+	if len(incomingKey) == ed25519.PublicKeySize {
+		if err = s.core.RemoveConditional(ctx, incomingKey); err != nil {
+			return fmt.Errorf("failed to cancel derivative via remove conditional: %w", err)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("position metadata is inconsistent: incoming side is missing")
+}
+
 func (s *DerivativesService) ListDerivativesPositions(ctx context.Context, channelAddr string, symbol string) ([]deriv.PositionView, error) {
 	ch, err := s.core.GetChannel(ctx, channelAddr)
 	if err != nil {
@@ -318,23 +419,47 @@ func (s *DerivativesService) ListDerivativesPositions(ctx context.Context, chann
 		entryStr := formatDerivativePrice(res.Details.EntryPrice.Nano())
 		currentStr := formatDerivativePrice(lastPrice)
 
-		entryF, _ := strconv.ParseFloat(entryStr, 64)
-		currF, _ := strconv.ParseFloat(currentStr, 64)
-		pnl := deriv.ComputePnLPercent(entryF, currF, int(res.Details.Leverage), isOurLong)
-		liq := deriv.ComputeLiquidationPrice(entryF, int(res.Details.Leverage), isOurLong)
+		incomingKey := ed25519.PublicKey(nil)
+		if meta.Incoming != nil {
+			incomingKey = append(ed25519.PublicKey(nil), res.Key...)
+		} else if meta.Outgoing != nil && len(meta.Outgoing.LinkedKey) == ed25519.PublicKeySize {
+			incomingKey = append(ed25519.PublicKey(nil), meta.Outgoing.LinkedKey...)
+		}
+
+		opened, openedAt, openedErr := s.derivativePositionOpened(ctx, incomingKey)
+		if openedErr != nil {
+			// Listing should be resilient; strict validation is done on close/cancel.
+			opened = false
+			openedAt = 0
+		}
+
+		status := derivativePositionStatusPendingOpen
+		pnl := 0.0
+		liqStr := ""
+		if opened {
+			status = derivativePositionStatusOpen
+			entryF, _ := strconv.ParseFloat(entryStr, 64)
+			currF, _ := strconv.ParseFloat(currentStr, 64)
+			pnl = deriv.ComputePnLPercent(entryF, currF, int(res.Details.Leverage), isOurLong)
+			liqStr = trimFloat(deriv.ComputeLiquidationPrice(entryF, int(res.Details.Leverage), isOurLong))
+		}
 
 		positions = append(positions, deriv.PositionView{
 			ID:               base64.StdEncoding.EncodeToString(res.Key),
 			Symbol:           assetSymbol,
 			ChannelAddress:   channelAddr,
 			Collateral:       collateralFormatter(res.Amount, s),
+			Fee:              collateralFormatter(res.Fee, s),
 			IsLong:           isOurLong,
 			Leverage:         int(res.Details.Leverage),
+			Status:           status,
+			Opened:           opened,
+			OpenedAt:         openedAt,
 			EntryAt:          meta.CreatedAt.Unix(),
 			EntryPrice:       entryStr,
 			CurrentPrice:     currentStr,
 			PnLPercent:       pnl,
-			LiquidationPrice: trimFloat(liq),
+			LiquidationPrice: liqStr,
 		})
 	}
 
@@ -342,6 +467,9 @@ func (s *DerivativesService) ListDerivativesPositions(ctx context.Context, chann
 }
 
 func collateralFormatter(amount *big.Int, s *DerivativesService) string {
+	if amount == nil {
+		return "0"
+	}
 	cc, err := s.core.ResolveCoinConfigBySymbol(defaultDerivativesCollateralSymbol)
 	if err != nil {
 		return amount.String()
@@ -438,6 +566,8 @@ func (s *DerivativesService) OpenPosition(ctx context.Context, channelAddr strin
 	if amt.Nano().Sign() <= 0 {
 		return "", fmt.Errorf("amount must be greater than zero")
 	}
+	feeNano := payments.CalcPercentFeeCeil(amt.Nano(), cc.VirtualTunnelConfig.DerivativeFeePercent)
+	feeNano.Mul(feeNano, big.NewInt(int64(leverage)))
 
 	// Only supporting binance source for now
 	assetID := oracle.GetResolverID("binance", symbolToOpen)
@@ -483,7 +613,7 @@ func (s *DerivativesService) OpenPosition(ctx context.Context, channelAddr strin
 	firstPart := transport.TunnelChainPart{
 		Target:   ch.Their.OnchainInfo.Key,
 		Capacity: amt.Nano(),
-		Fee:      big.NewInt(0), // TODO: calc fee
+		Fee:      big.NewInt(0),
 		Deadline: deadline,
 	}
 
@@ -520,7 +650,7 @@ func (s *DerivativesService) OpenPosition(ctx context.Context, channelAddr strin
 	instruction.ExpectedDeadline = time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
 	instruction.Details = detailsCell
 
-	err = s.core.CreateDerivativeCond(ctx, instructionKey, vPriv, firstPart, instruction, cc, amt.Nano(), resDetails, resolverAddr)
+	err = s.core.CreateDerivativeCond(ctx, instructionKey, vPriv, firstPart, instruction, cc, amt.Nano(), feeNano, resDetails, resolverAddr)
 	if err != nil {
 		return "", fmt.Errorf("failed to create derivative condition: %w", err)
 	}
@@ -529,8 +659,8 @@ func (s *DerivativesService) OpenPosition(ctx context.Context, channelAddr strin
 }
 
 func (s *DerivativesService) ClosePosition(ctx context.Context, channelAddr string, symbolOrPositionID string, typ string) error {
-	if typ != "market" {
-		return fmt.Errorf("only market close supported for now")
+	if typ != "market" && typ != "cancel" {
+		return fmt.Errorf("type must be market or cancel")
 	}
 
 	ch, err := s.core.GetActiveChannel(ctx, channelAddr)
@@ -539,6 +669,9 @@ func (s *DerivativesService) ClosePosition(ctx context.Context, channelAddr stri
 	}
 
 	if key, ok := decodeDerivativePositionID(symbolOrPositionID); ok {
+		if typ == "cancel" {
+			return s.cancelPositionByID(ctx, key)
+		}
 		return s.closePositionByID(ctx, ch, key)
 	}
 
@@ -550,12 +683,16 @@ func (s *DerivativesService) ClosePosition(ctx context.Context, channelAddr stri
 		return fmt.Errorf("position not found")
 	}
 	if len(positions) > 1 {
-		return fmt.Errorf("multiple positions found for symbol %s, close by position id", symbolOrPositionID)
+		return fmt.Errorf("multiple positions found for symbol %s, %s by position id", symbolOrPositionID, typ)
 	}
 
 	key, ok := decodeDerivativePositionID(positions[0].ID)
 	if !ok {
 		return fmt.Errorf("position id is malformed")
+	}
+
+	if typ == "cancel" {
+		return s.cancelPositionByID(ctx, key)
 	}
 	return s.closePositionByID(ctx, ch, key)
 }

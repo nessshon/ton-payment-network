@@ -664,6 +664,35 @@ func main() {
 		return js.Null()
 	}))
 
+	js.Global().Set("closeChannelUncooperative", js.FuncOf(func(this js.Value, args []js.Value) any {
+		if !started {
+			return js.Null()
+		}
+
+		if len(args) != 1 {
+			println("wrong number of arguments")
+			return js.Null()
+		}
+
+		channelAddr := args[0].String()
+		if channelAddr == "" {
+			println("channel address is required")
+			return js.Null()
+		}
+
+		if _, err := address.ParseAddr(channelAddr); err != nil {
+			println("invalid channel address: " + err.Error())
+			return js.Null()
+		}
+
+		if err := Service.RequestUncooperativeClose(context.Background(), channelAddr); err != nil {
+			println("failed to request uncooperative close: " + err.Error())
+			return js.Null()
+		}
+
+		return js.Null()
+	}))
+
 	js.Global().Set("listChannelsPrint", js.FuncOf(func(this js.Value, args []js.Value) any {
 		if !started {
 			return js.Null()
@@ -904,6 +933,7 @@ func start(peerKey, channelKey []byte) {
 	cfg.ChannelConfig.SupportedCoins.Ton.VirtualTunnelConfig.MaxCapacityToRentPerTx = "5"
 	cfg.ChannelConfig.SupportedCoins.Ton.VirtualTunnelConfig.CapacityDepositFee = "0.05"
 	cfg.ChannelConfig.SupportedCoins.Ton.VirtualTunnelConfig.CapacityFeePercentPer30Days = 0.1
+	cfg.ChannelConfig.SupportedCoins.Ton.VirtualTunnelConfig.DerivativeFeePercent = 0.5
 	cfg.ChannelConfig.SupportedCoins.Ton.BalanceControl = nil
 
 	cfg.ChannelConfig.SupportedCoins.Jettons["EQDQp0PWKNlb3rFzP3WgLp_0vzL0bAcoZXWlvs9SmcGRPkJv"] = config.CoinConfig{
@@ -915,6 +945,7 @@ func start(peerKey, channelKey []byte) {
 			ProxyMaxCapacity:            "15.5",
 			ProxyMinFee:                 "0.002",
 			ProxyFeePercent:             0.8,
+			DerivativeFeePercent:        0.5,
 		},
 		Symbol:                "USDX",
 		Decimals:              6,
