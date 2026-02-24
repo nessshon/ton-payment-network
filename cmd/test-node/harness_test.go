@@ -51,6 +51,15 @@ func newTestNode(t *testing.T, hub *loopbackHub, idx, port int) *testNode {
 	if err != nil {
 		t.Fatalf("node %d: generate config failed: %v", idx, err)
 	}
+	cfg.ChannelConfig.SupportedCoins.Ton.BalanceControl = nil
+	for key, jetton := range cfg.ChannelConfig.SupportedCoins.Jettons {
+		jetton.BalanceControl = nil
+		cfg.ChannelConfig.SupportedCoins.Jettons[key] = jetton
+	}
+	for key, ec := range cfg.ChannelConfig.SupportedCoins.ExtraCurrencies {
+		ec.BalanceControl = nil
+		cfg.ChannelConfig.SupportedCoins.ExtraCurrencies[key] = ec
+	}
 
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -161,7 +170,14 @@ func openDerivativeForTest(ctx context.Context, node *testNode, channelAddr stri
 		side = "long"
 	}
 
-	return node.derivatives.OpenPosition(ctx, channelAddr, "BTC", side, leverage, amountDecimal, "market", "")
+	id, err := node.derivatives.OpenPosition(ctx, channelAddr, "BTC", side, leverage, amountDecimal, "market", "")
+	if err == nil {
+		return id, nil
+	}
+	if !strings.Contains(err.Error(), "no price resolver") {
+		return "", err
+	}
+	return node.derivatives.OpenPosition(ctx, channelAddr, "BTCUSDT", side, leverage, amountDecimal, "market", "")
 }
 
 func seedChannelTONBalance(t *testing.T, node *testNode, channelAddr string, amount *big.Int) {

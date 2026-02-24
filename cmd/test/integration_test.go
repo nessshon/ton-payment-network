@@ -430,6 +430,8 @@ reCh8:
 	der := conditionals.ConditionalResolvable{
 		Key:          vPubKey,
 		Amount:       tlb.MustFromTON("0.1").Nano(),
+		Fee:          big.NewInt(0),
+		IsInitiator:  true,
 		ResolverAddr: resolverAddr,
 		Details: conditionals.ConditionalResolvableDetails{
 			AssetID:    0,

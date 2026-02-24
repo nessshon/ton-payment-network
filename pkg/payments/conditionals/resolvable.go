@@ -477,6 +477,16 @@ func (c *ConditionalResolvable) CheckInstruction(detailsCell *cell.Cell, isFinal
 		return fmt.Errorf("tunneling is not supported for this conditional type")
 	}
 
+	ccs := c.Action.GetAffectedCoins()
+	if len(ccs) == 0 {
+		return fmt.Errorf("no affected coins for derivative action")
+	}
+
+	balance := balances[ccs[0].BalanceID]
+	if balance == nil || balance.Available().Cmp(c.Amount) < 0 {
+		return fmt.Errorf("not enough balance to cover derivative collateral")
+	}
+
 	var details ConditionalResolvableInstructionDetails
 	if err := payments.LoadState(&details, detailsCell); err != nil {
 		return err

@@ -914,11 +914,11 @@ func (s *Service) closeConditional(ctx context.Context, meta *db.ConditionalMeta
 	isStateSame := bytes.Equal(newActState.Hash(), actState.Hash())
 
 	err = s.db.Transaction(ctx, func(ctx context.Context) error {
+		if err = s.db.ClosePairMeta(ctx, meta.Key, db.ConditionalStateWantClose); err != nil {
+			return fmt.Errorf("failed to update virtual channel pair in db: %w", err)
+		}
 		meta.Status = db.ConditionalStateWantClose
 		meta.UpdatedAt = time.Now()
-		if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
-			return fmt.Errorf("failed to update channel in db: %w", err)
-		}
 
 		// if state is equal after exec, no need to uncoop actions
 		if !isStateSame {

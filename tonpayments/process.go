@@ -369,12 +369,16 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 			}
 
 			if meta.Incoming == nil {
+				if err = s.db.ClosePairMeta(ctx, meta.Key, db.ConditionalStateClosed); err != nil {
+					return fmt.Errorf("failed to close virtual channel pair meta: %w", err)
+				}
 				meta.Status = db.ConditionalStateClosed
-			}
-
-			meta.UpdatedAt = time.Now()
-			if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
-				return fmt.Errorf("failed to update virtual channel meta: %w", err)
+				meta.UpdatedAt = time.Now()
+			} else {
+				meta.UpdatedAt = time.Now()
+				if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
+					return fmt.Errorf("failed to update virtual channel meta: %w", err)
+				}
 			}
 
 			if meta.Incoming != nil {

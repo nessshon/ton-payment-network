@@ -421,15 +421,15 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			}
 		}
 
-		onSuccess = func(ctx context.Context) error {
-			meta.Status = db.ConditionalStateClosed
-			meta.UpdatedAt = time.Now()
-			if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
-				return fmt.Errorf("failed to update virtual channel meta: %w", err)
-			}
+			onSuccess = func(ctx context.Context) error {
+				if err = s.db.ClosePairMeta(ctx, meta.Key, db.ConditionalStateClosed); err != nil {
+					return fmt.Errorf("failed to close virtual channel pair meta: %w", err)
+				}
+				meta.Status = db.ConditionalStateClosed
+				meta.UpdatedAt = time.Now()
 
-			if historyData != nil {
-				if err = s.db.CreateChannelEvent(ctx, channel, time.Now(), db.ChannelHistoryItem{
+				if historyData != nil {
+					if err = s.db.CreateChannelEvent(ctx, channel, time.Now(), db.ChannelHistoryItem{
 					Action: historyAction,
 					Data:   historyData,
 				}); err != nil {

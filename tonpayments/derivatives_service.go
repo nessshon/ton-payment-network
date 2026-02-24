@@ -215,12 +215,8 @@ func (s *DerivativesService) closePositionByID(ctx context.Context, ch *db.Chann
 	}
 
 	refCond := outgoingCond
-	isOurLong := false
-	if refCond != nil {
-		isOurLong = refCond.Details.IsLong
-	} else {
+	if refCond == nil {
 		refCond = incomingCond
-		isOurLong = !refCond.Details.IsLong
 	}
 
 	if refCond == nil || refCond.Details.Leverage == 0 {
@@ -241,21 +237,32 @@ func (s *DerivativesService) closePositionByID(ctx context.Context, ch *db.Chann
 		return fmt.Errorf("failed to get current price: %w", err)
 	}
 
-	var delta *big.Int
-	if isOurLong {
-		delta = new(big.Int).Sub(lastPrice, entryPrice)
-	} else {
-		delta = new(big.Int).Sub(entryPrice, lastPrice)
+	calcPnLForCond := func(cond *conditionals.ConditionalResolvable, isLong bool) *big.Int {
+		var delta *big.Int
+		if isLong {
+			delta = new(big.Int).Sub(lastPrice, entryPrice)
+		} else {
+			delta = new(big.Int).Sub(entryPrice, lastPrice)
+		}
+
+		positionSize := new(big.Int).Mul(cond.Amount, big.NewInt(int64(cond.Details.Leverage)))
+		p := new(big.Int).Mul(positionSize, delta)
+		p.Div(p, entryPrice)
+		return p
 	}
 
-	positionSize := new(big.Int).Mul(refCond.Amount, big.NewInt(int64(refCond.Details.Leverage)))
-	pnl := new(big.Int).Mul(positionSize, delta)
-	pnl.Div(pnl, entryPrice)
+	var pnlOur *big.Int
+	if outgoingCond != nil {
+		pnlOur = calcPnLForCond(outgoingCond, outgoingCond.Details.IsLong)
+	} else {
+		// If outgoing doesn't exist, we evaluate our PnL purely via the inverse of their incoming
+		pnlOur = calcPnLForCond(incomingCond, !incomingCond.Details.IsLong)
+	}
 
 	if outgoingCond != nil {
 		settleAmount := big.NewInt(0)
-		if pnl.Sign() < 0 {
-			loss := new(big.Int).Abs(pnl)
+		if pnlOur.Sign() < 0 {
+			loss := new(big.Int).Abs(pnlOur)
 			if outgoingCond.Amount.Sign() > 0 && loss.Cmp(outgoingCond.Amount) > 0 {
 				loss.Set(outgoingCond.Amount)
 			}
@@ -277,13 +284,15 @@ func (s *DerivativesService) closePositionByID(ctx context.Context, ch *db.Chann
 	}
 
 	if incomingCond != nil {
+		pnlTheir := calcPnLForCond(incomingCond, incomingCond.Details.IsLong)
+
 		settleAmount := big.NewInt(0)
-		if pnl.Sign() > 0 {
-			profit := new(big.Int).Set(pnl)
-			if incomingCond.Amount.Sign() > 0 && profit.Cmp(incomingCond.Amount) > 0 {
-				profit.Set(incomingCond.Amount)
+		if pnlTheir.Sign() < 0 {
+			loss := new(big.Int).Abs(pnlTheir)
+			if incomingCond.Amount.Sign() > 0 && loss.Cmp(incomingCond.Amount) > 0 {
+				loss.Set(incomingCond.Amount)
 			}
-			settleAmount = profit
+			settleAmount = loss
 		}
 
 		resState := conditionals.ResolvableState{

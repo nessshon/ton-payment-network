@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 )
 
 const vchActiveSpecialMetasPrefix = "vchi:ActiveSpecialMetas:"
@@ -140,6 +141,86 @@ func (d *DB) ForEachActiveSpecialMetaKey(ctx context.Context, fn func(key ed2551
 	}
 
 	return nil
+}
+
+func (d *DB) ClosePairMeta(ctx context.Context, key []byte, status ConditionalStatus) error {
+	return d.Transaction(ctx, func(ctx context.Context) error {
+		tx := d.storage.GetExecutor(ctx)
+		now := time.Now()
+
+		loadMeta := func(k []byte) (*ConditionalMeta, error) {
+			raw, err := tx.Get(virtualChannelMetaKey(k))
+			if err != nil {
+				if errors.Is(err, ErrNotFound) {
+					return nil, ErrNotFound
+				}
+				return nil, fmt.Errorf("failed to load virtual channel meta: %w", err)
+			}
+
+			var meta *ConditionalMeta
+			if err = json.Unmarshal(raw, &meta); err != nil {
+				return nil, fmt.Errorf("failed to decode virtual channel meta: %w", err)
+			}
+			return meta, nil
+		}
+
+		storeMeta := func(prev, next *ConditionalMeta) error {
+			data, err := json.Marshal(next)
+			if err != nil {
+				return fmt.Errorf("failed to encode virtual channel meta: %w", err)
+			}
+			if err = tx.Put(virtualChannelMetaKey(next.Key), data); err != nil {
+				return fmt.Errorf("failed to store virtual channel meta: %w", err)
+			}
+			if err = syncActiveSpecialMetasIndex(tx, prev, next); err != nil {
+				return err
+			}
+			return nil
+		}
+
+		resolveLinkedKey := func(meta *ConditionalMeta) []byte {
+			if meta == nil {
+				return nil
+			}
+			if meta.Incoming != nil && len(meta.Incoming.LinkedKey) == ed25519.PublicKeySize {
+				return append([]byte{}, meta.Incoming.LinkedKey...)
+			}
+			if meta.Outgoing != nil && len(meta.Outgoing.LinkedKey) == ed25519.PublicKeySize {
+				return append([]byte{}, meta.Outgoing.LinkedKey...)
+			}
+			return nil
+		}
+
+		meta, err := loadMeta(key)
+		if err != nil {
+			return err
+		}
+
+		prevPrimary := *meta
+		meta.Status = status
+		meta.UpdatedAt = now
+		if err = storeMeta(&prevPrimary, meta); err != nil {
+			return err
+		}
+
+		linkedKey := resolveLinkedKey(meta)
+		if len(linkedKey) != ed25519.PublicKeySize || bytes.Equal(linkedKey, meta.Key) {
+			return nil
+		}
+
+		linkedMeta, err := loadMeta(linkedKey)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil
+			}
+			return err
+		}
+
+		prevLinked := *linkedMeta
+		linkedMeta.Status = status
+		linkedMeta.UpdatedAt = now
+		return storeMeta(&prevLinked, linkedMeta)
+	})
 }
 
 func syncActiveSpecialMetasIndex(tx Executor, prev, next *ConditionalMeta) error {
