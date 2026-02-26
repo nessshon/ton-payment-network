@@ -29,14 +29,14 @@ func derivativeLinkedKey(base []byte) ed25519.PublicKey {
 
 func reverseDerivativeAction(act payments.Action) (payments.Action, error) {
 	switch a := act.(type) {
-	case *actions.ActionSendTon:
-		return &actions.ActionSendTon{
+	case *actions.ActionSendTonInsured:
+		return &actions.ActionSendTonInsured{
 			Coin:     a.Coin,
 			AddressA: a.AddressB,
 			AddressB: a.AddressA,
 		}, nil
-	case *actions.ActionSendJetton:
-		return &actions.ActionSendJetton{
+	case *actions.ActionSendJettonInsured:
+		return &actions.ActionSendJettonInsured{
 			Coin:     a.Coin,
 			AddressA: a.AddressB,
 			AddressB: a.AddressA,
@@ -44,8 +44,8 @@ func reverseDerivativeAction(act payments.Action) (payments.Action, error) {
 			WalletA:  a.WalletB,
 			WalletB:  a.WalletA,
 		}, nil
-	case *actions.ActionSendEC:
-		return &actions.ActionSendEC{
+	case *actions.ActionSendECInsured:
+		return &actions.ActionSendECInsured{
 			Coin:     a.Coin,
 			AddressA: a.AddressB,
 			AddressB: a.AddressA,

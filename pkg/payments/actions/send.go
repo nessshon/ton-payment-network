@@ -50,7 +50,7 @@ func NewSendActionFromBalanceID(ctx context.Context, cc *payments.CoinConfig, a,
 
 	switch {
 	case cc.BalanceID == payments.GetTONBalanceID():
-		return &ActionSendTon{
+		return &ActionSendTonInsured{
 			Coin:     cc,
 			AddressA: aAddr,
 			AddressB: bAddr,
@@ -66,7 +66,7 @@ func NewSendActionFromBalanceID(ctx context.Context, cc *payments.CoinConfig, a,
 			return nil, err
 		}
 
-		return &ActionSendJetton{
+		return &ActionSendJettonInsured{
 			Coin:     cc,
 			AddressA: aAddr,
 			AddressB: bAddr,
@@ -75,7 +75,7 @@ func NewSendActionFromBalanceID(ctx context.Context, cc *payments.CoinConfig, a,
 			WalletB:  wb,
 		}, nil
 	default:
-		return &ActionSendEC{
+		return &ActionSendECInsured{
 			Coin:     cc,
 			AddressA: aAddr,
 			AddressB: bAddr,

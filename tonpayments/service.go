@@ -60,6 +60,7 @@ type DB interface {
 	GetVirtualChannelMeta(ctx context.Context, key []byte) (*db.ConditionalMeta, error)
 	UpdateVirtualChannelMeta(ctx context.Context, meta *db.ConditionalMeta) error
 	CreateVirtualChannelMeta(ctx context.Context, meta *db.ConditionalMeta) error
+	ClosePairMeta(ctx context.Context, key []byte, status db.ConditionalStatus) error
 	ForEachActiveSpecialMetaKey(ctx context.Context, fn func(key ed25519.PublicKey) error) error
 
 	SetBlockOffset(ctx context.Context, seqno uint32) error

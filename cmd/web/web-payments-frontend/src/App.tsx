@@ -6,7 +6,107 @@ import { Send, ArrowDown, ArrowUp, RefreshCw, Copy, PlusCircle, MinusCircle, Act
 import { Card, CardContent } from "./components/ui/card";
 import { Input } from "./components/ui/input";
 import { Button } from "./components/ui/button";
-import { DerivativesPosition, DerivativesQuote, PaymentChannelHistoryItem, PriceHistoryPoint, TxMessage } from "./index";
+import {
+  DerivativesOrderBookLevel,
+  DerivativesOrderBookVolume,
+  DerivativesPosition,
+  DerivativesQuote,
+  DerivativesVolumePoint,
+  PaymentChannelHistoryItem,
+  PriceHistoryPoint,
+  TxMessage,
+} from "./index";
+
+const derivativeBookVolumeEndpoint = "/web-channel/api/v1/derivatives/book_volume";
+
+const fetchDerivativeBookVolume = async (symbol: string): Promise<DerivativesOrderBookVolume> => {
+  const query = new URLSearchParams({
+    symbol,
+    depth: "100",
+    volume_limit: "180",
+  });
+  const response = await fetch(`${derivativeBookVolumeEndpoint}?${query.toString()}`);
+  if (!response.ok) {
+    let text = "";
+    try {
+      text = await response.text();
+    } catch (_) {
+      text = "";
+    }
+    throw new Error(text || `failed to load order book and volume (${response.status})`);
+  }
+  return await response.json();
+};
+
+const formatCompactNumber = (raw: string, maxFractionDigits = 3): string => {
+  const val = Number.parseFloat(raw);
+  if (!Number.isFinite(val)) {
+    return raw;
+  }
+  return val.toLocaleString(undefined, { maximumFractionDigits: maxFractionDigits });
+};
+
+const formatPriceNumber = (raw: string): string => {
+  const val = Number.parseFloat(raw);
+  if (!Number.isFinite(val)) {
+    return raw;
+  }
+  const decimals = Math.abs(val) >= 1000 ? 2 : 4;
+  return val.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: decimals });
+};
+
+const resolveGroupingOptions = (symbol: string): number[] => {
+  if (symbol === "BTCUSDT") {
+    return [0, 1, 5, 10, 25, 50, 100];
+  }
+  if (symbol === "TONUSDT") {
+    return [0, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5];
+  }
+  return [0, 0.01, 0.05, 0.1, 0.5, 1, 5];
+};
+
+const formatGroupingLabel = (step: number): string => {
+  if (step <= 0) {
+    return "Raw";
+  }
+  return formatCompactNumber(step.toString(), 6);
+};
+
+const groupOrderBookLevels = (levels: DerivativesOrderBookLevel[], step: number, side: "ask" | "bid"): DerivativesOrderBookLevel[] => {
+  if (step <= 0) {
+    return levels;
+  }
+
+  const stepStr = step.toString();
+  const decimals = stepStr.includes(".") ? Math.min(8, stepStr.split(".")[1].length) : 0;
+  const grouped = new Map<string, number>();
+  for (const lvl of levels) {
+    const price = Number.parseFloat(lvl.price);
+    const qty = Number.parseFloat(lvl.quantity);
+    if (!Number.isFinite(price) || !Number.isFinite(qty) || qty <= 0) {
+      continue;
+    }
+
+    const scaled = price / step;
+    const bucket = (side === "ask" ? Math.ceil(scaled) : Math.floor(scaled)) * step;
+    const key = bucket.toFixed(decimals);
+    grouped.set(key, (grouped.get(key) || 0) + qty);
+  }
+
+  const out = Array.from(grouped.entries()).map(([price, quantity]) => ({
+    price,
+    quantity: quantity.toFixed(8).replace(/\.?0+$/, ""),
+  }));
+  out.sort((a, b) => {
+    const ap = Number.parseFloat(a.price);
+    const bp = Number.parseFloat(b.price);
+    if (side === "ask") {
+      return ap - bp;
+    }
+    return bp - ap;
+  });
+  return out;
+};
 
 
 function App() {
@@ -220,6 +320,26 @@ type WalletUIProps = {
   derivativesEnabled: boolean;
 };
 
+type LimitOrderConfirmState = {
+  side: "long" | "short";
+  symbol: string;
+  leverage: number;
+  amount: string;
+  orderType: "market" | "limit";
+  limitPrice: string;
+  currentPrice: string;
+  diffPercent: number;
+};
+
+type OpeningDerivativeDraft = {
+  id: string;
+  symbol: string;
+  isLong: boolean;
+  leverage: number;
+  amount: string;
+  createdAt: number;
+};
+
 const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capacities, pendingIn, transactions, currencies, derivativesEnabled }) => {
   const [sendTo, setSendTo] = useState("");
   const [sendAmount, setSendAmount] = useState("");
@@ -249,6 +369,10 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
   const [derivativeLimitPrice, setDerivativeLimitPrice] = useState("");
   const [derivativeOrderType, setDerivativeOrderType] = useState<"market" | "limit">("market");
   const [priceHistory, setPriceHistory] = useState<PriceHistoryPoint[]>([]);
+  const [orderBookVolume, setOrderBookVolume] = useState<DerivativesOrderBookVolume | null>(null);
+  const [orderBookVolumeLoading, setOrderBookVolumeLoading] = useState(true);
+  const [limitOrderConfirm, setLimitOrderConfirm] = useState<LimitOrderConfirmState | null>(null);
+  const [openingDerivativeDraft, setOpeningDerivativeDraft] = useState<OpeningDerivativeDraft | null>(null);
 
   const availableCurrencies = useMemo(() => currencies.length ? currencies : ["TON"], [currencies]);
   const swapPairs = useMemo(() => [{ from: "TON", to: "USDX", coeff: 2 }], []);
@@ -258,6 +382,19 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
   const syncCancellingDerivativeIds = (positions: DerivativesPosition[]) => {
     const activeIDs = new Set(positions.map((p) => p.id));
     setCancellingDerivativeIds((prev) => prev.filter((id) => activeIDs.has(id)));
+  };
+
+  const syncOpeningDerivativeDraft = (positions: DerivativesPosition[]) => {
+    setOpeningDerivativeDraft((prev) => {
+      if (!prev) {
+        return prev;
+      }
+      const exists = positions.some((p) => p.id === prev.id);
+      if (exists) {
+        return null;
+      }
+      return prev;
+    });
   };
 
   useEffect(() => {
@@ -283,28 +420,52 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
     setSwapToAmount((numeric * activeSwapPair.coeff).toString());
   }, [activeSwapPair, swapFromAmount]);
 
-  // Poll positions + quote + price history every second when modal is open
+  // Poll positions + quote + price history + order book/volume every second when modal is open
   useEffect(() => {
     if (!derivativesEnabled || !derivativesModalOpen) {
       return;
     }
+    setOrderBookVolume(null);
+    setOrderBookVolumeLoading(true);
     let first = true;
     const fetchAll = () => {
       if (first) {
         setDerivativesLoading(true);
       }
-      Promise.all([
+      Promise.allSettled([
         window.getDerivativesPositions(),
         window.getDerivativeMarketPrice(derivativeSymbol),
         window.getDerivativePriceHistory(derivativeSymbol),
-      ]).then(([positions, quote, history]) => {
-        const nextPositions = positions ?? [];
-        setDerivativesPositions(nextPositions);
-        syncCancellingDerivativeIds(nextPositions);
-        setDerivativeQuote(quote ?? null);
-        setPriceHistory(history ?? []);
-      }).catch(err => {
-        console.error(err);
+        fetchDerivativeBookVolume(derivativeSymbol),
+      ]).then((results) => {
+        const [positionsRes, quoteRes, historyRes, bookVolumeRes] = results;
+        if (positionsRes.status === "fulfilled") {
+          const nextPositions = positionsRes.value ?? [];
+          setDerivativesPositions(nextPositions);
+          syncCancellingDerivativeIds(nextPositions);
+          syncOpeningDerivativeDraft(nextPositions);
+        } else {
+          console.error(positionsRes.reason);
+        }
+
+        if (quoteRes.status === "fulfilled") {
+          setDerivativeQuote(quoteRes.value ?? null);
+        } else {
+          console.error(quoteRes.reason);
+        }
+
+        if (historyRes.status === "fulfilled") {
+          setPriceHistory(historyRes.value ?? []);
+        } else {
+          console.error(historyRes.reason);
+        }
+
+        if (bookVolumeRes.status === "fulfilled") {
+          setOrderBookVolume(bookVolumeRes.value ?? null);
+          setOrderBookVolumeLoading(false);
+        } else {
+          console.error(bookVolumeRes.reason);
+        }
       }).finally(() => {
         if (first) {
           setDerivativesLoading(false);
@@ -325,6 +486,10 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
       setDerivativesLoading(false);
       setDerivativeActionLoading(null);
       setCancellingDerivativeIds([]);
+      setOrderBookVolume(null);
+      setOrderBookVolumeLoading(true);
+      setLimitOrderConfirm(null);
+      setOpeningDerivativeDraft(null);
     }
   }, [derivativesEnabled]);
 
@@ -429,16 +594,36 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
     }
 
     setDerivativesLoading(true);
-    Promise.all([
+    Promise.allSettled([
       window.getDerivativesPositions(),
       window.getDerivativeMarketPrice(derivativeSymbol),
-    ]).then(([positions, quote]) => {
-      const nextPositions = positions ?? [];
-      setDerivativesPositions(nextPositions);
-      syncCancellingDerivativeIds(nextPositions);
-      setDerivativeQuote(quote ?? null);
-      if (derivativeOrderType === "limit" && quote?.price && !derivativeLimitPrice) {
-        setDerivativeLimitPrice(quote.price);
+      window.getDerivativePriceHistory(derivativeSymbol),
+      fetchDerivativeBookVolume(derivativeSymbol),
+    ]).then((results) => {
+      const [positionsRes, quoteRes, historyRes, bookVolumeRes] = results;
+
+      if (positionsRes.status === "fulfilled") {
+        const nextPositions = positionsRes.value ?? [];
+        setDerivativesPositions(nextPositions);
+        syncCancellingDerivativeIds(nextPositions);
+        syncOpeningDerivativeDraft(nextPositions);
+      }
+
+      if (quoteRes.status === "fulfilled") {
+        const quote = quoteRes.value ?? null;
+        setDerivativeQuote(quote);
+        if (derivativeOrderType === "limit" && quote?.price && !derivativeLimitPrice) {
+          setDerivativeLimitPrice(quote.price);
+        }
+      }
+
+      if (historyRes.status === "fulfilled") {
+        setPriceHistory(historyRes.value ?? []);
+      }
+
+      if (bookVolumeRes.status === "fulfilled") {
+        setOrderBookVolume(bookVolumeRes.value ?? null);
+        setOrderBookVolumeLoading(false);
       }
     }).catch(err => {
       alert(err);
@@ -454,6 +639,44 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
     }
 
     setDerivativesModalOpen(true);
+  };
+
+  const executeOpenDerivative = (
+    symbol: string,
+    side: "long" | "short",
+    leverageNum: number,
+    amount: string,
+    orderType: "market" | "limit",
+    limitPrice?: string
+  ) => {
+    setDerivativeActionLoading(side);
+    window.openDerivativePosition(
+      symbol,
+      side,
+      leverageNum,
+      amount,
+      orderType,
+      orderType === "limit" ? limitPrice : undefined
+    ).then((id) => {
+      setDerivativeAmount("");
+      setDerivativeActionLoading(null);
+      setLimitOrderConfirm(null);
+      if (typeof id === "string" && id.trim() !== "") {
+        setOpeningDerivativeDraft({
+          id: id.trim(),
+          symbol,
+          isLong: side === "long",
+          leverage: leverageNum,
+          amount,
+          createdAt: Date.now(),
+        });
+      }
+      refreshDerivatives();
+    }).catch(err => {
+      setDerivativeActionLoading(null);
+      alert(err);
+      console.error(err);
+    });
   };
 
   const openDerivative = (side: "long" | "short") => {
@@ -473,23 +696,28 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
       return;
     }
 
-    setDerivativeActionLoading(side);
-    window.openDerivativePosition(
-      derivativeSymbol,
-      side,
-      leverageNum,
-      derivativeAmount,
-      derivativeOrderType,
-      derivativeOrderType === "limit" ? derivativeLimitPrice : undefined
-    ).then(() => {
-      setDerivativeAmount("");
-      setDerivativeActionLoading(null);
-      refreshDerivatives();
-    }).catch(err => {
-      setDerivativeActionLoading(null);
-      alert(err);
-      console.error(err);
-    });
+    if (derivativeOrderType === "limit" && derivativeQuote?.price) {
+      const current = parseFloat(derivativeQuote.price);
+      const desired = parseFloat(derivativeLimitPrice);
+      if (Number.isFinite(current) && current > 0 && Number.isFinite(desired) && desired > 0) {
+        const diffPercent = Math.abs(((desired - current) / current) * 100);
+        if (diffPercent >= 10) {
+          setLimitOrderConfirm({
+            side,
+            symbol: derivativeSymbol,
+            leverage: leverageNum,
+            amount: derivativeAmount,
+            orderType: derivativeOrderType,
+            limitPrice: derivativeLimitPrice,
+            currentPrice: derivativeQuote.price,
+            diffPercent,
+          });
+          return;
+        }
+      }
+    }
+
+    executeOpenDerivative(derivativeSymbol, side, leverageNum, derivativeAmount, derivativeOrderType, derivativeLimitPrice);
   };
 
   const closeDerivative = (positionId: string) => {
@@ -832,7 +1060,31 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
           onCancelPosition={cancelDerivative}
           onRefresh={refreshDerivatives}
           priceHistory={priceHistory}
-          onCancel={() => setDerivativesModalOpen(false)}
+          orderBookVolume={orderBookVolume}
+          orderBookVolumeLoading={orderBookVolumeLoading}
+          openingDerivativeDraft={openingDerivativeDraft}
+          onCancel={() => {
+            setDerivativesModalOpen(false);
+            setLimitOrderConfirm(null);
+          }}
+        />
+      )}
+      {limitOrderConfirm && (
+        <LimitOrderConfirmModal
+          side={limitOrderConfirm.side}
+          symbol={limitOrderConfirm.symbol}
+          currentPrice={limitOrderConfirm.currentPrice}
+          limitPrice={limitOrderConfirm.limitPrice}
+          diffPercent={limitOrderConfirm.diffPercent}
+          actionLoading={derivativeActionLoading}
+          onCancel={() => setLimitOrderConfirm(null)}
+          onConfirm={() => {
+            const req = limitOrderConfirm;
+            if (!req) {
+              return;
+            }
+            executeOpenDerivative(req.symbol, req.side, req.leverage, req.amount, req.orderType, req.limitPrice);
+          }}
         />
       )}
       {transferStatus && (
@@ -911,8 +1163,175 @@ const ModalAmount: React.FC<{
   </div>
 );
 
-const PriceChart: React.FC<{ data: PriceHistoryPoint[] }> = ({ data }) => {
+const LimitOrderConfirmModal: React.FC<{
+  side: "long" | "short";
+  symbol: string;
+  currentPrice: string;
+  limitPrice: string;
+  diffPercent: number;
+  actionLoading: "long" | "short" | "close" | "cancel" | null;
+  onConfirm: () => void;
+  onCancel: () => void;
+}> = ({ side, symbol, currentPrice, limitPrice, diffPercent, actionLoading, onConfirm, onCancel }) => {
+  const current = Number.parseFloat(currentPrice);
+  const desired = Number.parseFloat(limitPrice);
+  const isHigher = Number.isFinite(current) && Number.isFinite(desired) && desired > current;
+
+  return (
+    <div className="fixed inset-0 bg-black/45 flex items-center justify-center z-[70]">
+      <div className="bg-white rounded-2xl shadow-2xl w-[min(92vw,460px)] p-6 space-y-4 border border-[#e1ebf4]">
+        <h3 className="text-lg font-semibold text-gray-800">Confirm limit order</h3>
+        <p className="text-sm text-gray-600">
+          Your {side === "long" ? "LONG (buy)" : "SHORT (sell)"} limit price for {symbol} differs from current market price by{" "}
+          <span className="font-semibold text-gray-800">{diffPercent.toFixed(2)}%</span>.
+        </p>
+        <div className="bg-[#f7fbff] border border-[#e0edf8] rounded-xl p-3 space-y-2 text-sm">
+          <div className="flex items-center justify-between">
+            <span className="text-gray-500">Current price</span>
+            <span className="font-semibold text-gray-800">${formatPriceNumber(currentPrice)}</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-gray-500">Limit price</span>
+            <span className="font-semibold text-gray-800">${formatPriceNumber(limitPrice)}</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-gray-500">Difference</span>
+            <span className={`font-semibold ${isHigher ? "text-red-600" : "text-amber-600"}`}>
+              {isHigher ? "Above market" : "Below market"} ({formatCompactNumber(diffPercent.toFixed(2), 2)}%)
+            </span>
+          </div>
+        </div>
+        <p className="text-xs text-gray-500">
+          Check order side and limit price before confirmation.
+        </p>
+        <div className="flex gap-3">
+          <Button
+            onClick={onConfirm}
+            disabled={actionLoading !== null}
+            className="bg-[#0098ea] text-white flex-1 disabled:opacity-50"
+          >
+            {actionLoading === side ? <RefreshCw className="animate-spin" size={14} /> : "Confirm and place"}
+          </Button>
+          <Button
+            onClick={onCancel}
+            disabled={actionLoading !== null}
+            className="bg-gray-200 text-gray-700 flex-1 disabled:opacity-50"
+          >
+            Cancel
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const OrderBookPanel: React.FC<{
+  orderBook: DerivativesOrderBookVolume | null;
+  loading: boolean;
+  selectedSymbol: string;
+}> = ({ orderBook, loading, selectedSymbol }) => {
+  const groupingOptions = useMemo(() => resolveGroupingOptions(selectedSymbol), [selectedSymbol]);
+  const [groupingStep, setGroupingStep] = useState<number>(() => {
+    const defaults = resolveGroupingOptions(selectedSymbol);
+    return defaults.find((v) => v > 0) ?? 0;
+  });
+
+  useEffect(() => {
+    const defaults = resolveGroupingOptions(selectedSymbol);
+    const preferred = defaults.find((v) => v > 0) ?? 0;
+    setGroupingStep(preferred);
+  }, [selectedSymbol]);
+
+  const asksRaw = orderBook?.asks ?? [];
+  const bidsRaw = orderBook?.bids ?? [];
+  const asksGrouped = groupOrderBookLevels(asksRaw, groupingStep, "ask").slice(0, 120);
+  const bidsGrouped = groupOrderBookLevels(bidsRaw, groupingStep, "bid").slice(0, 120);
+  const asks = [...asksGrouped].reverse();
+  const bids = [...bidsGrouped];
+  const allLevels = [...asks, ...bids];
+  const maxQty = Math.max(
+    1,
+    ...allLevels
+      .map((lvl) => Number.parseFloat(lvl.quantity))
+      .filter((qty) => Number.isFinite(qty) && qty > 0)
+  );
+
+  const renderRow = (lvl: DerivativesOrderBookLevel, side: "ask" | "bid") => {
+    const qty = Number.parseFloat(lvl.quantity);
+    const ratio = Number.isFinite(qty) && qty > 0 ? qty / maxQty : 0;
+    const width = Math.max(4, Math.min(100, ratio * 100));
+    const barClass = side === "ask" ? "bg-red-100" : "bg-green-100";
+    const priceClass = side === "ask" ? "text-red-600" : "text-green-600";
+
+    return (
+      <div key={`${side}-${lvl.price}-${lvl.quantity}`} className="relative h-6 rounded overflow-hidden">
+        <div className={`absolute inset-y-0 right-0 ${barClass}`} style={{ width: `${width}%` }} />
+        <div className="relative z-10 h-full px-2 flex items-center justify-between text-[11px]">
+          <span className={`font-semibold ${priceClass}`}>{formatPriceNumber(lvl.price)}</span>
+          <span className="text-gray-500">{formatCompactNumber(lvl.quantity, 4)}</span>
+        </div>
+      </div>
+    );
+  };
+
+  if (loading || !orderBook) {
+    return (
+      <div className="bg-gradient-to-b from-[#f5fbff] to-white rounded-xl border border-[#dce8f3] h-[360px] flex items-center justify-center text-sm text-gray-500">
+        <div className="text-center">
+          <RefreshCw className="animate-spin mx-auto mb-2 text-[#0098ea] opacity-50" size={18} />
+          Loading order book…
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-gradient-to-b from-[#f5fbff] to-white rounded-xl border border-[#dce8f3] p-3 h-[360px] flex flex-col">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-[11px] uppercase tracking-wide text-gray-500 font-medium">Order Book</span>
+        <span className="text-[11px] text-gray-400">{new Date(orderBook.at * 1000).toLocaleTimeString()}</span>
+      </div>
+
+      <div className="flex items-center gap-1 overflow-x-auto pb-2 mb-2 border-b border-[#e6eef7]">
+        <span className="text-[10px] text-gray-400 mr-1 whitespace-nowrap">Grouping</span>
+        {groupingOptions.map((step) => (
+          <button
+            key={`group-step-${step}`}
+            onClick={() => setGroupingStep(step)}
+            className={`px-2 py-1 rounded-md text-[11px] font-medium whitespace-nowrap transition-colors ${
+              groupingStep === step
+                ? "bg-[#0098ea] text-white"
+                : "bg-white text-gray-600 border border-[#dce8f3] hover:bg-[#edf6fd]"
+            }`}
+          >
+            {formatGroupingLabel(step)}
+          </button>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-[1fr_auto] text-[10px] text-gray-400 px-2 mb-1">
+        <span>Price</span>
+        <span>Amount</span>
+      </div>
+
+      <div className="flex-1 overflow-y-auto pr-1 space-y-1.5">
+        {asks.length === 0 && bids.length === 0 ? (
+          <div className="h-full flex items-center justify-center text-xs text-gray-400">Order book is empty</div>
+        ) : (
+          <>
+            {asks.map((lvl) => renderRow(lvl, "ask"))}
+            <div className="h-px bg-[#e8f0f8] my-1" />
+            {bids.map((lvl) => renderRow(lvl, "bid"))}
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const PriceChart: React.FC<{ data: PriceHistoryPoint[]; volumes: DerivativesVolumePoint[]; volumesLoaded: boolean }> = ({ data, volumes, volumesLoaded }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const showVolumes = volumesLoaded;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -929,9 +1348,12 @@ const PriceChart: React.FC<{ data: PriceHistoryPoint[] }> = ({ data }) => {
 
     const w = rect.width;
     const h = rect.height;
-    const pad = { top: 14, right: 64, bottom: 28, left: 10 };
+    const pad = { top: 16, right: 80, bottom: 32, left: 12 };
+    const volumeHeight = showVolumes ? 72 : 0;
+    const volumeGap = showVolumes ? 12 : 0;
     const cw = w - pad.left - pad.right;
-    const ch = h - pad.top - pad.bottom;
+    const ch = h - pad.top - pad.bottom - volumeHeight - volumeGap;
+    const volumeTop = pad.top + ch + volumeGap;
 
     const prices = data.map(d => parseFloat(d.price));
     const times = data.map(d => d.at);
@@ -991,7 +1413,10 @@ const PriceChart: React.FC<{ data: PriceHistoryPoint[] }> = ({ data }) => {
       ctx.fillText(d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }), x, h - 6);
     }
 
-    const toX = (t: number) => pad.left + (cw * (t - minT)) / rangeT;
+    const toX = (t: number) => {
+      const clamped = Math.min(maxT, Math.max(minT, t));
+      return pad.left + (cw * (clamped - minT)) / rangeT;
+    };
     const toY = (p: number) => pad.top + ch - (ch * (p - minP)) / range;
 
     // Gradient fill under the line
@@ -1042,11 +1467,42 @@ const PriceChart: React.FC<{ data: PriceHistoryPoint[] }> = ({ data }) => {
     ctx.arc(lastX, lastY, 2, 0, Math.PI * 2);
     ctx.fillStyle = '#ffffff';
     ctx.fill();
-  }, [data]);
+
+    if (showVolumes) {
+      const volumeBySecond = new Map<number, number>();
+      for (const point of volumes) {
+        const parsed = Number.parseFloat(point.volume);
+        if (!Number.isFinite(parsed) || parsed < 0) {
+          continue;
+        }
+        volumeBySecond.set(point.at, parsed);
+      }
+
+      const alignedPoints = times.map((at) => ({
+        at,
+        volume: volumeBySecond.get(at) ?? 0,
+      }));
+      const maxVolume = Math.max(1, ...alignedPoints.map((v) => v.volume));
+      const barWidth = Math.max(1, Math.floor(cw / Math.max(alignedPoints.length, 60)));
+
+      ctx.fillStyle = '#8fa4b8';
+      ctx.textAlign = 'left';
+      ctx.fillText('Volume', pad.left, volumeTop - 2);
+
+      for (let i = 0; i < alignedPoints.length; i++) {
+        const p = alignedPoints[i];
+        const barHeight = (p.volume / maxVolume) * (volumeHeight - 10);
+        const x = toX(p.at) - barWidth / 2;
+        const y = volumeTop + volumeHeight - barHeight;
+        ctx.fillStyle = i === alignedPoints.length - 1 ? 'rgba(0,152,234,0.55)' : 'rgba(183,222,248,0.95)';
+        ctx.fillRect(x, y, barWidth, barHeight);
+      }
+    }
+  }, [data, showVolumes, volumes]);
 
   if (data.length < 2) {
     return (
-      <div className="bg-gradient-to-b from-[#f0f8ff] to-white rounded-xl p-6 text-center text-sm text-gray-400 flex items-center justify-center" style={{ height: 180 }}>
+      <div className="bg-gradient-to-b from-[#f0f8ff] to-white rounded-xl p-6 text-center text-sm text-gray-400 flex items-center justify-center" style={{ height: 280 }}>
         <div>
           <RefreshCw className="animate-spin mx-auto mb-2 text-[#0098ea] opacity-40" size={20} />
           Waiting for price data…
@@ -1055,7 +1511,7 @@ const PriceChart: React.FC<{ data: PriceHistoryPoint[] }> = ({ data }) => {
     );
   }
 
-  return <canvas ref={canvasRef} style={{ width: '100%', height: 180, display: 'block' }} className="rounded-xl" />;
+  return <canvas ref={canvasRef} style={{ width: '100%', height: showVolumes ? 330 : 280, display: 'block' }} className="rounded-xl" />;
 };
 
 /* Leverage slider tick marks */
@@ -1075,6 +1531,9 @@ const DerivativesModal: React.FC<{
   actionLoading: "long" | "short" | "close" | "cancel" | null;
   cancellingPositionIds: string[];
   priceHistory: PriceHistoryPoint[];
+  orderBookVolume: DerivativesOrderBookVolume | null;
+  orderBookVolumeLoading: boolean;
+  openingDerivativeDraft: OpeningDerivativeDraft | null;
   onAmountChange: (value: string) => void;
   onLeverageChange: (value: string) => void;
   onOrderTypeChange: (value: "market" | "limit") => void;
@@ -1099,6 +1558,9 @@ const DerivativesModal: React.FC<{
   actionLoading,
   cancellingPositionIds,
   priceHistory,
+  orderBookVolume,
+  orderBookVolumeLoading,
+  openingDerivativeDraft,
   onAmountChange,
   onLeverageChange,
   onOrderTypeChange,
@@ -1134,7 +1596,7 @@ const DerivativesModal: React.FC<{
         .deriv-slider::-moz-range-thumb { width: 22px; height: 22px; border-radius: 50%; background: #0098ea; border: 3px solid #fff; box-shadow: 0 1px 6px rgba(0,152,234,0.4); cursor: pointer; }
       `}</style>
         <div
-          className="bg-white rounded-2xl shadow-2xl w-[min(95vw,1100px)] max-h-[90vh] overflow-y-auto border border-[#e0ecf5]"
+          className="bg-white rounded-2xl shadow-2xl w-[min(96vw,1280px)] max-h-[92vh] overflow-y-auto overscroll-contain border border-[#e0ecf5]"
           onClick={(e) => e.stopPropagation()}
         >
           {/* Header */}
@@ -1170,8 +1632,7 @@ const DerivativesModal: React.FC<{
             </div>
           </div>
 
-          <div className="px-6 pb-6 pt-4 lg:grid lg:grid-cols-[minmax(0,1fr)_430px] lg:gap-6">
-            <div className="space-y-5">
+          <div className="px-6 pb-6 pt-4 space-y-5">
               {/* Symbol selector */}
             <div className="flex items-center gap-2">
               {symbols.map((s) => (
@@ -1188,8 +1649,19 @@ const DerivativesModal: React.FC<{
               ))}
             </div>
 
-            {/* Chart */}
-            <PriceChart data={priceHistory} />
+            {/* Chart + Order book */}
+            <div className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] gap-4">
+              <OrderBookPanel
+                orderBook={orderBookVolume}
+                loading={orderBookVolumeLoading}
+                selectedSymbol={selectedSymbol}
+              />
+              <PriceChart
+                data={priceHistory}
+                volumes={orderBookVolume?.volume_history ?? []}
+                volumesLoaded={!orderBookVolumeLoading}
+              />
+            </div>
 
             {/* Order type pills */}
             <div className="flex items-center gap-2">
@@ -1313,10 +1785,6 @@ const DerivativesModal: React.FC<{
               </button>
             </div>
 
-            </div>
-
-            <div className="space-y-4">
-
             {/* Pending Orders */}
             <div>
               <div className="flex items-center justify-between mb-3">
@@ -1328,11 +1796,51 @@ const DerivativesModal: React.FC<{
                 )}
               </div>
               {pendingPositions.length === 0 ? (
-                <div className="text-center py-4 text-sm text-gray-400 bg-[#fafcff] rounded-xl border border-dashed border-[#dce8f3]">
-                  No pending orders
-                </div>
+                openingDerivativeDraft ? (
+                  <div className="bg-[#f4f9ff] border border-[#d3e7f8] rounded-xl p-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <RefreshCw className="animate-spin text-[#0098ea]" size={14} />
+                        <span className="text-sm font-semibold text-gray-700">Opening {openingDerivativeDraft.symbol}</span>
+                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold text-white ${openingDerivativeDraft.isLong ? 'bg-green-500' : 'bg-red-500'}`}>
+                          {openingDerivativeDraft.isLong ? <TrendingUp size={10} /> : <TrendingDown size={10} />}
+                          {openingDerivativeDraft.isLong ? 'LONG' : 'SHORT'}
+                        </span>
+                      </div>
+                      <span className="text-xs text-gray-400">Please wait…</span>
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs mt-3">
+                      <div>
+                        <div className="text-gray-400 mb-0.5">Collateral</div>
+                        <div className="font-semibold text-gray-700">{openingDerivativeDraft.amount} TON</div>
+                      </div>
+                      <div>
+                        <div className="text-gray-400 mb-0.5">Leverage</div>
+                        <div className="font-semibold text-gray-700">×{openingDerivativeDraft.leverage}</div>
+                      </div>
+                      <div>
+                        <div className="text-gray-400 mb-0.5">Status</div>
+                        <div className="font-semibold text-[#0098ea]">Submitting</div>
+                      </div>
+                      <div>
+                        <div className="text-gray-400 mb-0.5">Time</div>
+                        <div className="font-semibold text-gray-700">{new Date(openingDerivativeDraft.createdAt).toLocaleTimeString()}</div>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center py-4 text-sm text-gray-400 bg-[#fafcff] rounded-xl border border-dashed border-[#dce8f3]">
+                    No pending orders
+                  </div>
+                )
               ) : (
                 <div className="space-y-2">
+                  {openingDerivativeDraft && (
+                    <div className="bg-[#f4f9ff] border border-[#d3e7f8] rounded-xl p-3 flex items-center gap-2 text-xs text-gray-600">
+                      <RefreshCw className="animate-spin text-[#0098ea]" size={12} />
+                      Opening new order {openingDerivativeDraft.symbol}…
+                    </div>
+                  )}
                   {pendingPositions.map((p) => {
                     const isCancelling = cancellingPositionIds.includes(p.id);
                     return (
@@ -1453,8 +1961,6 @@ const DerivativesModal: React.FC<{
                   })}
                 </div>
               )}
-            </div>
-
             </div>
           </div>
         </div>

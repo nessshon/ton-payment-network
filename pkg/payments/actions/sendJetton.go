@@ -14,11 +14,11 @@ import (
 
 func init() {
 	payments.ActionTypes[string(actionSendJettonStaticCode.Hash())] = func() payments.Action {
-		return &ActionSendJetton{}
+		return &ActionSendJettonInsured{}
 	}
 }
 
-type ActionSendJetton struct {
+type ActionSendJettonInsured struct {
 	Coin *payments.CoinConfig
 
 	AddressA *address.Address
@@ -29,7 +29,7 @@ type ActionSendJetton struct {
 	WalletB  *address.Address
 }
 
-func (a *ActionSendJetton) Serialize() *cell.Cell {
+func (a *ActionSendJettonInsured) Serialize() *cell.Cell {
 	return cell.BeginCell().
 		MustStoreBuilder(vm.PushSliceRef(cell.BeginCell().MustStoreAddr(a.AddressA).ToSlice())).
 		MustStoreBuilder(vm.PushSliceRef(cell.BeginCell().MustStoreAddr(a.AddressB).ToSlice())).
@@ -43,7 +43,7 @@ func (a *ActionSendJetton) Serialize() *cell.Cell {
 		EndCell()
 }
 
-func (a *ActionSendJetton) Parse(ctx context.Context, balanceTypes payments.BalanceTypeResolver, s *cell.Slice) error {
+func (a *ActionSendJettonInsured) Parse(ctx context.Context, balanceTypes payments.BalanceTypeResolver, s *cell.Slice) error {
 	slc, err := vm.ReadSliceOP(s)
 	if err != nil {
 		return fmt.Errorf("failed to parse addr slice: %w", err)
@@ -142,11 +142,11 @@ func (a *ActionSendJetton) Parse(ctx context.Context, balanceTypes payments.Bala
 	return nil
 }
 
-func (a *ActionSendJetton) GetAffectedCoins() []*payments.CoinConfig {
+func (a *ActionSendJettonInsured) GetAffectedCoins() []*payments.CoinConfig {
 	return []*payments.CoinConfig{a.Coin}
 }
 
-func (a *ActionSendJetton) PrepareNext(ctx context.Context, addrA, addrB *address.Address) (payments.Action, error) {
+func (a *ActionSendJettonInsured) PrepareNext(ctx context.Context, addrA, addrB *address.Address) (payments.Action, error) {
 	wA, err := a.Coin.JettonClient.GetWalletAddress(ctx, addrA)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get wallet address A for %s: %w", addrA, err)
@@ -157,7 +157,7 @@ func (a *ActionSendJetton) PrepareNext(ctx context.Context, addrA, addrB *addres
 		return nil, fmt.Errorf("failed to get wallet address B for %s: %w", addrB, err)
 	}
 
-	return &ActionSendJetton{
+	return &ActionSendJettonInsured{
 		Coin:     a.Coin,
 		AddressA: addrA,
 		AddressB: addrB,
@@ -167,25 +167,25 @@ func (a *ActionSendJetton) PrepareNext(ctx context.Context, addrA, addrB *addres
 	}, nil
 }
 
-func (a *ActionSendJetton) PrepareExecuteState(state *cell.Cell, party *address.Address, seqno uint64, withFee bool, finalBalances map[string]*payments.BalanceInfo) (*cell.Cell, *payments.PendingMessageInfo, error) {
+func (a *ActionSendJettonInsured) PrepareExecuteState(state *cell.Cell, party *address.Address, seqno uint64, withFee bool, finalBalances map[string]*payments.BalanceInfo) (*cell.Cell, *payments.PendingMessageInfo, error) {
 	transferNotificationOp := []byte{0x9c, 0xd0, 0x62, 0x73}
 	return prepareExecuteSendState(state, seqno, a.Coin, withFee, finalBalances, party, transferNotificationOp)
 }
 
-func (a *ActionSendJetton) StatesDiff(before, after *cell.Cell) (map[string]*big.Int, error) {
+func (a *ActionSendJettonInsured) StatesDiff(before, after *cell.Cell) (map[string]*big.Int, error) {
 	return sendStatesDiff(before, after, a.Coin.BalanceID)
 }
 
-func (a *ActionSendJetton) GetFeesPerCommitPropose() (map[string]*big.Int, error) {
+func (a *ActionSendJettonInsured) GetFeesPerCommitPropose() (map[string]*big.Int, error) {
 	return map[string]*big.Int{a.Coin.BalanceID: a.Coin.FeePerWithdrawPropose.Nano()}, nil
 }
 
-func (a *ActionSendJetton) IDCell() *cell.Cell {
+func (a *ActionSendJettonInsured) IDCell() *cell.Cell {
 	// TODO: cache maybe
 	return cell.BeginCell().MustStoreSlice(a.Serialize().Hash(), 256).EndCell()
 }
 
-func (a *ActionSendJetton) EmulateBalance(state *cell.Cell, balances map[string]*payments.BalanceInfo, fromUs bool) error {
+func (a *ActionSendJettonInsured) EmulateBalance(state *cell.Cell, balances map[string]*payments.BalanceInfo, fromUs bool) error {
 	var curState StateActionSend
 	if err := payments.LoadState(&curState, state); err != nil {
 		return err
@@ -209,15 +209,15 @@ func (a *ActionSendJetton) EmulateBalance(state *cell.Cell, balances map[string]
 	return nil
 }
 
-func (a *ActionSendJetton) AddCoins(actionState *cell.Cell, amount *big.Int, locked map[string]*payments.LockedDepositInfo) (*cell.Cell, error) {
+func (a *ActionSendJettonInsured) AddCoins(actionState *cell.Cell, amount *big.Int, locked map[string]*payments.LockedDepositInfo) (*cell.Cell, error) {
 	return sendAddCoins(a.Coin, actionState, amount, locked)
 }
 
-func (a *ActionSendJetton) GetEmptyState() *cell.Cell {
+func (a *ActionSendJettonInsured) GetEmptyState() *cell.Cell {
 	return emptySendState()
 }
 
-func (a *ActionSendJetton) CheckCanRemove(commitedSeqno uint64, state *cell.Cell) (bool, error) {
+func (a *ActionSendJettonInsured) CheckCanRemove(commitedSeqno uint64, state *cell.Cell) (bool, error) {
 	return checkCanRemove(commitedSeqno, state)
 }
 

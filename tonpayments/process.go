@@ -1477,15 +1477,15 @@ func (s *Service) addActionToChannel(ctx context.Context, channel *db.Channel, c
 	}
 
 	switch act := a.(type) {
-	case *actions.ActionSendJetton:
+	case *actions.ActionSendJettonInsured:
 		if err = validateAddrs(act.AddressA, act.AddressB); err != nil {
 			return nil, fmt.Errorf("failed to validate jetton action addresses: %w", err)
 		}
-	case *actions.ActionSendTon:
+	case *actions.ActionSendTonInsured:
 		if err = validateAddrs(act.AddressA, act.AddressB); err != nil {
 			return nil, fmt.Errorf("failed to validate ton action addresses: %w", err)
 		}
-	case *actions.ActionSendEC:
+	case *actions.ActionSendECInsured:
 		if err = validateAddrs(act.AddressA, act.AddressB); err != nil {
 			return nil, fmt.Errorf("failed to validate ec action addresses: %w", err)
 		}

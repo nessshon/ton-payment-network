@@ -31,3 +31,22 @@ type PriceHistoryPoint struct {
 	At    int64  `json:"at"`
 	Price string `json:"price"`
 }
+
+type OrderBookLevel struct {
+	Price    string `json:"price"`
+	Quantity string `json:"quantity"`
+}
+
+type VolumePoint struct {
+	At     int64  `json:"at"`
+	Volume string `json:"volume"`
+}
+
+type OrderBookVolumeView struct {
+	Symbol        string           `json:"symbol"`
+	At            int64            `json:"at"`
+	Volume        string           `json:"volume"`
+	VolumeHistory []VolumePoint    `json:"volume_history"`
+	Bids          []OrderBookLevel `json:"bids"`
+	Asks          []OrderBookLevel `json:"asks"`
+}

@@ -57,8 +57,8 @@ func (r *hardErrorResolver) GetLastPrice() (int64, *big.Int, error) {
 
 func (r *hardErrorResolver) GetPricesSince(_ int64) []oracle.RangePrice { return nil }
 
-func testResolvableActionWithFeePercent(percent float64) *actions.ActionSendTon {
-	return &actions.ActionSendTon{
+func testResolvableActionWithFeePercent(percent float64) *actions.ActionSendTonInsured {
+	return &actions.ActionSendTonInsured{
 		Coin: &payments.CoinConfig{
 			Symbol:   "TON",
 			Decimals: 9,

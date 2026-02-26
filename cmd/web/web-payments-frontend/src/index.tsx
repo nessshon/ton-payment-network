@@ -53,6 +53,25 @@ export interface PriceHistoryPoint {
     price: string;
 }
 
+export interface DerivativesOrderBookLevel {
+    price: string;
+    quantity: string;
+}
+
+export interface DerivativesVolumePoint {
+    at: number;
+    volume: string;
+}
+
+export interface DerivativesOrderBookVolume {
+    symbol: string;
+    at: number;
+    volume: string;
+    volume_history: DerivativesVolumePoint[];
+    bids: DerivativesOrderBookLevel[];
+    asks: DerivativesOrderBookLevel[];
+}
+
 export interface TxMessage {
     to: string;
     amtNano: string;

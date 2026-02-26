@@ -14,11 +14,11 @@ import (
 
 func init() {
 	payments.ActionTypes[string(actionSendECStaticCode.Hash())] = func() payments.Action {
-		return &ActionSendEC{}
+		return &ActionSendECInsured{}
 	}
 }
 
-type ActionSendEC struct {
+type ActionSendECInsured struct {
 	Coin *payments.CoinConfig
 
 	AddressA *address.Address
@@ -27,7 +27,7 @@ type ActionSendEC struct {
 	EC uint32
 }
 
-func (a *ActionSendEC) Serialize() *cell.Cell {
+func (a *ActionSendECInsured) Serialize() *cell.Cell {
 	return cell.BeginCell().
 		MustStoreBuilder(vm.PushSliceRef(cell.BeginCell().MustStoreAddr(a.AddressA).ToSlice())).
 		MustStoreBuilder(vm.PushSliceRef(cell.BeginCell().MustStoreAddr(a.AddressB).ToSlice())).
@@ -37,7 +37,7 @@ func (a *ActionSendEC) Serialize() *cell.Cell {
 		EndCell()
 }
 
-func (a *ActionSendEC) Parse(ctx context.Context, balanceTypes payments.BalanceTypeResolver, s *cell.Slice) error {
+func (a *ActionSendECInsured) Parse(ctx context.Context, balanceTypes payments.BalanceTypeResolver, s *cell.Slice) error {
 	slc, err := vm.ReadSliceOP(s)
 	if err != nil {
 		return fmt.Errorf("failed to parse addr slice: %w", err)
@@ -90,12 +90,12 @@ func (a *ActionSendEC) Parse(ctx context.Context, balanceTypes payments.BalanceT
 	return nil
 }
 
-func (a *ActionSendEC) GetAffectedCoins() []*payments.CoinConfig {
+func (a *ActionSendECInsured) GetAffectedCoins() []*payments.CoinConfig {
 	return []*payments.CoinConfig{a.Coin}
 }
 
-func (a *ActionSendEC) PrepareNext(ctx context.Context, addrA, addrB *address.Address) (payments.Action, error) {
-	return &ActionSendEC{
+func (a *ActionSendECInsured) PrepareNext(ctx context.Context, addrA, addrB *address.Address) (payments.Action, error) {
+	return &ActionSendECInsured{
 		Coin:     a.Coin,
 		AddressA: addrA,
 		AddressB: addrB,
@@ -103,24 +103,24 @@ func (a *ActionSendEC) PrepareNext(ctx context.Context, addrA, addrB *address.Ad
 	}, nil
 }
 
-func (a *ActionSendEC) PrepareExecuteState(state *cell.Cell, party *address.Address, seqno uint64, withFee bool, finalBalances map[string]*payments.BalanceInfo) (*cell.Cell, *payments.PendingMessageInfo, error) {
+func (a *ActionSendECInsured) PrepareExecuteState(state *cell.Cell, party *address.Address, seqno uint64, withFee bool, finalBalances map[string]*payments.BalanceInfo) (*cell.Cell, *payments.PendingMessageInfo, error) {
 	return prepareExecuteSendState(state, seqno, a.Coin, withFee, finalBalances, party, make([]byte, 4))
 }
 
-func (a *ActionSendEC) StatesDiff(before, after *cell.Cell) (map[string]*big.Int, error) {
+func (a *ActionSendECInsured) StatesDiff(before, after *cell.Cell) (map[string]*big.Int, error) {
 	return sendStatesDiff(before, after, a.Coin.BalanceID)
 }
 
-func (a *ActionSendEC) GetFeesPerCommitPropose() (map[string]*big.Int, error) {
+func (a *ActionSendECInsured) GetFeesPerCommitPropose() (map[string]*big.Int, error) {
 	return map[string]*big.Int{a.Coin.BalanceID: a.Coin.FeePerWithdrawPropose.Nano()}, nil
 }
 
-func (a *ActionSendEC) IDCell() *cell.Cell {
+func (a *ActionSendECInsured) IDCell() *cell.Cell {
 	// TODO: cache maybe
 	return cell.BeginCell().MustStoreSlice(a.Serialize().Hash(), 256).EndCell()
 }
 
-func (a *ActionSendEC) EmulateBalance(state *cell.Cell, balances map[string]*payments.BalanceInfo, fromUs bool) error {
+func (a *ActionSendECInsured) EmulateBalance(state *cell.Cell, balances map[string]*payments.BalanceInfo, fromUs bool) error {
 	var curState StateActionSend
 	if err := payments.LoadState(&curState, state); err != nil {
 		return err
@@ -144,15 +144,15 @@ func (a *ActionSendEC) EmulateBalance(state *cell.Cell, balances map[string]*pay
 	return nil
 }
 
-func (a *ActionSendEC) AddCoins(actionState *cell.Cell, amount *big.Int, locked map[string]*payments.LockedDepositInfo) (*cell.Cell, error) {
+func (a *ActionSendECInsured) AddCoins(actionState *cell.Cell, amount *big.Int, locked map[string]*payments.LockedDepositInfo) (*cell.Cell, error) {
 	return sendAddCoins(a.Coin, actionState, amount, locked)
 }
 
-func (a *ActionSendEC) GetEmptyState() *cell.Cell {
+func (a *ActionSendECInsured) GetEmptyState() *cell.Cell {
 	return emptySendState()
 }
 
-func (a *ActionSendEC) CheckCanRemove(commitedSeqno uint64, state *cell.Cell) (bool, error) {
+func (a *ActionSendECInsured) CheckCanRemove(commitedSeqno uint64, state *cell.Cell) (bool, error) {
 	return checkCanRemove(commitedSeqno, state)
 }
 
