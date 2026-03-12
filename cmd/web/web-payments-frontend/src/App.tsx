@@ -12,6 +12,7 @@ import {
   DerivativesPosition,
   DerivativesQuote,
   DerivativesVolumePoint,
+  PaymentWalletRequestEvent,
   PaymentChannelHistoryItem,
   PriceHistoryPoint,
   TxMessage,
@@ -122,6 +123,9 @@ function App() {
   let [pendingIn, setPendingIn] = useState<Record<string, string>>({});
   let [history, setHistory] = useState<PaymentChannelHistoryItem[] | null>(null);
   let [supportedCurrencies, setSupportedCurrencies] = useState<string[]>(["TON"]);
+  const [walletRequestStatus, setWalletRequestStatus] = useState<PaymentWalletRequestEvent | null>(null);
+  const [uncooperativeCloseWarning, setUncooperativeCloseWarning] = useState(false);
+  const [uncooperativeCloseApprovals, setUncooperativeCloseApprovals] = useState(0);
 
   const updateDerivativesAvailability = () => {
     if (typeof window.isDerivativesEnabled !== "function") {
@@ -149,6 +153,8 @@ function App() {
     setCapacities(ev.capacities || {});
     setLockedBalance(ev.locked || {});
     setPendingIn(ev.pendingIn || {});
+    setUncooperativeCloseWarning(Boolean(ev.uncooperativeClose));
+    setUncooperativeCloseApprovals(Number(ev.expectedWalletApprovals || 0));
 
     const currencies = Array.from(new Set([
       ...Object.keys(ev.balances || {}),
@@ -192,6 +198,9 @@ function App() {
   useEffect(() => {
     if (!wallet) {
       setDerivativesEnabled(false);
+      setWalletRequestStatus(null);
+      setUncooperativeCloseWarning(false);
+      setUncooperativeCloseApprovals(0);
       return;
     }
 
@@ -228,6 +237,10 @@ function App() {
 
       let resp = await tonConnectUI.sendTransaction(transaction);
       return resp.boc;
+    };
+    window.onPaymentWalletRequestUpdated = (ev: PaymentWalletRequestEvent) => {
+      console.log("wallet request update", ev);
+      setWalletRequestStatus(ev);
     };
 
     if (wasmInitializedRef.current) {
@@ -284,6 +297,28 @@ function App() {
     };
   }, [wallet, addr, tonConnectUI]);
 
+  useEffect(() => {
+    if (!walletRequestStatus) {
+      return;
+    }
+    if (walletRequestStatus.phase === "queued" || walletRequestStatus.phase === "requested") {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setWalletRequestStatus((current) => {
+        if (!current || current.at !== walletRequestStatus.at) {
+          return current;
+        }
+        return null;
+      });
+    }, walletRequestStatus.phase === "submitted" ? 5000 : 10000);
+
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [walletRequestStatus]);
+
   if (!wallet) {
     return (
       <div className="min-h-screen bg-white text-gray-800 p-6 space-y-6">
@@ -305,6 +340,9 @@ function App() {
       transactions={history}
       currencies={supportedCurrencies}
       derivativesEnabled={derivativesEnabled}
+      walletRequestStatus={walletRequestStatus}
+      uncooperativeCloseWarning={uncooperativeCloseWarning}
+      uncooperativeCloseApprovals={uncooperativeCloseApprovals}
     />
   );
 }
@@ -318,6 +356,9 @@ type WalletUIProps = {
   currencies: string[];
   transactions: PaymentChannelHistoryItem[] | null;
   derivativesEnabled: boolean;
+  walletRequestStatus: PaymentWalletRequestEvent | null;
+  uncooperativeCloseWarning: boolean;
+  uncooperativeCloseApprovals: number;
 };
 
 type LimitOrderConfirmState = {
@@ -340,7 +381,20 @@ type OpeningDerivativeDraft = {
   createdAt: number;
 };
 
-const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capacities, pendingIn, transactions, currencies, derivativesEnabled }) => {
+const walletRequestTitle = (phase: PaymentWalletRequestEvent["phase"]): string => {
+  switch (phase) {
+    case "queued":
+      return "Wallet request queued";
+    case "requested":
+      return "Approve transaction in wallet";
+    case "submitted":
+      return "Wallet transaction submitted";
+    case "failed":
+      return "Wallet transaction failed";
+  }
+};
+
+const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capacities, pendingIn, transactions, currencies, derivativesEnabled, walletRequestStatus, uncooperativeCloseWarning, uncooperativeCloseApprovals }) => {
   const [sendTo, setSendTo] = useState("");
   const [sendAmount, setSendAmount] = useState("");
   const [sendFeeAmount, setSendFeeAmount] = useState("");
@@ -752,6 +806,68 @@ const WalletUI: React.FC<WalletUIProps> = ({ paymentAddr, balances, locked, capa
           <h2 className="text-lg font-bold text-[#772233]">Testnet</h2>
           <TonConnectButton />
         </div>
+
+        {walletRequestStatus && (
+          <Card className={
+            walletRequestStatus.phase === "failed"
+              ? "border-red-200 bg-red-50 shadow-sm rounded-2xl"
+              : walletRequestStatus.phase === "submitted"
+                ? "border-emerald-200 bg-emerald-50 shadow-sm rounded-2xl"
+                : "border-amber-200 bg-amber-50 shadow-sm rounded-2xl"
+          }>
+            <CardContent className="p-4">
+              <div className="flex items-start gap-3">
+                {walletRequestStatus.phase === "failed" ? (
+                  <X className="w-5 h-5 text-red-600 mt-0.5" />
+                ) : walletRequestStatus.phase === "submitted" ? (
+                  <Check className="w-5 h-5 text-emerald-600 mt-0.5" />
+                ) : (
+                  <Activity className="w-5 h-5 text-amber-600 mt-0.5" />
+                )}
+                <div className="space-y-1 min-w-0">
+                  <div className="text-sm font-semibold">
+                    {walletRequestTitle(walletRequestStatus.phase)}
+                  </div>
+                  <div className="text-sm break-words">
+                    {walletRequestStatus.reason}
+                  </div>
+                  {walletRequestStatus.details ? (
+                    <div className="text-xs opacity-80 break-all">
+                      {walletRequestStatus.details}
+                    </div>
+                  ) : (
+                    <div className="text-xs opacity-80">
+                      Messages: {walletRequestStatus.messages}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {uncooperativeCloseWarning && (
+          <Card className="border-amber-200 bg-amber-50 shadow-sm rounded-2xl">
+            <CardContent className="p-4">
+              <div className="flex items-start gap-3">
+                <Activity className="w-5 h-5 text-amber-600 mt-0.5" />
+                <div className="space-y-1 min-w-0">
+                  <div className="text-sm font-semibold">
+                    Uncooperative close in progress
+                  </div>
+                  <div className="text-sm">
+                    Keep this page open until the channel close is completed.
+                  </div>
+                  <div className="text-xs opacity-80">
+                    {uncooperativeCloseApprovals > 0
+                      ? `Up to ${uncooperativeCloseApprovals} wallet approvals may be required.`
+                      : "Additional wallet approvals may still be required."}
+                  </div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         <Card className="bg-[#f0f8ff] shadow-md rounded-2xl">
           <CardContent className="p-6 space-y-4">

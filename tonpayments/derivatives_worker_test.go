@@ -181,6 +181,30 @@ func TestDerivativeIncomingKeyForRemove_Missing(t *testing.T) {
 	}
 }
 
+func TestDerivativeRemoveTerminalMeta(t *testing.T) {
+	trueStatuses := []db.ConditionalStatus{
+		db.ConditionalStateWantClose,
+		db.ConditionalStateClosed,
+		db.ConditionalStateWantRemove,
+		db.ConditionalStateRemoved,
+	}
+	for _, status := range trueStatuses {
+		if !derivativeRemoveTerminalMeta(&db.ConditionalMeta{Status: status}) {
+			t.Fatalf("status %d must be treated as terminal for remove", status)
+		}
+	}
+
+	falseStatuses := []db.ConditionalStatus{
+		db.ConditionalStateActive,
+		db.ConditionalStatePending,
+	}
+	for _, status := range falseStatuses {
+		if derivativeRemoveTerminalMeta(&db.ConditionalMeta{Status: status}) {
+			t.Fatalf("status %d must not be treated as terminal for remove", status)
+		}
+	}
+}
+
 func TestDerivativeOutgoingKeyForLiquidation_FromIncomingLinked(t *testing.T) {
 	linked := make([]byte, ed25519.PublicKeySize)
 	for i := range linked {

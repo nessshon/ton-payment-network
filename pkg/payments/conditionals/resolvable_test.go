@@ -10,6 +10,7 @@ import (
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
 	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals/oracle"
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 )
 
@@ -239,9 +240,10 @@ func TestValidateState_RejectsWhenResolverNotReady(t *testing.T) {
 
 func TestValidateOnAdd_RejectsExcessiveLeverage(t *testing.T) {
 	cond := &ConditionalResolvable{
-		Amount: big.NewInt(100),
-		Fee:    big.NewInt(0),
-		Action: testResolvableActionWithFeePercent(0),
+		Amount:       big.NewInt(100),
+		Fee:          big.NewInt(0),
+		Action:       testResolvableActionWithFeePercent(0),
+		ResolverAddr: &address.Address{},
 		Details: ConditionalResolvableDetails{
 			Leverage: 21,
 		},
@@ -268,9 +270,10 @@ func TestValidateOnAdd_RejectsExcessiveLeverage(t *testing.T) {
 
 func TestValidateOnAdd_RejectsFeeBelowConfiguredPercent(t *testing.T) {
 	cond := &ConditionalResolvable{
-		Amount: big.NewInt(1_000_000_000),
-		Fee:    big.NewInt(9_999_999), // below 1% of amount
-		Action: testResolvableActionWithFeePercent(1),
+		Amount:       big.NewInt(1_000_000_000),
+		Fee:          big.NewInt(9_999_999), // below 1% of amount
+		Action:       testResolvableActionWithFeePercent(1),
+		ResolverAddr: &address.Address{},
 		Details: ConditionalResolvableDetails{
 			Leverage: 10,
 		},
@@ -280,9 +283,29 @@ func TestValidateOnAdd_RejectsFeeBelowConfiguredPercent(t *testing.T) {
 		t.Fatal("ValidateOnAdd should reject fee below configured percent")
 	}
 
-	cond.Fee = big.NewInt(10_000_000)
+	cond.Fee = big.NewInt(100_000_000)
 	if err := cond.ValidateOnAdd(); err != nil {
 		t.Fatalf("ValidateOnAdd should accept fee equal to configured percent, got: %v", err)
+	}
+}
+
+func TestValidateOnAdd_RejectsMissingResolverAddress(t *testing.T) {
+	cond := &ConditionalResolvable{
+		Amount: big.NewInt(1_000_000_000),
+		Fee:    big.NewInt(100_000_000),
+		Action: testResolvableActionWithFeePercent(1),
+		Details: ConditionalResolvableDetails{
+			Leverage: 10,
+		},
+	}
+
+	if err := cond.ValidateOnAdd(); err == nil {
+		t.Fatal("ValidateOnAdd should reject missing resolver address")
+	}
+
+	cond.ResolverAddr = &address.Address{}
+	if err := cond.ValidateOnAdd(); err != nil {
+		t.Fatalf("ValidateOnAdd should accept non-nil resolver address, got: %v", err)
 	}
 }
 

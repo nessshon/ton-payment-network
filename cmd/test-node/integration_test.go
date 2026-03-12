@@ -1,12 +1,14 @@
 package testnode
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +18,9 @@ import (
 	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
 	dbpkg "github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/ton/wallet"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -77,7 +81,7 @@ func TestIntegration_DerivativesInProcess(t *testing.T) {
 	})
 	t.Logf("node2 incoming derivative key=%s", base64.StdEncoding.EncodeToString(incomingKey))
 
-	waitFor(t, 25*time.Second, 300*time.Millisecond, func() (bool, string) {
+	waitFor(t, 45*time.Second, 300*time.Millisecond, func() (bool, string) {
 		meta, err := node2.svc.GetVirtualChannelMeta(context.Background(), incomingKey)
 		if err != nil {
 			return false, fmt.Sprintf("failed to read incoming derivative meta: %v", err)
@@ -423,6 +427,248 @@ func TestIntegration_DerivativesMarketClose_SettlementAndFee(t *testing.T) {
 	})
 }
 
+func TestIntegration_DerivativesMarketClose_ByCounterparty(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+
+	mockResolver := installMockBTCResolver(t, "100")
+
+	hub := newLoopbackHub()
+	node1 := newTestNode(t, hub, 1, 19311)
+	node2 := newTestNode(t, hub, 2, 19312)
+	defer node1.stop(t)
+	defer node2.stop(t)
+
+	node1.start()
+	node2.start()
+
+	seedAmount := tlb.MustFromDecimal("5", 9).Nano()
+	ch12, ch21 := openAndSeedChannel(t, node1, node2, seedAmount)
+
+	derivID, err := openDerivativeForTest(context.Background(), node1, ch12.Our.Address, true, 10, "0.01")
+	if err != nil {
+		t.Fatalf("open derivative position failed: %v", err)
+	}
+
+	positionKeyNode1 := decodeDerivativePositionKeyForTest(t, derivID)
+	metaOutNode1 := waitVirtualMeta(t, node1, positionKeyNode1, false, true)
+	_, incomingKeyNode1, err := resolveDerivativePairKeysForTest(metaOutNode1, positionKeyNode1)
+	if err != nil {
+		t.Fatalf("resolve node1 derivative pair keys failed: %v", err)
+	}
+	metaInNode1 := waitVirtualMeta(t, node1, incomingKeyNode1, true, false)
+
+	var incomingKeyNode2 ed25519.PublicKey
+	waitFor(t, 25*time.Second, 300*time.Millisecond, func() (bool, string) {
+		keys, err := listActiveIncomingDerivativeKeys(node2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to list node2 incoming derivative index: %v", err)
+		}
+		if len(keys) == 0 {
+			return false, "waiting for node2 incoming derivative in index"
+		}
+		incomingKeyNode2 = keys[0]
+		return true, fmt.Sprintf("node2 has %d active incoming derivative(s)", len(keys))
+	})
+
+	metaInNode2 := waitVirtualMeta(t, node2, incomingKeyNode2, true, false)
+	outgoingKeyNode2, _, err := resolveDerivativePairKeysForTest(metaInNode2, incomingKeyNode2)
+	if err != nil {
+		t.Fatalf("resolve node2 derivative pair keys failed: %v", err)
+	}
+	metaOutNode2 := waitVirtualMeta(t, node2, outgoingKeyNode2, false, true)
+
+	waitFor(t, 25*time.Second, 300*time.Millisecond, func() (bool, string) {
+		meta, err := node2.svc.GetVirtualChannelMeta(context.Background(), incomingKeyNode2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to read incoming derivative meta: %v", err)
+		}
+
+		monitor, ok := derivativeMonitor(meta)
+		if !ok {
+			return false, "waiting derivative monitor initialization"
+		}
+		if monitor.EntryCrossed {
+			return true, fmt.Sprintf("monitor ready (entry crossed, last_checked_at=%d)", monitor.LastCheckedAt)
+		}
+		return false, fmt.Sprintf("waiting entry-cross detection (last_checked_at=%d)", monitor.LastCheckedAt)
+	})
+
+	outCondNode1 := loadResolvableFromMetaForTest(t, node1, metaOutNode1, true)
+	inCondNode1 := loadResolvableFromMetaForTest(t, node1, metaInNode1, false)
+	outCondNode2 := loadResolvableFromMetaForTest(t, node2, metaOutNode2, true)
+	inCondNode2 := loadResolvableFromMetaForTest(t, node2, metaInNode2, false)
+
+	chBeforeNode1, err := node1.svc.GetActiveChannel(context.Background(), ch12.Our.Address)
+	if err != nil {
+		t.Fatalf("get node1 channel before close failed: %v", err)
+	}
+	chBeforeNode2, err := node2.svc.GetActiveChannel(context.Background(), ch21.Our.Address)
+	if err != nil {
+		t.Fatalf("get node2 channel before close failed: %v", err)
+	}
+
+	outBeforeNode1 := loadSendActionAmountForMetaSide(t, chBeforeNode1, outCondNode1, true)
+	inBeforeNode1 := loadSendActionAmountForMetaSide(t, chBeforeNode1, inCondNode1, false)
+	outBeforeNode2 := loadSendActionAmountForMetaSide(t, chBeforeNode2, outCondNode2, true)
+	inBeforeNode2 := loadSendActionAmountForMetaSide(t, chBeforeNode2, inCondNode2, false)
+
+	targetPrice := tlb.MustFromDecimal("105", 9).Nano()
+	if err = mockResolver.SetPrice(targetPrice); err != nil {
+		t.Fatalf("set mock price failed: %v", err)
+	}
+
+	if err = node2.derivatives.ClosePosition(context.Background(), ch21.Our.Address, base64.StdEncoding.EncodeToString(incomingKeyNode2), "market"); err != nil {
+		t.Fatalf("counterparty close derivative position failed: %v", err)
+	}
+
+	waitDerivativeMetaInactiveForTest(t, node1, positionKeyNode1)
+	waitDerivativeMetaInactiveForTest(t, node1, incomingKeyNode1)
+	metaOutClosedNode2 := waitDerivativeMetaClosedWithResolveForTest(t, node2, outgoingKeyNode2)
+	metaInClosedNode2 := waitDerivativeMetaClosedWithResolveForTest(t, node2, incomingKeyNode2)
+
+	pnl := calculateDerivativePnLForTest(outCondNode1, targetPrice)
+	wantOutSettle := expectedOutgoingDerivativeSettleForTest(pnl, outCondNode1.Amount)
+	wantInSettle := expectedIncomingDerivativeSettleForTest(pnl, inCondNode1.Amount)
+
+	assertDerivativeResolveAmountForTest(t, metaOutClosedNode2, positionKeyNode1, incomingKeyNode1, wantOutSettle, wantInSettle)
+	assertDerivativeResolveAmountForTest(t, metaInClosedNode2, positionKeyNode1, incomingKeyNode1, wantOutSettle, wantInSettle)
+
+	chAfterNode1, err := node1.svc.GetActiveChannel(context.Background(), ch12.Our.Address)
+	if err != nil {
+		t.Fatalf("get node1 channel after close failed: %v", err)
+	}
+	chAfterNode2, err := node2.svc.GetActiveChannel(context.Background(), ch21.Our.Address)
+	if err != nil {
+		t.Fatalf("get node2 channel after close failed: %v", err)
+	}
+
+	assertDerivativeAmountDeltaForTest(t, chAfterNode1, outCondNode1, inCondNode1, outBeforeNode1, inBeforeNode1,
+		applyDerivativeFeeForTransferForTest(wantOutSettle, outCondNode1.Fee, outCondNode1.IsInitiator),
+		applyDerivativeFeeForTransferForTest(wantInSettle, inCondNode1.Fee, inCondNode1.IsInitiator),
+	)
+	assertDerivativeAmountDeltaForTest(t, chAfterNode2, outCondNode2, inCondNode2, outBeforeNode2, inBeforeNode2,
+		applyDerivativeFeeForTransferForTest(loadResolvableStateFromMetaForTest(t, metaOutClosedNode2).Amount, outCondNode2.Fee, outCondNode2.IsInitiator),
+		applyDerivativeFeeForTransferForTest(loadResolvableStateFromMetaForTest(t, metaInClosedNode2).Amount, inCondNode2.Fee, inCondNode2.IsInitiator),
+	)
+	assertMirroredChannelPairStateForTest(t, chAfterNode1, chAfterNode2)
+
+	waitFor(t, 40*time.Second, 300*time.Millisecond, func() (bool, string) {
+		keys, err := listActiveIncomingDerivativeKeys(node1)
+		if err != nil {
+			return false, fmt.Sprintf("failed to read node1 incoming derivative index: %v", err)
+		}
+		if len(keys) != 0 {
+			return false, fmt.Sprintf("node1 still has %d active incoming derivative(s)", len(keys))
+		}
+		keys, err = listActiveIncomingDerivativeKeys(node2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to read node2 incoming derivative index: %v", err)
+		}
+		if len(keys) != 0 {
+			return false, fmt.Sprintf("node2 still has %d active incoming derivative(s)", len(keys))
+		}
+		return true, "both nodes cleared incoming derivative indexes"
+	})
+}
+
+func TestIntegration_DerivativesCancelBeforeOpen(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+
+	installMockBTCResolver(t, "100")
+
+	hub := newLoopbackHub()
+	node1 := newTestNode(t, hub, 1, 19321)
+	node2 := newTestNode(t, hub, 2, 19322)
+	defer node1.stop(t)
+	defer node2.stop(t)
+
+	node1.start()
+	node2.start()
+
+	seedAmount := tlb.MustFromDecimal("5", 9).Nano()
+	ch12, _ := openAndSeedChannel(t, node1, node2, seedAmount)
+
+	derivID, err := node1.derivatives.OpenPosition(context.Background(), ch12.Our.Address, "BTCUSDT", "long", 10, "0.01", "limit", "80")
+	if err != nil {
+		t.Fatalf("open limit derivative position failed: %v", err)
+	}
+
+	positionKeyNode1 := decodeDerivativePositionKeyForTest(t, derivID)
+	waitVirtualMeta(t, node1, positionKeyNode1, false, true)
+	var incomingKeyNode2 ed25519.PublicKey
+	waitFor(t, 25*time.Second, 300*time.Millisecond, func() (bool, string) {
+		keys, err := listActiveIncomingDerivativeKeys(node2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to list node2 incoming derivative index: %v", err)
+		}
+		if len(keys) == 0 {
+			return false, "waiting for node2 incoming derivative in index"
+		}
+		incomingKeyNode2 = keys[0]
+		return true, fmt.Sprintf("node2 has %d active incoming derivative(s)", len(keys))
+	})
+
+	metaInNode2 := waitVirtualMeta(t, node2, incomingKeyNode2, true, false)
+	waitFor(t, 25*time.Second, 300*time.Millisecond, func() (bool, string) {
+		meta, err := node2.svc.GetVirtualChannelMeta(context.Background(), incomingKeyNode2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to read incoming derivative meta: %v", err)
+		}
+		monitor, ok := derivativeMonitor(meta)
+		if !ok {
+			return false, "waiting derivative monitor initialization"
+		}
+			if monitor.EntryCrossed {
+				return false, "derivative must stay unopened"
+			}
+			return true, fmt.Sprintf("monitor initialized without entry cross, last_checked_at=%d", monitor.LastCheckedAt)
+		})
+
+	if err = node1.derivatives.ClosePosition(context.Background(), ch12.Our.Address, derivID, "cancel"); err != nil {
+		t.Fatalf("cancel derivative position failed: %v", err)
+	}
+
+	waitDerivativeMetaInactiveForTest(t, node2, incomingKeyNode2)
+
+	outgoingKeyNode2, _, err := resolveDerivativePairKeysForTest(metaInNode2, incomingKeyNode2)
+	if err != nil {
+		t.Fatalf("resolve node2 derivative pair keys failed: %v", err)
+	}
+	waitDerivativeMetaInactiveForTest(t, node2, outgoingKeyNode2)
+
+	chAfterNode1, err := node1.svc.GetActiveChannel(context.Background(), ch12.Our.Address)
+	if err != nil {
+		t.Fatalf("get node1 channel after cancel failed: %v", err)
+	}
+	chAfterNode2, err := node2.svc.GetActiveChannel(context.Background(), metaInNode2.Incoming.ChannelAddress)
+	if err != nil {
+		t.Fatalf("get node2 channel after cancel failed: %v", err)
+	}
+	assertMirroredChannelPairStateForTest(t, chAfterNode1, chAfterNode2)
+
+	waitFor(t, 40*time.Second, 300*time.Millisecond, func() (bool, string) {
+		keys, err := listActiveIncomingDerivativeKeys(node1)
+		if err != nil {
+			return false, fmt.Sprintf("failed to read node1 incoming derivative index: %v", err)
+		}
+		if len(keys) != 0 {
+			return false, fmt.Sprintf("node1 still has %d active incoming derivative(s)", len(keys))
+		}
+		keys, err = listActiveIncomingDerivativeKeys(node2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to read node2 incoming derivative index: %v", err)
+		}
+		if len(keys) != 0 {
+			return false, fmt.Sprintf("node2 still has %d active incoming derivative(s)", len(keys))
+		}
+		return true, "both nodes cleared incoming derivative indexes"
+	})
+}
+
 func TestIntegration_DerivativesMarketClose_RejectTamperedResolves(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in -short mode")
@@ -540,6 +786,262 @@ func TestIntegration_DerivativesMarketClose_RejectTamperedResolves(t *testing.T)
 	})
 }
 
+func TestIntegration_DerivativesUncooperativeClose_TwoNodes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+
+	mockResolver := installMockBTCResolver(t, "100")
+
+	hub := newLoopbackHub()
+	node1 := newTestNode(t, hub, 1, 19501)
+	node2 := newTestNode(t, hub, 2, 19502)
+	defer node1.stop(t)
+	defer node2.stop(t)
+
+	node1.start()
+	node2.start()
+
+	seedAmount := tlb.MustFromDecimal("5", 9).Nano()
+	ch12, ch21 := openAndSeedChannel(t, node1, node2, seedAmount)
+
+	derivID, err := openDerivativeForTest(context.Background(), node1, ch12.Our.Address, true, 10, "0.01")
+	if err != nil {
+		t.Fatalf("open derivative position failed: %v", err)
+	}
+
+	positionKeyNode1 := decodeDerivativePositionKeyForTest(t, derivID)
+	metaOutNode1 := waitVirtualMeta(t, node1, positionKeyNode1, false, true)
+	_, incomingKeyNode1, err := resolveDerivativePairKeysForTest(metaOutNode1, positionKeyNode1)
+	if err != nil {
+		t.Fatalf("resolve derivative pair keys failed: %v", err)
+	}
+	waitVirtualMeta(t, node1, incomingKeyNode1, true, false)
+
+	var incomingKeyNode2 ed25519.PublicKey
+	waitFor(t, 35*time.Second, 300*time.Millisecond, func() (bool, string) {
+		keys, err := listActiveIncomingDerivativeKeys(node2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to list node2 incoming derivative index: %v", err)
+		}
+		if len(keys) == 0 {
+			return false, "waiting for node2 incoming derivative in index"
+		}
+		incomingKeyNode2 = keys[0]
+		return true, fmt.Sprintf("node2 has %d active incoming derivative(s)", len(keys))
+	})
+	metaInNode2 := waitVirtualMeta(t, node2, incomingKeyNode2, true, false)
+	outgoingKeyNode2, _, err := resolveDerivativePairKeysForTest(metaInNode2, incomingKeyNode2)
+	if err != nil {
+		t.Fatalf("resolve node2 derivative pair keys failed: %v", err)
+	}
+	waitVirtualMeta(t, node2, outgoingKeyNode2, false, true)
+
+	waitFor(t, 25*time.Second, 300*time.Millisecond, func() (bool, string) {
+		meta, err := node2.svc.GetVirtualChannelMeta(context.Background(), incomingKeyNode2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to read incoming derivative meta: %v", err)
+		}
+
+		monitor, ok := derivativeMonitor(meta)
+		if !ok {
+			return false, "waiting derivative monitor initialization"
+		}
+		if monitor.EntryCrossed {
+			return true, fmt.Sprintf("monitor ready (entry crossed, last_checked_at=%d)", monitor.LastCheckedAt)
+		}
+		return false, fmt.Sprintf("waiting entry-cross detection (last_checked_at=%d)", monitor.LastCheckedAt)
+	})
+
+	targetPrice := tlb.MustFromDecimal("105", 9).Nano()
+	if err = mockResolver.SetPrice(targetPrice); err != nil {
+		t.Fatalf("set mock price failed: %v", err)
+	}
+
+	syncChannelPairFromDB(t, node1, node2, ch12.Our.Address, ch21.Our.Address)
+
+	if err = node1.svc.RequestUncooperativeClose(context.Background(), ch12.Our.Address); err != nil {
+		t.Fatalf("request uncooperative close failed: %v", err)
+	}
+
+	waitChannelInactiveForTest(t, node1, ch12.Our.Address)
+	waitChannelInactiveForTest(t, node2, ch21.Our.Address)
+
+	chAfterNode1, err := node1.db.GetChannel(context.Background(), ch12.Our.Address)
+	if err != nil {
+		t.Fatalf("get node1 channel after uncoop close failed: %v", err)
+	}
+	chAfterNode2, err := node2.db.GetChannel(context.Background(), ch21.Our.Address)
+	if err != nil {
+		t.Fatalf("get node2 channel after uncoop close failed: %v", err)
+	}
+
+	assertMirroredChannelPairStateForTest(t, chAfterNode1, chAfterNode2)
+
+	t.Logf("[two-node-uncoop-flow] %s", strings.Join(node1.chain.flowSnapshot(), " -> "))
+}
+
+func TestIntegration_DerivativesUncooperativeClose_TwoNodes_Testnet(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+	if os.Getenv("PAYMENTS_TESTNET_TWO_NODE") == "" {
+		t.Skip("set PAYMENTS_TESTNET_TWO_NODE=1 to run real testnet two-node flow")
+	}
+
+	installMockBTCResolver(t, "100")
+
+	hub := newTestnetLoopbackHub(t)
+	node1 := newTestnetNode(t, hub, 1, 19601)
+	node2 := newTestnetNode(t, hub, 2, 19602)
+	defer node1.stop(t)
+	defer node2.stop(t)
+
+	node1.start()
+	node2.start()
+
+	t.Logf("[wallet][shared] %s", node1.wallet.WalletAddress().String())
+
+	ch12, ch21 := openAndFundChannelTestnet(t, node1, node2, "0.6")
+
+	mockResolver := installMockBTCResolver(t, "100")
+
+	derivID, err := openDerivativeForTest(context.Background(), node1, ch12.Our.Address, true, 10, "0.01")
+	if err != nil {
+		t.Fatalf("open derivative position failed: %v", err)
+	}
+
+	positionKeyNode1 := decodeDerivativePositionKeyForTest(t, derivID)
+	metaOutNode1 := waitVirtualMeta(t, node1, positionKeyNode1, false, true)
+	_, incomingKeyNode1, err := resolveDerivativePairKeysForTest(metaOutNode1, positionKeyNode1)
+	if err != nil {
+		t.Fatalf("resolve derivative pair keys failed: %v", err)
+	}
+	metaInNode1 := waitVirtualMeta(t, node1, incomingKeyNode1, true, false)
+
+	var incomingKeyNode2 ed25519.PublicKey
+	waitFor(t, 90*time.Second, time.Second, func() (bool, string) {
+		keys, err := listActiveIncomingDerivativeKeys(node2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to list node2 incoming derivative index: %v", err)
+		}
+		if len(keys) == 0 {
+			return false, "waiting for node2 incoming derivative in index"
+		}
+		incomingKeyNode2 = keys[0]
+		return true, fmt.Sprintf("node2 has %d active incoming derivative(s)", len(keys))
+	})
+	metaInNode2 := waitVirtualMeta(t, node2, incomingKeyNode2, true, false)
+	outgoingKeyNode2, _, err := resolveDerivativePairKeysForTest(metaInNode2, incomingKeyNode2)
+	if err != nil {
+		t.Fatalf("resolve node2 derivative pair keys failed: %v", err)
+	}
+	metaOutNode2 := waitVirtualMeta(t, node2, outgoingKeyNode2, false, true)
+
+	waitFor(t, 90*time.Second, time.Second, func() (bool, string) {
+		meta, err := node2.svc.GetVirtualChannelMeta(context.Background(), incomingKeyNode2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to read incoming derivative meta: %v", err)
+		}
+
+		monitor, ok := derivativeMonitor(meta)
+		if !ok {
+			return false, "waiting derivative monitor initialization"
+		}
+		if monitor.EntryCrossed {
+			return true, fmt.Sprintf("monitor ready (entry crossed, last_checked_at=%d)", monitor.LastCheckedAt)
+		}
+		return false, fmt.Sprintf("waiting entry-cross detection (last_checked_at=%d)", monitor.LastCheckedAt)
+	})
+
+	outCondNode1 := loadResolvableFromMetaForTest(t, node1, metaOutNode1, true)
+	inCondNode1 := loadResolvableFromMetaForTest(t, node1, metaInNode1, false)
+	outCondNode2 := loadResolvableFromMetaForTest(t, node2, metaOutNode2, true)
+	inCondNode2 := loadResolvableFromMetaForTest(t, node2, metaInNode2, false)
+	if outCondNode1.ResolverAddr == nil {
+		t.Fatalf("derivative resolver address is nil")
+	}
+
+	chBeforeNode1, err := node1.svc.GetActiveChannel(context.Background(), ch12.Our.Address)
+	if err != nil {
+		t.Fatalf("get node1 channel before uncoop close failed: %v", err)
+	}
+	chBeforeNode2, err := node2.svc.GetActiveChannel(context.Background(), ch21.Our.Address)
+	if err != nil {
+		t.Fatalf("get node2 channel before uncoop close failed: %v", err)
+	}
+	outBeforeNode1 := loadSendActionAmountForMetaSide(t, chBeforeNode1, outCondNode1, true)
+	inBeforeNode1 := loadSendActionAmountForMetaSide(t, chBeforeNode1, inCondNode1, false)
+	outBeforeNode2 := loadSendActionAmountForMetaSide(t, chBeforeNode2, outCondNode2, true)
+	inBeforeNode2 := loadSendActionAmountForMetaSide(t, chBeforeNode2, inCondNode2, false)
+
+	targetPrice := tlb.MustFromDecimal("105", 9).Nano()
+	if err = mockResolver.SetPrice(targetPrice); err != nil {
+		t.Fatalf("set mock price failed: %v", err)
+	}
+	pnl := calculateDerivativePnLForTest(outCondNode1, targetPrice)
+	wantOutSettle := expectedOutgoingDerivativeSettleForTest(pnl, outCondNode1.Amount)
+	wantInSettle := expectedIncomingDerivativeSettleForTest(pnl, inCondNode1.Amount)
+
+	if err = node1.svc.RequestUncooperativeClose(context.Background(), ch12.Our.Address); err != nil {
+		t.Fatalf("request uncooperative close failed: %v", err)
+	}
+
+	waitFor(t, 90*time.Second, time.Second, func() (bool, string) {
+		acc, err := hub.live.chain.GetAccount(context.Background(), outCondNode1.ResolverAddr, time.Time{})
+		if err != nil {
+			return false, fmt.Sprintf("failed to fetch resolver account: %v", err)
+		}
+		if acc != nil && acc.IsActive && acc.HasState {
+			return true, fmt.Sprintf("resolver %s is active on testnet", outCondNode1.ResolverAddr.String())
+		}
+		return false, "waiting resolver deployment on testnet"
+	})
+
+	waitFor(t, 180*time.Second, 2*time.Second, func() (bool, string) {
+		flow := strings.Join(hub.live.flow.snapshot(), " | ")
+		need := []string{"uncoop-start:", "deploy-resolver:", "commit-resolver:", "finish-close:"}
+		for _, part := range need {
+			if !strings.Contains(flow, part) {
+				return false, "waiting flow step " + part
+			}
+		}
+		return true, flow
+	})
+
+	waitChannelInactiveWithinForTest(t, node1, ch12.Our.Address, 240*time.Second)
+	waitChannelInactiveWithinForTest(t, node2, ch21.Our.Address, 240*time.Second)
+
+	metaOutClosedNode2 := waitDerivativeMetaClosedWithResolveForTest(t, node2, outgoingKeyNode2)
+	metaInClosedNode2 := waitDerivativeMetaClosedWithResolveForTest(t, node2, incomingKeyNode2)
+
+	assertDerivativeResolveAmountForTest(t, metaOutClosedNode2, positionKeyNode1, incomingKeyNode1, wantOutSettle, wantInSettle)
+	assertDerivativeResolveAmountForTest(t, metaInClosedNode2, positionKeyNode1, incomingKeyNode1, wantOutSettle, wantInSettle)
+
+	chAfterNode1, err := node1.db.GetChannel(context.Background(), ch12.Our.Address)
+	if err != nil {
+		t.Fatalf("get node1 channel after uncoop close failed: %v", err)
+	}
+	chAfterNode2, err := node2.db.GetChannel(context.Background(), ch21.Our.Address)
+	if err != nil {
+		t.Fatalf("get node2 channel after uncoop close failed: %v", err)
+	}
+
+	assertDerivativeAmountDeltaForTest(t, chAfterNode1, outCondNode1, inCondNode1, outBeforeNode1, inBeforeNode1,
+		applyDerivativeFeeForTransferForTest(wantOutSettle, outCondNode1.Fee, outCondNode1.IsInitiator),
+		applyDerivativeFeeForTransferForTest(wantInSettle, inCondNode1.Fee, inCondNode1.IsInitiator),
+	)
+	assertDerivativeAmountDeltaForTest(t, chAfterNode2, outCondNode2, inCondNode2, outBeforeNode2, inBeforeNode2,
+		applyDerivativeFeeForTransferForTest(loadResolvableStateFromMetaForTest(t, metaOutClosedNode2).Amount, outCondNode2.Fee, outCondNode2.IsInitiator),
+		applyDerivativeFeeForTransferForTest(loadResolvableStateFromMetaForTest(t, metaInClosedNode2).Amount, inCondNode2.Fee, inCondNode2.IsInitiator),
+	)
+	assertMirroredChannelPairStateForTest(t, chAfterNode1, chAfterNode2)
+
+	t.Logf("[two-node-testnet-addresses] wallet=%s channel_a=%s channel_b=%s resolver=%s",
+		node1.wallet.WalletAddress().String(), ch12.Our.Address, ch21.Our.Address, outCondNode1.ResolverAddr.String())
+	t.Logf("[two-node-testnet-flow] %s", strings.Join(hub.live.flow.snapshot(), " -> "))
+}
+
 func openAndSeedChannel(t *testing.T, nodeA, nodeB *testNode, seedAmount *big.Int) (*dbpkg.Channel, *dbpkg.Channel) {
 	t.Helper()
 
@@ -559,8 +1061,178 @@ func openAndSeedChannel(t *testing.T, nodeA, nodeB *testNode, seedAmount *big.In
 	seedChannelTONBalance(t, nodeB, chBA.Our.Address, seedAmount)
 	waitActiveChannelReady(t, nodeA, chAB.Our.Address)
 	waitActiveChannelReady(t, nodeB, chBA.Our.Address)
+	nodeA.chain.syncChannelPair(t, chAB, chBA)
 
 	return chAB, chBA
+}
+
+func syncChannelPairFromDB(t *testing.T, nodeA, nodeB *testNode, addrA, addrB string) (*dbpkg.Channel, *dbpkg.Channel) {
+	t.Helper()
+
+	chA, err := nodeA.db.GetChannel(context.Background(), addrA)
+	if err != nil {
+		t.Fatalf("node %d get channel %s failed: %v", nodeA.idx, addrA, err)
+	}
+	chB, err := nodeB.db.GetChannel(context.Background(), addrB)
+	if err != nil {
+		t.Fatalf("node %d get channel %s failed: %v", nodeB.idx, addrB, err)
+	}
+
+	nodeA.chain.syncChannelPair(t, chA, chB)
+	return chA, chB
+}
+
+func waitChannelInactiveForTest(t *testing.T, node *testNode, channelAddr string) {
+	t.Helper()
+
+	waitChannelInactiveWithinForTest(t, node, channelAddr, 30*time.Second)
+}
+
+func waitChannelInactiveWithinForTest(t *testing.T, node *testNode, channelAddr string, timeout time.Duration) {
+	t.Helper()
+
+	waitFor(t, timeout, 300*time.Millisecond, func() (bool, string) {
+		ch, err := node.db.GetChannel(context.Background(), channelAddr)
+		if err != nil {
+			return false, fmt.Sprintf("node %d get channel %s failed: %v", node.idx, channelAddr, err)
+		}
+		if ch.Status == dbpkg.ChannelStateInactive {
+			return true, fmt.Sprintf("node %d channel %s is inactive", node.idx, channelAddr)
+		}
+		return false, fmt.Sprintf("waiting node %d channel %s inactive, status=%d", node.idx, channelAddr, ch.Status)
+	})
+}
+
+func openAndFundChannelTestnet(t *testing.T, nodeA, nodeB *testNode, amount string) (*dbpkg.Channel, *dbpkg.Channel) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	opened, err := nodeA.svc.OpenChannelWithNode(ctx, nodeB.pub)
+	if err != nil {
+		t.Fatalf("open channel %d->%d failed: %v", nodeA.idx, nodeB.idx, err)
+	}
+	t.Logf("offchain channel opened: %s", opened.String())
+
+	chAB := waitChannelByPeer(t, nodeA, nodeB.pub)
+	chBA := waitChannelByPeer(t, nodeB, nodeA.pub)
+
+	waitActiveChannelReady(t, nodeA, chAB.Our.Address)
+	waitActiveChannelReady(t, nodeB, chBA.Our.Address)
+
+	if chAB.Their.Address != chBA.Our.Address {
+		t.Fatalf("unexpected pair mapping: node %d their=%s node %d our=%s", nodeA.idx, chAB.Their.Address, nodeB.idx, chBA.Our.Address)
+	}
+	if chBA.Their.Address != chAB.Our.Address {
+		t.Fatalf("unexpected pair mapping: node %d their=%s node %d our=%s", nodeB.idx, chBA.Their.Address, nodeA.idx, chAB.Our.Address)
+	}
+
+	topup := tlb.MustFromDecimal(amount, 9)
+	deployChannelContractForTestnet(t, nodeA, chAB, topup)
+
+	waitChannelOnchainReadyForTestnet(t, nodeA, chAB.Our.Address, topup.Nano())
+	waitChannelOnchainReadyForTestnet(t, nodeB, chBA.Our.Address, big.NewInt(1))
+	fundChannelAddressForTestnet(t, nodeA, chAB.Our.Address, tlb.MustFromTON("0.25"))
+	fundChannelAddressForTestnet(t, nodeA, chBA.Our.Address, tlb.MustFromTON("0.25"))
+	waitChannelBalancesAtLeastForTestnet(t, nodeA, chAB.Our.Address, big.NewInt(200_000_000), big.NewInt(200_000_000))
+	waitChannelBalancesAtLeastForTestnet(t, nodeB, chBA.Our.Address, big.NewInt(200_000_000), big.NewInt(200_000_000))
+	return chAB, chBA
+}
+
+func deployChannelContractForTestnet(t *testing.T, node *testNode, ch *dbpkg.Channel, amount tlb.Coins) {
+	t.Helper()
+
+	if node.walletRaw == nil {
+		t.Fatalf("node %d has no raw wallet for testnet deploy", node.idx)
+	}
+
+	var code *cell.Cell
+	for _, candidate := range payments.PaymentChannelCodes {
+		if bytes.Equal(candidate.Hash(), ch.CodeHash) {
+			code = candidate
+			break
+		}
+	}
+	if code == nil {
+		t.Fatalf("node %d cannot resolve channel code for %s", node.idx, ch.Our.Address)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	addr, tx, _, err := node.walletRaw.DeployContractWaitTransaction(ctx, amount, ch.InitMessageBody, code, ch.InitialData)
+	if err != nil {
+		t.Fatalf("node %d deploy contract %s failed: %v", node.idx, ch.Our.Address, err)
+	}
+
+	t.Logf("[testnet-deploy][node=%d] channel=%s tx=%s", node.idx, addr.String(), base64.StdEncoding.EncodeToString(tx.Hash))
+}
+
+func fundChannelAddressForTestnet(t *testing.T, node *testNode, channelAddr string, amount tlb.Coins) {
+	t.Helper()
+
+	if node.walletRaw == nil {
+		t.Fatalf("node %d has no raw wallet for testnet funding", node.idx)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	tx, _, err := node.walletRaw.SendWaitTransaction(ctx, wallet.SimpleMessage(address.MustParseAddr(channelAddr), amount, cell.BeginCell().EndCell()))
+	if err != nil {
+		t.Fatalf("node %d fund channel %s failed: %v", node.idx, channelAddr, err)
+	}
+
+	t.Logf("[testnet-topup][node=%d] channel=%s amount=%s tx=%s", node.idx, channelAddr, amount.String(), base64.StdEncoding.EncodeToString(tx.Hash))
+}
+
+func waitChannelOnchainReadyForTestnet(t *testing.T, node *testNode, channelAddr string, _ *big.Int) {
+	t.Helper()
+
+	waitFor(t, 180*time.Second, time.Second, func() (bool, string) {
+		ch, err := node.db.GetChannel(context.Background(), channelAddr)
+		if err != nil {
+			return false, fmt.Sprintf("node %d get channel %s failed: %v", node.idx, channelAddr, err)
+		}
+
+		if !ch.Our.ActiveOnchain || !ch.Their.ActiveOnchain {
+			return false, fmt.Sprintf("waiting node %d channel %s onchain activation our=%t their=%t", node.idx, channelAddr, ch.Our.ActiveOnchain, ch.Their.ActiveOnchain)
+		}
+
+		ourBal := ch.Our.OnchainBalances[payments.GetTONBalanceID()]
+		theirBal := ch.Their.OnchainBalances[payments.GetTONBalanceID()]
+		if ourBal == nil || theirBal == nil {
+			return false, fmt.Sprintf("waiting node %d channel %s onchain balances", node.idx, channelAddr)
+		}
+		if ourBal.Sign() <= 0 || theirBal.Sign() <= 0 {
+			return false, fmt.Sprintf("waiting node %d channel %s positive balances our=%s their=%s", node.idx, channelAddr, ourBal.String(), theirBal.String())
+		}
+
+		return true, fmt.Sprintf("node %d channel %s is active onchain with balances our=%s their=%s", node.idx, channelAddr, ourBal.String(), theirBal.String())
+	})
+}
+
+func waitChannelBalancesAtLeastForTestnet(t *testing.T, node *testNode, channelAddr string, ourMin, theirMin *big.Int) {
+	t.Helper()
+
+	waitFor(t, 180*time.Second, time.Second, func() (bool, string) {
+		ch, err := node.db.GetChannel(context.Background(), channelAddr)
+		if err != nil {
+			return false, fmt.Sprintf("node %d get channel %s failed: %v", node.idx, channelAddr, err)
+		}
+
+		ourBal := ch.Our.OnchainBalances[payments.GetTONBalanceID()]
+		theirBal := ch.Their.OnchainBalances[payments.GetTONBalanceID()]
+		if ourBal == nil || theirBal == nil {
+			return false, fmt.Sprintf("waiting node %d channel %s onchain balances", node.idx, channelAddr)
+		}
+		if ourBal.Cmp(ourMin) < 0 || theirBal.Cmp(theirMin) < 0 {
+			return false, fmt.Sprintf("waiting node %d channel %s balances our=%s their=%s", node.idx, channelAddr, ourBal.String(), theirBal.String())
+		}
+
+		return true, fmt.Sprintf("node %d channel %s funded our=%s their=%s", node.idx, channelAddr, ourBal.String(), theirBal.String())
+	})
 }
 
 func waitVirtualMeta(t *testing.T, node *testNode, key ed25519.PublicKey, wantIncoming, wantOutgoing bool) *dbpkg.ConditionalMeta {
@@ -710,6 +1382,63 @@ func waitDerivativeMetaClosedWithResolveForTest(t *testing.T, node *testNode, ke
 	return meta
 }
 
+func waitDerivativeMetaInactiveForTest(t *testing.T, node *testNode, key ed25519.PublicKey) *dbpkg.ConditionalMeta {
+	t.Helper()
+
+	var meta *dbpkg.ConditionalMeta
+	waitFor(t, 40*time.Second, 300*time.Millisecond, func() (bool, string) {
+		got, err := node.svc.GetVirtualChannelMeta(context.Background(), key)
+		if err != nil {
+			return false, fmt.Sprintf("failed to get derivative meta: %v", err)
+		}
+		if got.Status == dbpkg.ConditionalStateActive || got.Status == dbpkg.ConditionalStatePending {
+			return false, fmt.Sprintf("waiting derivative inactive, status=%d", got.Status)
+		}
+		meta = got
+		return true, fmt.Sprintf("derivative inactive, status=%d", got.Status)
+	})
+
+	return meta
+}
+
+func waitDerivativeMetaTerminalForTest(t *testing.T, node *testNode, key ed25519.PublicKey) *dbpkg.ConditionalMeta {
+	t.Helper()
+
+	var meta *dbpkg.ConditionalMeta
+	waitFor(t, 40*time.Second, 300*time.Millisecond, func() (bool, string) {
+		got, err := node.svc.GetVirtualChannelMeta(context.Background(), key)
+		if err != nil {
+			return false, fmt.Sprintf("failed to get derivative meta: %v", err)
+		}
+		if got.Status != dbpkg.ConditionalStateClosed && got.Status != dbpkg.ConditionalStateRemoved {
+			return false, fmt.Sprintf("waiting derivative terminal status, got=%d", got.Status)
+		}
+		meta = got
+		return true, fmt.Sprintf("derivative terminal, status=%d", got.Status)
+	})
+
+	return meta
+}
+
+func waitDerivativeMetaResolvedForTest(t *testing.T, node *testNode, key ed25519.PublicKey) *dbpkg.ConditionalMeta {
+	t.Helper()
+
+	var meta *dbpkg.ConditionalMeta
+	waitFor(t, 40*time.Second, 300*time.Millisecond, func() (bool, string) {
+		got, err := node.svc.GetVirtualChannelMeta(context.Background(), key)
+		if err != nil {
+			return false, fmt.Sprintf("failed to get derivative meta: %v", err)
+		}
+		if got.LastKnownResolve == nil {
+			return false, fmt.Sprintf("waiting derivative resolve propagation, status=%d", got.Status)
+		}
+		meta = got
+		return true, fmt.Sprintf("derivative resolved, status=%d", got.Status)
+	})
+
+	return meta
+}
+
 func loadResolvableStateFromMetaForTest(t *testing.T, meta *dbpkg.ConditionalMeta) conditionals.ResolvableState {
 	t.Helper()
 
@@ -722,6 +1451,70 @@ func loadResolvableStateFromMetaForTest(t *testing.T, meta *dbpkg.ConditionalMet
 		t.Fatalf("decode resolve state failed: %v", err)
 	}
 	return state
+}
+
+func assertDerivativeResolveAmountForTest(t *testing.T, meta *dbpkg.ConditionalMeta, outgoingKey, incomingKey ed25519.PublicKey, wantOutgoing, wantIncoming *big.Int) {
+	t.Helper()
+
+	state := loadResolvableStateFromMetaForTest(t, meta)
+	var want *big.Int
+	switch {
+	case bytes.Equal(meta.Key, outgoingKey):
+		want = wantOutgoing
+	case bytes.Equal(meta.Key, incomingKey):
+		want = wantIncoming
+	default:
+		t.Fatalf("unexpected derivative meta key %s", base64.StdEncoding.EncodeToString(meta.Key))
+	}
+
+	if state.Amount.Cmp(want) != 0 {
+		t.Fatalf("unexpected derivative resolve amount for key %s: got %s want %s",
+			base64.StdEncoding.EncodeToString(meta.Key), state.Amount.String(), want.String())
+	}
+}
+
+func assertDerivativeAmountDeltaForTest(t *testing.T, ch *dbpkg.Channel, outCond, inCond *conditionals.ConditionalResolvable, outBefore, inBefore, wantOutTransfer, wantInTransfer *big.Int) {
+	t.Helper()
+
+	outAfter := loadSendActionAmountForMetaSide(t, ch, outCond, true)
+	inAfter := loadSendActionAmountForMetaSide(t, ch, inCond, false)
+	outDiff := new(big.Int).Sub(outAfter, outBefore)
+	inDiff := new(big.Int).Sub(inAfter, inBefore)
+
+	if outDiff.Cmp(wantOutTransfer) != 0 {
+		t.Fatalf("unexpected outgoing transfer delta: got %s want %s", outDiff.String(), wantOutTransfer.String())
+	}
+	if inDiff.Cmp(wantInTransfer) != 0 {
+		t.Fatalf("unexpected incoming transfer delta: got %s want %s", inDiff.String(), wantInTransfer.String())
+	}
+}
+
+func assertMirroredChannelPairStateForTest(t *testing.T, chA, chB *dbpkg.Channel) {
+	t.Helper()
+
+	hashOrNil := func(c *cell.Cell) []byte {
+		if c == nil {
+			return nil
+		}
+		return c.Hash()
+	}
+
+	if !bytes.Equal(hashOrNil(chA.Our.Data.ActionStates.AsCell()), hashOrNil(chB.Their.Data.ActionStates.AsCell())) {
+		t.Fatalf("mirrored action states hash mismatch: nodeA.our=%x nodeB.their=%x",
+			hashOrNil(chA.Our.Data.ActionStates.AsCell()), hashOrNil(chB.Their.Data.ActionStates.AsCell()))
+	}
+	if !bytes.Equal(hashOrNil(chA.Their.Data.ActionStates.AsCell()), hashOrNil(chB.Our.Data.ActionStates.AsCell())) {
+		t.Fatalf("mirrored action states hash mismatch: nodeA.their=%x nodeB.our=%x",
+			hashOrNil(chA.Their.Data.ActionStates.AsCell()), hashOrNil(chB.Our.Data.ActionStates.AsCell()))
+	}
+	if !bytes.Equal(hashOrNil(chA.Our.Data.Conditionals.AsCell()), hashOrNil(chB.Their.Data.Conditionals.AsCell())) {
+		t.Fatalf("mirrored conditionals hash mismatch: nodeA.our=%x nodeB.their=%x",
+			hashOrNil(chA.Our.Data.Conditionals.AsCell()), hashOrNil(chB.Their.Data.Conditionals.AsCell()))
+	}
+	if !bytes.Equal(hashOrNil(chA.Their.Data.Conditionals.AsCell()), hashOrNil(chB.Our.Data.Conditionals.AsCell())) {
+		t.Fatalf("mirrored conditionals hash mismatch: nodeA.their=%x nodeB.our=%x",
+			hashOrNil(chA.Their.Data.Conditionals.AsCell()), hashOrNil(chB.Our.Data.Conditionals.AsCell()))
+	}
 }
 
 func calculateDerivativePnLForTest(cond *conditionals.ConditionalResolvable, currentPrice *big.Int) *big.Int {

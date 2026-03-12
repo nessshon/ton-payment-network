@@ -12,6 +12,8 @@ interface PaymentChannelEvent {
     locked: Record<string, string>;
     pendingIn: Record<string, string>;
     address: string;
+    uncooperativeClose: boolean;
+    expectedWalletApprovals: number;
 }
 
 export interface PaymentChannelHistoryItem {
@@ -79,6 +81,14 @@ export interface TxMessage {
     stateInit?: string;
 }
 
+export interface PaymentWalletRequestEvent {
+    phase: "queued" | "requested" | "submitted" | "failed";
+    reason: string;
+    messages: number;
+    details?: string;
+    at: number;
+}
+
 declare global {
     interface Window {
         startPaymentNetwork: (peerPubKey: string, channelPubKey: string) => void;
@@ -86,6 +96,7 @@ declare global {
         onPaymentNetworkLoaded: (addr: string) => void;
         onPaymentChannelUpdated: (ev: PaymentChannelEvent) => void;
         onPaymentChannelHistoryUpdated: () => void;
+        onPaymentWalletRequestUpdated: (ev: PaymentWalletRequestEvent) => void;
         topupChannel: (amount: string, currency: string) => void;
         sendTransfer: (amount: string, to: string, currency?: string) => Promise<string>;
         estimateTransfer: (amount: string, to: string, currency?: string) => string;
@@ -98,7 +109,7 @@ declare global {
         isDerivativesEnabled: () => boolean;
         getChannelHistory: (limit: number) => Promise<PaymentChannelHistoryItem[] | null>;
         openChannel: () => void;
-        closeChannelUncooperative: (channelAddress: string) => void;
+        closeChannelUncooperative: (channelAddress: string) => Promise<void>;
         withdrawChannel: (amount: string, currency: string, target: string) => void;
         doTransaction: (reason: string, messages: TxMessage[]) => Promise<string>;
     }

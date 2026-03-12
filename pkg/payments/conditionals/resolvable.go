@@ -262,6 +262,9 @@ func (c *ConditionalResolvable) ValidateOnAdd() error {
 	if c.Action == nil {
 		return fmt.Errorf("action is required")
 	}
+	if c.ResolverAddr == nil {
+		return fmt.Errorf("resolver address is required")
+	}
 	ccs := c.Action.GetAffectedCoins()
 	if len(ccs) != 1 || ccs[0] == nil {
 		return fmt.Errorf("unexpected number of affected coins")
@@ -273,7 +276,6 @@ func (c *ConditionalResolvable) ValidateOnAdd() error {
 		return fmt.Errorf("invalid fee: expected at least %s, got %s", minFee.String(), c.Fee.String())
 	}
 
-	// TODO: check resolver addr match
 	return nil
 }
 

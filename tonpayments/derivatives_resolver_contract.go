@@ -25,6 +25,7 @@ const (
 	derivativeResolverQuarantineDuration = uint32(1)
 	derivativeResolverAcceptionWindow    = uint32(10)
 	derivativeResolverDeployAmount       = "0.05"
+	derivativeResolverProxyAmount        = "0.03"
 )
 
 var errDerivativeResolverMetaMissing = errors.New("derivative resolver metadata missing")
@@ -357,4 +358,115 @@ func (s *Service) deployChannelDerivativeResolvers(ctx context.Context, channelA
 	}
 
 	return nil
+}
+
+func prepareDerivativeSettleProxyMessage(ch *payments.ChannelContract, rawMessage *cell.Cell, resolverAddr *address.Address) (*address.Address, *cell.Cell, error) {
+	if ch == nil {
+		return nil, nil, fmt.Errorf("channel is nil")
+	}
+	if rawMessage == nil {
+		return nil, nil, fmt.Errorf("raw settle message is nil")
+	}
+	if resolverAddr == nil {
+		return nil, nil, fmt.Errorf("resolver address is nil")
+	}
+
+	body, err := tlb.ToCell(condcontracts.ProxySettle{
+		ToA: ch.Storage.IsA,
+		Msg: rawMessage,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to wrap proxy settle: %w", err)
+	}
+	return resolverAddr, body, nil
+}
+
+func (s *Service) prepareDerivativeConditionalResolve(ctx context.Context, channel *db.Channel, meta *db.ConditionalMeta, cond *conditionals.ConditionalResolvable) (*cell.Cell, error) {
+	if channel == nil {
+		return nil, fmt.Errorf("channel is nil")
+	}
+	if meta == nil {
+		return nil, fmt.Errorf("conditional meta is nil")
+	}
+	if cond == nil {
+		return nil, fmt.Errorf("conditional is nil")
+	}
+	if cond.ResolverAddr == nil {
+		return nil, fmt.Errorf("resolver address is nil")
+	}
+
+	resolver := oracle.PriceResolvers[cond.Details.AssetID]
+	if resolver == nil {
+		return nil, fmt.Errorf("no price resolver for asset %d", cond.Details.AssetID)
+	}
+
+	acc, err := s.ton.GetAccount(ctx, cond.ResolverAddr, channel.Our.LastProcessedTxAt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get derivative resolver state: %w", err)
+	}
+	if acc == nil || !acc.HasState || acc.Data == nil {
+		return nil, fmt.Errorf("resolver %s is not deployed", cond.ResolverAddr.String())
+	}
+
+	storage, err := condcontracts.LoadDerivativeStorage(acc.Data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse derivative resolver storage: %w", err)
+	}
+
+	entryPrice := cond.Details.EntryPrice.Nano()
+	if entryPrice == nil || entryPrice.Sign() <= 0 {
+		return nil, fmt.Errorf("invalid derivative entry price")
+	}
+
+	entryAt := meta.CreatedAt.UTC().Unix()
+	if storage.CreatedAt != 0 {
+		entryAt = int64(storage.CreatedAt)
+	}
+
+	resolveAt := int64(storage.ExitAt)
+	resolvePrice := storage.ExitPrice.Nano()
+
+	if resolveAt == 0 || resolvePrice == nil || resolvePrice.Sign() <= 0 {
+		resolveAt, resolvePrice, err = resolver.GetLastPrice()
+		if err != nil || resolvePrice == nil || resolvePrice.Sign() <= 0 {
+			return nil, fmt.Errorf("failed to get current derivative price: %w", err)
+		}
+
+		if entryAt <= 0 || entryAt >= resolveAt {
+			entryAt = resolveAt - 1
+			if entryAt <= 0 {
+				entryAt = resolveAt
+			}
+		}
+
+		commitBody, err := buildDerivativeResolverCommitMessage(resolver, entryPrice, entryAt, resolveAt, resolvePrice)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build derivative resolver commit: %w", err)
+		}
+
+		if _, err = s.wallet.DoTransactionMany(ctx, "Commit derivative resolver", []WalletMessage{{
+			To:     cond.ResolverAddr,
+			Amount: tlb.MustFromTON(derivativeResolverProxyAmount),
+			Body:   commitBody,
+		}}); err != nil {
+			return nil, fmt.Errorf("failed to commit derivative resolver price: %w", err)
+		}
+	}
+
+	resolve, err := buildDerivativeResolveForPrice(cond, resolveAt, resolvePrice)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build derivative resolve: %w", err)
+	}
+
+	if meta.LastKnownResolve == nil {
+		if err = meta.AddKnownResolve(ctx, cond, resolve, true); err != nil {
+			return nil, fmt.Errorf("failed to persist derivative resolve: %w", err)
+		}
+		meta.UpdatedAt = time.Now()
+		if err = s.db.UpdateVirtualChannelMeta(ctx, meta); err != nil {
+			return nil, fmt.Errorf("failed to update derivative meta: %w", err)
+		}
+	}
+
+	return resolve, nil
 }

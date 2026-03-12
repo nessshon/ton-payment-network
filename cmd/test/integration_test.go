@@ -47,7 +47,10 @@ var code = payments.PaymentChannelCodes[0]
 var _seed = strings.Split(os.Getenv("WALLET_SEED"), " ")
 
 func TestClient_AsyncChannelFullFlow(t *testing.T) {
-	log.Println(os.Getenv("WALLET_SEED"))
+	if len(_seed) < 12 || strings.TrimSpace(os.Getenv("WALLET_SEED")) == "" {
+		t.Skip("WALLET_SEED is required for testnet integration flow")
+	}
+
 	chainClient := client2.NewTON(api)
 	client := payments.NewPaymentChannelClient(chainClient)
 	ctx := api.Client().StickyContext(context.Background())
@@ -340,6 +343,23 @@ func TestClient_AsyncChannelFullFlow(t *testing.T) {
 	_ = actA.SetIntKey(new(big.Int).SetBytes(actC.Hash()), actStateA)
 	_ = actB.SetIntKey(new(big.Int).SetBytes(actC.Hash()), actStateB)
 
+	loadActionAmount := func(dict *cell.Dictionary, label string) *big.Int {
+		slice, err := dict.LoadValueByIntKey(new(big.Int).SetBytes(actC.Hash()))
+		if err != nil {
+			t.Fatal(fmt.Errorf("failed to load %s action state: %w", label, err))
+		}
+
+		var state actions.StateActionSend
+		if err = payments.LoadState(&state, slice.MustToCell()); err != nil {
+			t.Fatal(fmt.Errorf("failed to parse %s action state: %w", label, err))
+		}
+
+		t.Logf("[balance-flow][%s] action_amount=%s", label, tlb.MustFromNano(state.Amount.Nano(), 9).String())
+		return state.Amount.Nano()
+	}
+
+	initialActionAmount := loadActionAmount(actA, "initial")
+
 	vch := conditionals.ConditionalVirtualChannel{
 		Action:   &a1,
 		Key:      vPubKey,
@@ -603,6 +623,10 @@ func TestClient_AsyncChannelFullFlow(t *testing.T) {
 			bytes.Equal(cur.Storage.Quarantine.TheirState.ConditionalsHash, condAfterDrv.AsCell().Hash())
 	})
 	log.Println("phase 1 settled, updated (derivative applied)")
+	afterDerivativeAmount := loadActionAmount(actAfterDrv, "after-derivative-settle")
+	if new(big.Int).Sub(afterDerivativeAmount, initialActionAmount).Cmp(tlb.MustFromTON("0.01").Nano()) != 0 {
+		t.Fatalf("unexpected derivative settle delta: initial=%s after=%s", initialActionAmount.String(), afterDerivativeAmount.String())
+	}
 
 	// PHASE 2: normal resolves (virtual channels) sent directly to channel
 	toSettleNorm := cell.NewDict(256)
@@ -644,6 +668,12 @@ func TestClient_AsyncChannelFullFlow(t *testing.T) {
 		return bytes.Equal(cur.Storage.Quarantine.TheirState.ActionStatesHash, actFinal.AsCell().Hash())
 	})
 	log.Println("phase 2 settled, actions updated (normal resolves applied)")
+	finalActionAmount := loadActionAmount(actFinal, "after-normal-settle")
+	t.Logf("[balance-flow][channel-action-deltas] derivative_delta=%s normal_delta=%s total_delta=%s",
+		tlb.MustFromNano(new(big.Int).Sub(afterDerivativeAmount, initialActionAmount), 9).String(),
+		tlb.MustFromNano(new(big.Int).Sub(finalActionAmount, afterDerivativeAmount), 9).String(),
+		tlb.MustFromNano(new(big.Int).Sub(finalActionAmount, initialActionAmount), 9).String(),
+	)
 
 	// Use final actions for subsequent steps
 	actA = actFinal
@@ -693,6 +723,10 @@ func TestClient_AsyncChannelFullFlow(t *testing.T) {
 	execToAddr := ch2.Address                // and sends value to this side (B)
 	execFromBefore := getBalanceRetry(execFromAddr, "failed to get execute-source balance before action")
 	execToBefore := getBalanceRetry(execToAddr, "failed to get execute-destination balance before action")
+	t.Logf("[balance-flow][wallet-before-execute] source=%s destination=%s",
+		tlb.MustFromNano(execFromBefore, 9).String(),
+		tlb.MustFromNano(execToBefore, 9).String(),
+	)
 
 	tx = sendExternalRetry(ch2.Address, body, "failed to send tx")
 	log.Println("executed action B external on contract A:", base64.StdEncoding.EncodeToString(tx.Hash))
@@ -713,6 +747,13 @@ func TestClient_AsyncChannelFullFlow(t *testing.T) {
 	spreadBefore := new(big.Int).Sub(execToBefore, execFromBefore)
 	spreadAfter := new(big.Int).Sub(execToAfter, execFromAfter)
 	spreadShift := new(big.Int).Sub(spreadAfter, spreadBefore)
+	t.Logf("[balance-flow][wallet-after-execute] source=%s destination=%s delta_source=%s delta_destination=%s spread_shift=%s",
+		tlb.MustFromNano(execFromAfter, 9).String(),
+		tlb.MustFromNano(execToAfter, 9).String(),
+		tlb.MustFromNano(deltaFrom, 9).String(),
+		tlb.MustFromNano(deltaTo, 9).String(),
+		tlb.MustFromNano(spreadShift, 9).String(),
+	)
 
 	if deltaFrom.Sign() >= 0 {
 		t.Fatalf("unexpected action direction: source side balance did not decrease, delta=%s", deltaFrom.String())

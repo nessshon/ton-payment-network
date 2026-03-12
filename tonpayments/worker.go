@@ -100,7 +100,7 @@ func (s *Service) taskExecutor() {
 						return fmt.Errorf("failed to load conditional meta: %w", err)
 					}
 
-					if meta.Status == db.ConditionalStateClosed || meta.Status == db.ConditionalStateRemoved {
+					if meta.Status == db.ConditionalStateClosed || meta.Status == db.ConditionalStateRemoved || meta.Status == db.ConditionalStateWantRemove {
 						log.Debug().Str("key", base64.StdEncoding.EncodeToString(data.VirtualKey)).Msg("is not active, skip closing")
 						return nil
 					}

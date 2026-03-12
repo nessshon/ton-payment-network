@@ -7,6 +7,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -16,6 +18,8 @@ import (
 
 type Wallet struct {
 }
+
+var walletTxMu sync.Mutex
 
 func InitWallet() (*Wallet, error) {
 	return &Wallet{}, nil
@@ -42,18 +46,25 @@ func (w *Wallet) DoTransaction(ctx context.Context, reason string, to *address.A
 
 func (w *Wallet) DoTransactionMany(ctx context.Context, reason string, messages []tonpayments.WalletMessage) ([]byte, error) {
 	if len(messages) > 4 {
-		panic("attempt to execute more than 4 messages in web")
+		return nil, fmt.Errorf("attempt to execute more than 4 messages in web")
 	}
 
 	doTransaction := js.Global().Get("doTransaction")
 	if doTransaction.Type() != js.TypeFunction {
-		panic("doTransaction func is not registered globally")
+		return nil, errors.New("doTransaction func is not registered globally")
 	}
+
+	notifyWalletRequestStatus("queued", reason, len(messages), "")
+	walletTxMu.Lock()
+	defer walletTxMu.Unlock()
+	notifyWalletRequestStatus("requested", reason, len(messages), "")
 
 	txMessages := make([]interface{}, len(messages))
 	for i, msg := range messages {
 		if msg.EC != nil {
-			panic("ec is not supported on web")
+			err := errors.New("ec is not supported on web")
+			notifyWalletRequestStatus("failed", reason, len(messages), err.Error())
+			return nil, err
 		}
 
 		var siBoc string
@@ -64,6 +75,11 @@ func (w *Wallet) DoTransactionMany(ctx context.Context, reason string, messages 
 			}
 			msg.To = address.NewAddress(0, 0, stateCell.Hash()).Bounce(false)
 			siBoc = base64.StdEncoding.EncodeToString(stateCell.ToBOC())
+		}
+		if msg.To == nil {
+			err := errors.New("wallet message target is not specified")
+			notifyWalletRequestStatus("failed", reason, len(messages), err.Error())
+			return nil, err
 		}
 
 		txMsg := map[string]any{
@@ -89,15 +105,37 @@ func (w *Wallet) DoTransactionMany(ctx context.Context, reason string, messages 
 
 	val, err := awaitPromise(promise)
 	if err != nil {
+		notifyWalletRequestStatus("failed", reason, len(messages), err.Error())
 		return nil, err
 	}
 
 	hash, err := parseResultMsg(val.String())
 	if err != nil {
+		notifyWalletRequestStatus("failed", reason, len(messages), err.Error())
 		return nil, err
 	}
 
+	notifyWalletRequestStatus("submitted", reason, len(messages), base64.StdEncoding.EncodeToString(hash))
 	return hash, nil
+}
+
+func notifyWalletRequestStatus(phase, reason string, messages int, details string) {
+	handler := js.Global().Get("onPaymentWalletRequestUpdated")
+	if handler.Type() != js.TypeFunction {
+		return
+	}
+
+	ev := map[string]any{
+		"phase":    phase,
+		"reason":   reason,
+		"messages": messages,
+		"at":       time.Now().UnixMilli(),
+	}
+	if details != "" {
+		ev["details"] = details
+	}
+
+	handler.Invoke(js.ValueOf(ev))
 }
 
 func awaitPromise(p js.Value) (js.Value, error) {

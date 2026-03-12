@@ -42,6 +42,16 @@ type ActionResolver interface {
 	ResolveAction(ctx context.Context, id []byte) (Action, error)
 }
 
+type VaultData struct {
+	Target    *address.Address `tlb:"addr"`
+	Address   *address.Address `tlb:"addr"`
+	Signature []byte           `tlb:"^ bits 512"`
+}
+
+type VaultResolver interface {
+	ResolveVaults(ctx context.Context, addrA *address.Address, addrB *address.Address) (*VaultData, *VaultData, error)
+}
+
 type BalanceTypeResolver interface {
 	ResolveBalanceType(id string) (*CoinConfig, error)
 	GetKnownBalanceTypes() []*CoinConfig
@@ -59,6 +69,7 @@ type CoinConfig struct {
 	Decimals              uint8
 	MinCapacityRequest    tlb.Coins
 	JettonClient          JettonClient
+	VaultResolver         VaultResolver
 	FeePerWithdrawPropose tlb.Coins
 
 	BalanceID string

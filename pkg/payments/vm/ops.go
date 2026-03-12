@@ -47,6 +47,10 @@ func PushRef(slc *cell.Cell) *cell.Builder {
 	return cell.BeginCell().MustStoreUInt(0x88, 8).MustStoreRef(slc)
 }
 
+func PushNull() *cell.Builder {
+	return cell.BeginCell().MustStoreUInt(0x6D, 8)
+}
+
 func PushSliceRef(slc *cell.Slice) *cell.Builder {
 	return cell.BeginCell().MustStoreUInt(0x89, 8).MustStoreRef(slc.MustToCell())
 }
@@ -59,6 +63,22 @@ func ReadCellOP(code *cell.Slice) (*cell.Cell, error) {
 
 	if v != 0x88 {
 		return nil, fmt.Errorf("incorrect opcode")
+	}
+	return code.LoadRefCell()
+}
+
+func ReadCellOrNullOP(code *cell.Slice) (*cell.Cell, error) {
+	v, err := code.LoadUInt(8)
+	if err != nil {
+		return nil, err
+	}
+
+	if v != 0x88 && v != 0x6D {
+		return nil, fmt.Errorf("incorrect opcode")
+	}
+	
+	if v == 0x6D {
+		return nil, nil
 	}
 	return code.LoadRefCell()
 }

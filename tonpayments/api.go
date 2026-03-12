@@ -18,6 +18,7 @@ import (
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
 	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
+	condcontracts "github.com/xssnick/ton-payment-network/pkg/payments/conditionals/contracts"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/address"
@@ -868,16 +869,30 @@ func (s *Service) CloseConditional(ctx context.Context, virtualKey ed25519.Publi
 }
 
 func (s *Service) closeConditional(ctx context.Context, meta *db.ConditionalMeta) error {
+	if meta == nil {
+		return fmt.Errorf("conditional meta is nil")
+	}
+
+	resolve := meta.LastKnownResolve
+	if resolve == nil {
+		return ErrNoResolveExists
+	}
+
+	if meta.Incoming == nil {
+		if err := s.db.ClosePairMeta(ctx, meta.Key, db.ConditionalStateWantClose); err != nil {
+			return fmt.Errorf("failed to update outgoing virtual channel pair in db: %w", err)
+		}
+		meta.Status = db.ConditionalStateWantClose
+		meta.UpdatedAt = time.Now()
+		return nil
+	}
+
 	ch, err := s.GetActiveChannel(ctx, meta.Incoming.ChannelAddress)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return fmt.Errorf("onchain channel with source is not active")
 		}
 		return fmt.Errorf("failed to get channel: %w", err)
-	}
-
-	if meta.Incoming == nil {
-		return ErrCannotCloseOutgoingVirtual
 	}
 
 	condId := meta.Incoming.Conditional.Hash()
@@ -891,11 +906,6 @@ func (s *Service) closeConditional(ctx context.Context, meta *db.ConditionalMeta
 
 		log.Error().Err(err).Str("channel", ch.Our.Address).Msg("failed to find virtual channel")
 		return fmt.Errorf("failed to find virtual channel: %w", err)
-	}
-
-	resolve := meta.LastKnownResolve
-	if resolve == nil {
-		return ErrNoResolveExists
 	}
 
 	actStateSlice, err := ch.Their.Data.ActionStates.LoadValue(cond.GetAction().IDCell())
@@ -1509,6 +1519,10 @@ func (s *Service) finishUncooperativeChannelClose(ctx context.Context, channelAd
 
 func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr string) error {
 	const conditionsPerMessage = 30
+	type settleConditionalMessage struct {
+		Message        *cell.Cell
+		ExpectedSender *address.Address
+	}
 
 	log.Info().Str("address", channelAddr).Msg("settling conditionals")
 
@@ -1548,11 +1562,15 @@ func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr str
 		return fmt.Errorf("failed to load their conditions dict: %w", err)
 	}
 
-	var condMessages []*cell.Cell
+	var condMessages []settleConditionalMessage
 	var resolved int
 	var pending int
 
 	addMessage := func(data *payments.SettleMsg, condProofPath, actProofPath *cell.ProofSkeleton) error {
+		if data.Signed.ToSettle == nil || data.Signed.ToSettle.IsEmpty() {
+			return nil
+		}
+
 		condDictProof, err := channel.Their.Data.Conditionals.AsCell().CreateProof(condProofPath)
 		if err != nil {
 			log.Warn().Err(err).Msg("failed to find proof path for conditionals dict")
@@ -1579,7 +1597,10 @@ func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr str
 			return fmt.Errorf("failed to serialize message to cell: %w", err)
 		}
 
-		condMessages = append(condMessages, msgCell)
+		condMessages = append(condMessages, settleConditionalMessage{
+			Message:        msgCell,
+			ExpectedSender: data.Signed.ExpectedSender,
+		})
 		return nil
 	}
 
@@ -1588,6 +1609,26 @@ func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr str
 
 	condNum := 0
 	condProofPath, actProofPath := cell.CreateProofSkeleton(), cell.CreateProofSkeleton()
+	flushMessage := func() error {
+		if condNum == 0 {
+			return nil
+		}
+
+		if err := addMessage(&msg, condProofPath, actProofPath); err != nil {
+			log.Warn().Err(err).Msg("failed to add settle message")
+			return err
+		}
+
+		condNum = 0
+		condProofPath = cell.CreateProofSkeleton()
+		actProofPath = cell.CreateProofSkeleton()
+		channel.Their.Data.Conditionals = updatedState.Copy()
+		channel.Their.Data.ActionStates = updatedActions.Copy()
+		msg.Signed.ExpectedSender = nil
+		msg.Signed.ToSettle = cell.NewDict(256)
+
+		return nil
+	}
 	for _, kv := range all {
 		if kv.Value.RefsNum() == 0 && kv.Value.BitsLeft() == 0 {
 			// executed
@@ -1608,7 +1649,29 @@ func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr str
 			continue
 		}
 
-		if resolve := meta.LastKnownResolve; resolve != nil {
+		resolve := meta.LastKnownResolve
+		var expectedSender *address.Address
+		if drv, ok := vch.(*conditionals.ConditionalResolvable); ok && drv.ResolverAddr != nil {
+			expectedSender = drv.ResolverAddr
+			if resolve == nil {
+				resolve, err = s.prepareDerivativeConditionalResolve(ctx, channel, meta, drv)
+				if err != nil {
+					log.Warn().Err(err).Str("key", base64.StdEncoding.EncodeToString(drv.GetKey())).Msg("failed to prepare derivative settle resolve")
+					continue
+				}
+			}
+		}
+
+		if resolve != nil {
+			if expectedSender != nil && condNum > 0 {
+				if err := flushMessage(); err != nil {
+					return err
+				}
+			}
+			if expectedSender != nil {
+				msg.Signed.ExpectedSender = expectedSender
+			}
+
 			actionState, sk, err := channel.Their.Data.ActionStates.LoadValueWithProof(vch.GetAction().IDCell(), actProofPath)
 			if err != nil {
 				log.Warn().Err(err).Msg("failed to find proof path for action state")
@@ -1646,32 +1709,23 @@ func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr str
 				continue
 			}
 
-			if condNum == conditionsPerMessage {
-				if err := addMessage(&msg, condProofPath, actProofPath); err != nil {
-					log.Warn().Err(err).Msg("failed to add settle message")
+			if expectedSender != nil || condNum == conditionsPerMessage {
+				if err := flushMessage(); err != nil {
 					return err
 				}
-
-				condNum = 0
-				condProofPath = cell.CreateProofSkeleton()
-				actProofPath = cell.CreateProofSkeleton()
-				channel.Their.Data.Conditionals = updatedState.Copy()
-				channel.Their.Data.ActionStates = updatedActions.Copy()
-				msg.Signed.ToSettle = cell.NewDict(256)
 			}
 			resolved++
 		}
 	}
 
-	if condNum%conditionsPerMessage != 0 {
-		if err := addMessage(&msg, condProofPath, actProofPath); err != nil {
-			log.Warn().Err(err).Msg("failed to add settle last message")
-			return err
-		}
+	if err := flushMessage(); err != nil {
+		log.Warn().Err(err).Msg("failed to add settle last message")
+		return err
 	}
 
 	if resolved != pending {
-		return fmt.Errorf("cannot settle conditionals partially: resolved=%d pending=%d", resolved, pending)
+		log.Warn().Int("resolved", resolved).Int("pending", pending).Msg("not all conditions resolved")
+		// return fmt.Errorf("cannot settle conditionals partially: resolved=%d pending=%d", resolved, pending)
 	}
 
 	expectedActionsHash := updatedActions.AsCell().Hash()
@@ -1679,14 +1733,20 @@ func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr str
 
 	err = s.db.Transaction(ctx, func(ctx context.Context) error {
 		for i, message := range condMessages {
+			var executeAfter *time.Time
+			if message.ExpectedSender != nil {
+				at := time.Now().Add(time.Duration(derivativeResolverQuarantineDuration+1) * time.Second)
+				executeAfter = &at
+			}
+
 			if err = s.db.CreateTask(ctx, PaymentsTaskPool, "settle-step", channel.Our.Address+"-settle",
 				"settle-"+channel.Our.Address+"-"+fmt.Sprint(i),
 				db.SettleConditionalStepTask{
 					Step:               i,
 					Address:            channel.Our.Address,
-					Message:            message,
+					Message:            message.Message,
 					ChannelInitiatedAt: &channel.InitAt,
-				}, nil, nil,
+				}, executeAfter, nil,
 			); err != nil {
 				log.Error().Err(err).Str("channel", channel.Our.Address).Msg("failed to create settle step task")
 			}
@@ -1959,18 +2019,12 @@ func (s *Service) executeSettleStep(ctx context.Context, channelAddr string, raw
 		return nil
 	}
 
-	if err = s.CheckAddrBalance(ctx, address.MustParseAddr(channel.Our.Address), "", tlb.ZeroCoins); err != nil {
-		return fmt.Errorf("failed to check balance: %w", err)
-	}
-
 	c, err := s.channelClient.GetChannel(ctx, address.MustParseAddr(channel.Our.Address), true, channel.Our.LastProcessedTxAt)
 	if err != nil {
 		return fmt.Errorf("failed to get onchain channel: %w", err)
 	}
 
-	// enrich with seqno and signature only, other data should be fine
 	msg.Signed.WalletSeqno = c.Storage.WalletSeqno
-	msg.Signed.ExpectedSender = nil
 
 	dataCell, err := tlb.ToCell(msg.Signed)
 	if err != nil {
@@ -1981,6 +2035,48 @@ func (s *Service) executeSettleStep(ctx context.Context, channelAddr string, raw
 	message, err := tlb.ToCell(msg)
 	if err != nil {
 		return fmt.Errorf("failed to serialize wrap body to cell: %w", err)
+	}
+
+	if msg.Signed.ExpectedSender != nil {
+		acc, err := s.ton.GetAccount(ctx, msg.Signed.ExpectedSender, channel.Our.LastProcessedTxAt)
+		if err != nil {
+			return fmt.Errorf("failed to get derivative resolver state: %w", err)
+		}
+		if acc == nil || !acc.HasState || acc.Data == nil {
+			return ErrStillPending
+		}
+
+		storage, err := condcontracts.LoadDerivativeStorage(acc.Data)
+		if err != nil {
+			return fmt.Errorf("failed to parse derivative resolver storage: %w", err)
+		}
+		if storage.ExitAt == 0 {
+			return ErrStillPending
+		}
+
+		if err = s.CheckWalletBalance(ctx, "", tlb.MustFromTON(derivativeResolverProxyAmount)); err != nil {
+			return fmt.Errorf("failed to check wallet balance: %w", err)
+		}
+
+		target, proxiedBody, err := prepareDerivativeSettleProxyMessage(c, message, msg.Signed.ExpectedSender)
+		if err != nil {
+			return fmt.Errorf("failed to build derivative settle proxy message: %w", err)
+		}
+
+		msgHash, err := s.wallet.DoTransactionMany(ctx, "Proxy derivative settle", []WalletMessage{{
+			To:     target,
+			Amount: tlb.MustFromTON(derivativeResolverProxyAmount),
+			Body:   proxiedBody,
+		}})
+		if err != nil {
+			return fmt.Errorf("failed to send proxy settle transaction: %w", err)
+		}
+		log.Info().Str("addr", channel.Our.Address).Str("resolver", target.String()).Str("hash", base64.StdEncoding.EncodeToString(msgHash)).Int("step", step).Msg("settle conditions step transaction proxied via resolver")
+		return nil
+	}
+
+	if err = s.CheckAddrBalance(ctx, address.MustParseAddr(channel.Our.Address), "", tlb.ZeroCoins); err != nil {
+		return fmt.Errorf("failed to check balance: %w", err)
 	}
 
 	msgHash, err := s.ton.SendWaitExternalMessage(ctx, address.MustParseAddr(channel.Our.Address), message)
@@ -2012,6 +2108,15 @@ func (s *Service) executeSettleFinalize(ctx context.Context, channelAddr string,
 	c, err := s.channelClient.GetChannel(ctx, address.MustParseAddr(channel.Our.Address), true, channel.Our.LastProcessedTxAt)
 	if err != nil {
 		return fmt.Errorf("failed to get onchain channel: %w", err)
+	}
+	if c.Storage.Quarantine == nil || c.Storage.Quarantine.TheirState == nil {
+		return ErrStillPending
+	}
+	if c.Storage.Quarantine.OurSettlementFinalized {
+		return nil
+	}
+	if !bytes.Equal(c.Storage.Quarantine.TheirState.ActionStatesHash, actionsHash) {
+		return ErrStillPending
 	}
 
 	message, err := c.PrepareFinalizeSettleMessage(s.key, actionsHash)

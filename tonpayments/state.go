@@ -136,7 +136,7 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 		condAction := cond.GetAction()
 		actIdx := condAction.IDCell()
 
-		actState, err := channel.Their.Data.ActionStates.LoadValue(actIdx)
+		actState, err := channel.Our.Data.ActionStates.LoadValue(actIdx)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to load action state: %w", err)
 		}
@@ -421,15 +421,15 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			}
 		}
 
-			onSuccess = func(ctx context.Context) error {
-				if err = s.db.ClosePairMeta(ctx, meta.Key, db.ConditionalStateClosed); err != nil {
-					return fmt.Errorf("failed to close virtual channel pair meta: %w", err)
-				}
-				meta.Status = db.ConditionalStateClosed
-				meta.UpdatedAt = time.Now()
+		onSuccess = func(ctx context.Context) error {
+			if err = s.db.ClosePairMeta(ctx, meta.Key, db.ConditionalStateClosed); err != nil {
+				return fmt.Errorf("failed to close virtual channel pair meta: %w", err)
+			}
+			meta.Status = db.ConditionalStateClosed
+			meta.UpdatedAt = time.Now()
 
-				if historyData != nil {
-					if err = s.db.CreateChannelEvent(ctx, channel, time.Now(), db.ChannelHistoryItem{
+			if historyData != nil {
+				if err = s.db.CreateChannelEvent(ctx, channel, time.Now(), db.ChannelHistoryItem{
 					Action: historyAction,
 					Data:   historyData,
 				}); err != nil {

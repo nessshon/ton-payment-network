@@ -295,6 +295,20 @@ func (s *Service) ensureDerivativeRemovable(ctx context.Context, outgoingMeta *d
 
 	meta, cond, monitor, _, err := s.refreshIncomingDerivativeMeta(checkCtx, incomingKey)
 	if err != nil {
+		if errors.Is(err, db.ErrNotFound) || errors.Is(err, errNotIncomingDerivative) {
+			if derivativeRemoveTerminalMeta(outgoingMeta) {
+				return nil
+			}
+
+			incomingMeta, loadErr := s.db.GetVirtualChannelMeta(ctx, incomingKey)
+			switch {
+			case errors.Is(loadErr, db.ErrNotFound):
+				return nil
+			case loadErr == nil && derivativeRemoveTerminalMeta(incomingMeta):
+				return nil
+			}
+		}
+
 		return fmt.Errorf("failed to refresh derivative monitor before remove: %w", err)
 	}
 
@@ -303,6 +317,19 @@ func (s *Service) ensureDerivativeRemovable(ctx context.Context, outgoingMeta *d
 	}
 
 	return nil
+}
+
+func derivativeRemoveTerminalMeta(meta *db.ConditionalMeta) bool {
+	if meta == nil {
+		return false
+	}
+
+	switch meta.Status {
+	case db.ConditionalStateWantClose, db.ConditionalStateClosed, db.ConditionalStateWantRemove, db.ConditionalStateRemoved:
+		return true
+	default:
+		return false
+	}
 }
 
 func derivativeIncomingKeyForRemove(meta *db.ConditionalMeta) (ed25519.PublicKey, bool) {

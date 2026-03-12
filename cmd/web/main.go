@@ -16,6 +16,7 @@ import (
 
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
 	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals/oracle"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain"
@@ -28,6 +29,7 @@ import (
 	"github.com/xssnick/ton-payment-network/tonpayments/wallet"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 var DB *db.DB
@@ -665,32 +667,44 @@ func main() {
 	}))
 
 	js.Global().Set("closeChannelUncooperative", js.FuncOf(func(this js.Value, args []js.Value) any {
-		if !started {
-			return js.Null()
-		}
+		promiseCtor := js.Global().Get("Promise")
 
-		if len(args) != 1 {
-			println("wrong number of arguments")
-			return js.Null()
-		}
+		return promiseCtor.New(js.FuncOf(func(this js.Value, prArgs []js.Value) any {
+			resolve := prArgs[0]
+			reject := prArgs[1]
 
-		channelAddr := args[0].String()
-		if channelAddr == "" {
-			println("channel address is required")
-			return js.Null()
-		}
+			go func() {
+				if !started {
+					reject.Invoke("not started")
+					return
+				}
 
-		if _, err := address.ParseAddr(channelAddr); err != nil {
-			println("invalid channel address: " + err.Error())
-			return js.Null()
-		}
+				if len(args) != 1 {
+					reject.Invoke("wrong number of arguments")
+					return
+				}
 
-		if err := Service.RequestUncooperativeClose(context.Background(), channelAddr); err != nil {
-			println("failed to request uncooperative close: " + err.Error())
-			return js.Null()
-		}
+				channelAddr := args[0].String()
+				if channelAddr == "" {
+					reject.Invoke("channel address is required")
+					return
+				}
 
-		return js.Null()
+				if _, err := address.ParseAddr(channelAddr); err != nil {
+					reject.Invoke("invalid channel address: " + err.Error())
+					return
+				}
+
+				if err := Service.RequestUncooperativeClose(context.Background(), channelAddr); err != nil {
+					reject.Invoke("failed to request uncooperative close: " + err.Error())
+					return
+				}
+
+				resolve.Invoke(js.Undefined())
+			}()
+
+			return nil
+		}))
 	}))
 
 	js.Global().Set("listChannelsPrint", js.FuncOf(func(this js.Value, args []js.Value) any {
@@ -1056,13 +1070,63 @@ func start(peerKey, channelKey []byte) {
 			resPending[cc.Symbol] = cc.MustAmount(b).String()
 		}
 
+		estimateWalletApprovals := func(channel *db.Channel) int {
+			if channel == nil || Service == nil {
+				return 0
+			}
+			if !channel.UncoopCloseStarted && channel.Status != db.ChannelStateClosing {
+				return 0
+			}
+
+			resolvers := map[string]struct{}{}
+			proxySettles := 0
+
+			collect := func(dict *cell.Dictionary, countProxy bool) {
+				if dict == nil {
+					return
+				}
+
+				items, err := dict.LoadAll()
+				if err != nil {
+					return
+				}
+
+				for _, kv := range items {
+					if kv.Value == nil || (kv.Value.BitsLeft() == 0 && kv.Value.RefsNum() == 0) {
+						continue
+					}
+
+					parsed, err := payments.CodeToConditional(ctx, kv.Value.MustToCell(), Service)
+					if err != nil {
+						continue
+					}
+
+					drv, ok := parsed.(*conditionals.ConditionalResolvable)
+					if !ok || drv.ResolverAddr == nil {
+						continue
+					}
+
+					resolvers[drv.ResolverAddr.String()] = struct{}{}
+					if countProxy {
+						proxySettles++
+					}
+				}
+			}
+
+			collect(channel.Our.Data.Conditionals, false)
+			collect(channel.Their.Data.Conditionals, true)
+			return len(resolvers)*2 + proxySettles
+		}
+
 		jsEvent := map[string]any{
-			"active":     ch.Status == db.ChannelStateActive,
-			"balances":   js.ValueOf(resBalances),
-			"capacities": js.ValueOf(resCapacities),
-			"locked":     js.ValueOf(resLocked),
-			"pendingIn":  js.ValueOf(resPending),
-			"address":    ch.Our.Address,
+			"active":                  ch.Status == db.ChannelStateActive,
+			"balances":                js.ValueOf(resBalances),
+			"capacities":              js.ValueOf(resCapacities),
+			"locked":                  js.ValueOf(resLocked),
+			"pendingIn":               js.ValueOf(resPending),
+			"address":                 ch.Our.Address,
+			"uncooperativeClose":      ch.UncoopCloseStarted || ch.Status == db.ChannelStateClosing,
+			"expectedWalletApprovals": estimateWalletApprovals(ch),
 		}
 
 		pcuFunc.Invoke(js.ValueOf(jsEvent))
@@ -1106,12 +1170,14 @@ func start(peerKey, channelKey []byte) {
 
 	if noChannels {
 		jsEvent := map[string]any{
-			"active":     false,
-			"balances":   js.ValueOf(map[string]any{}),
-			"capacities": js.ValueOf(map[string]any{}),
-			"locked":     js.ValueOf(map[string]any{}),
-			"pendingIn":  js.ValueOf(map[string]any{}),
-			"address":    "",
+			"active":                  false,
+			"balances":                js.ValueOf(map[string]any{}),
+			"capacities":              js.ValueOf(map[string]any{}),
+			"locked":                  js.ValueOf(map[string]any{}),
+			"pendingIn":               js.ValueOf(map[string]any{}),
+			"address":                 "",
+			"uncooperativeClose":      false,
+			"expectedWalletApprovals": 0,
 		}
 
 		pcuFunc.Invoke(js.ValueOf(jsEvent))

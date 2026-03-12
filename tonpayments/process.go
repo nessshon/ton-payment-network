@@ -1218,11 +1218,13 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 			return nil, fmt.Errorf("to execute action must use last wallet seqno")
 		}
 
-		if len(channel.Their.PendingOnchainTransfers) != 0 {
-			return nil, fmt.Errorf("to execute action must be no pending onchain transfers")
-		} else if channel.Their.PendingOnchainTransfers[pendingIDWallet(req.Signed.WalletSeqno)] != nil {
+		pendingID := pendingIDWallet(req.Signed.WalletSeqno)
+		if channel.Their.PendingOnchainTransfers[pendingID] != nil {
 			// idempotency
 			return nil, nil
+		}
+		if len(channel.Their.PendingOnchainTransfers) != 0 {
+			return nil, fmt.Errorf("to execute action must be no pending onchain transfers")
 		}
 
 		var theirSig = req.SignatureA.Value
@@ -1260,7 +1262,7 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 		}
 
 		err = s.db.Transaction(ctx, func(ctx context.Context) error {
-			channel.Their.PendingOnchainTransfers[pendingIDWallet(req.Signed.WalletSeqno)] = p
+			channel.Their.PendingOnchainTransfers[pendingID] = p
 
 			if err = s.db.UpdateChannel(ctx, channel); err != nil {
 				return fmt.Errorf("failed to update channel: %w", err)
