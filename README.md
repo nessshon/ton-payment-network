@@ -60,6 +60,8 @@ Dummy data is also added to make it harder to analyze the path.
 TON Payment Network combines the speed of offchain payments with the security of blockchain.  
 It’s designed for a world where fast, private, and cheap payments are the default.
 
+Derivative trading support, hedging hooks, and operational setup are documented separately in [DERIVATIVES.md](./DERIVATIVES.md).
+
 # Technical Details
 
 The network consists of **peer-to-peer payment nodes** that establish connections between each other via:
@@ -339,4 +341,3 @@ The standalone node currently supports several **console commands**:
 - `close` — Close a virtual channel (used by the **recipient**) by providing a signed state.
 - `destroy` — Close an **onchain channel** by address.  
   First attempts a **cooperative closure**, and if that fails, performs a **forced closure**.
-

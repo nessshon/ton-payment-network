@@ -213,6 +213,12 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 		globalCancel:                   globalCancel,
 	}
 
+	if strings.TrimSpace(cfg.DerivativesHedge.WebhookURL) != "" {
+		if _, _, err := s.derivativeHedgeAuth(); err != nil {
+			return nil, fmt.Errorf("invalid derivatives hedge config: %w", err)
+		}
+	}
+
 	addBalanceControl := func(balanceId string, currency config.CoinConfig) error {
 		if currency.BalanceControl == nil {
 			currency.BalanceControl = &config.BalanceControlConfig{
@@ -1006,6 +1012,7 @@ func (s *Service) Start() {
 						}
 					}
 
+					prevStatus := channel.Status
 					err = s.db.Transaction(context.Background(), func(ctx context.Context) error {
 						if err = s.processSideUpdate(ctx, channel, false, upd); err != nil {
 							return fmt.Errorf("failed to process side update: %w", err)
@@ -1020,6 +1027,11 @@ func (s *Service) Start() {
 						log.Error().Err(err).Str("channel", channel.Our.Address).Msg("failed to set channel in db")
 						// we retry full process because we need to reproduce all changes in case of concurrent update
 						goto retry
+					}
+					if prevStatus != db.ChannelStateInactive && channel.Status == db.ChannelStateInactive {
+						if err = s.finalizeInactiveChannelDerivatives(context.Background(), channel); err != nil {
+							log.Error().Err(err).Str("channel", channel.Our.Address).Msg("failed to finalize inactive channel derivatives")
+						}
 					}
 				} else {
 					// TODO: queue transactions
@@ -1166,6 +1178,7 @@ func (s *Service) Start() {
 				}
 			}
 
+			prevStatus := channel.Status
 			err = s.db.Transaction(context.Background(), func(ctx context.Context) error {
 				if err = s.processSideUpdate(ctx, channel, true, upd); err != nil {
 					return fmt.Errorf("failed to process our side update: %w", err)
@@ -1180,6 +1193,11 @@ func (s *Service) Start() {
 				log.Error().Err(err).Str("channel", channel.Our.Address).Msg("failed to set channel in db")
 				// we retry full process because we need to reproduce all changes in case of concurrent update
 				goto retry
+			}
+			if prevStatus != db.ChannelStateInactive && channel.Status == db.ChannelStateInactive {
+				if err = s.finalizeInactiveChannelDerivatives(context.Background(), channel); err != nil {
+					log.Error().Err(err).Str("channel", channel.Our.Address).Msg("failed to finalize inactive channel derivatives")
+				}
 			}
 
 			if s.webhook != nil {

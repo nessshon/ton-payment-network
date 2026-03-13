@@ -66,6 +66,15 @@ func (s *Service) taskExecutor() {
 				defer cancel()
 
 				switch task.Type {
+				case "derivative-hedge-webhook":
+					var data derivativeHedgeWebhookTask
+					if err = json.Unmarshal(task.Data, &data); err != nil {
+						return fmt.Errorf("invalid json: %w", err)
+					}
+					if err = s.sendDerivativeHedgeWebhook(ctx, data.Request, derivativeHedgeWebhookCloseTimeout); err != nil {
+						return err
+					}
+					return nil
 				case "increment-state":
 					var data db.IncrementStatesTask
 					if err = json.Unmarshal(task.Data, &data); err != nil {

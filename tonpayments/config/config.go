@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -64,6 +65,14 @@ type ChannelsConfig struct {
 	ConditionalCloseDurationSec     uint32
 	MinSafeVirtualChannelTimeoutSec uint32
 	ReplicationMessageAttachAmount  string
+	AcceptingDerivatives            bool
+	DerivativesHedge                DerivativesHedgeConfig
+}
+
+type DerivativesHedgeConfig struct {
+	WebhookURL                    string
+	WebhookKey                    string
+	WebhookSignatureHMACSHA256Key string
 }
 
 type CoinTypes struct {
@@ -90,7 +99,15 @@ type Config struct {
 	ChannelConfig                  ChannelsConfig
 }
 
-const LatestConfigVersion = 3
+const LatestConfigVersion = 5
+
+func generateBase64Random(size int) (string, error) {
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(buf), nil
+}
 
 func Generate() (*Config, error) {
 	_, priv, err := ed25519.GenerateKey(nil)
@@ -110,6 +127,14 @@ func Generate() (*Config, error) {
 
 	whKey := make([]byte, 32)
 	if _, err = rand.Read(whKey); err != nil {
+		return nil, err
+	}
+	hedgeKey, err := generateBase64Random(12)
+	if err != nil {
+		return nil, err
+	}
+	hedgeSigKey, err := generateBase64Random(32)
+	if err != nil {
 		return nil, err
 	}
 
@@ -180,6 +205,11 @@ func Generate() (*Config, error) {
 			ConditionalCloseDurationSec:     3 * 3600,
 			MinSafeVirtualChannelTimeoutSec: 60,
 			ReplicationMessageAttachAmount:  "0.1",
+			AcceptingDerivatives:            false,
+			DerivativesHedge: DerivativesHedgeConfig{
+				WebhookKey:                    hedgeKey,
+				WebhookSignatureHMACSHA256Key: hedgeSigKey,
+			},
 		},
 	}
 
@@ -187,9 +217,9 @@ func Generate() (*Config, error) {
 	return cfg, nil
 }
 
-func Upgrade(cfg *Config) bool {
+func Upgrade(cfg *Config) (bool, error) {
 	if cfg.Version >= LatestConfigVersion {
-		return false
+		return false, nil
 	}
 
 	if cfg.Version < 2 {
@@ -232,8 +262,37 @@ func Upgrade(cfg *Config) bool {
 		}
 	}
 
+	if cfg.Version < 4 {
+		if cfg.ChannelConfig.DerivativesHedge.WebhookURL == "" {
+			cfg.ChannelConfig.DerivativesHedge = DerivativesHedgeConfig{}
+		}
+	}
+
+	if cfg.Version < 5 {
+		if cfg.ChannelConfig.DerivativesHedge.WebhookURL == "" &&
+			cfg.ChannelConfig.DerivativesHedge.WebhookKey == "" &&
+			cfg.ChannelConfig.DerivativesHedge.WebhookSignatureHMACSHA256Key == "" {
+			cfg.ChannelConfig.DerivativesHedge = DerivativesHedgeConfig{}
+		} else {
+			if cfg.ChannelConfig.DerivativesHedge.WebhookKey == "" {
+				key, err := generateBase64Random(12)
+				if err != nil {
+					return false, fmt.Errorf("generate derivatives hedge webhook key: %w", err)
+				}
+				cfg.ChannelConfig.DerivativesHedge.WebhookKey = key
+			}
+			if cfg.ChannelConfig.DerivativesHedge.WebhookSignatureHMACSHA256Key == "" {
+				key, err := generateBase64Random(32)
+				if err != nil {
+					return false, fmt.Errorf("generate derivatives hedge signature key: %w", err)
+				}
+				cfg.ChannelConfig.DerivativesHedge.WebhookSignatureHMACSHA256Key = key
+			}
+		}
+	}
+
 	cfg.Version = LatestConfigVersion
-	return true
+	return true, nil
 }
 
 func (cfg *Config) assignBalanceID() {

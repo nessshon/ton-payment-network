@@ -35,6 +35,7 @@ export interface DerivativesPosition {
     leverage: number;
     status: "open" | "pending_open";
     opened: boolean;
+    hedged: boolean;
     opened_at?: number;
     entry_at: number;
     entry_price: string;

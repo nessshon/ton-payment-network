@@ -50,12 +50,7 @@ func NewDerivativesService(core *Service) *DerivativesService {
 }
 
 func (s *DerivativesService) GetSymbolByID(id uint32) string {
-	for _, sym := range supportedSymbols {
-		if oracle.GetResolverID(sym.Provider, sym.Symbol) == id {
-			return sym.Symbol
-		}
-	}
-	return ""
+	return derivativeSymbolByID(id)
 }
 
 func canonicalPositionID(key []byte, linked []byte) string {
@@ -463,6 +458,7 @@ func (s *DerivativesService) ListDerivativesPositions(ctx context.Context, chann
 			Leverage:         int(res.Details.Leverage),
 			Status:           status,
 			Opened:           opened,
+			Hedged:           derivativeMetaHedged(meta),
 			OpenedAt:         openedAt,
 			EntryAt:          meta.CreatedAt.Unix(),
 			EntryPrice:       entryStr,
@@ -704,6 +700,14 @@ func (s *DerivativesService) ClosePosition(ctx context.Context, channelAddr stri
 		return s.cancelPositionByID(ctx, key)
 	}
 	return s.closePositionByID(ctx, ch, key)
+}
+
+func (s *DerivativesService) SetPositionHedged(ctx context.Context, orderID string, hedged bool) error {
+	key, ok := decodeDerivativePositionID(orderID)
+	if !ok {
+		return fmt.Errorf("order id is malformed")
+	}
+	return s.core.SetDerivativeOrderHedged(ctx, key, hedged)
 }
 
 func trimFloat(f float64) string {

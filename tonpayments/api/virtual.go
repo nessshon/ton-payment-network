@@ -31,13 +31,18 @@ type ConditionalSide struct {
 }
 
 type Conditional struct {
-	Key       string           `json:"key"`
-	Status    string           `json:"status"`
-	Resolve   *cell.Cell       `json:"resolve"`
-	Outgoing  *ConditionalSide `json:"outgoing"`
-	Incoming  *ConditionalSide `json:"incoming"`
-	CreatedAt time.Time        `json:"created_at"`
-	UpdatedAt time.Time        `json:"updated_at"`
+	Key        string           `json:"key"`
+	Status     string           `json:"status"`
+	Resolve    *cell.Cell       `json:"resolve"`
+	Outgoing   *ConditionalSide `json:"outgoing"`
+	Incoming   *ConditionalSide `json:"incoming"`
+	Derivative *DerivativeMeta  `json:"derivative,omitempty"`
+	CreatedAt  time.Time        `json:"created_at"`
+	UpdatedAt  time.Time        `json:"updated_at"`
+}
+
+type DerivativeMeta struct {
+	Hedged bool `json:"hedged"`
 }
 
 func (s *Server) handleVirtualGet(w http.ResponseWriter, r *http.Request) {
@@ -175,11 +180,12 @@ func (s *Server) getVirtual(ctx context.Context, meta *db.ConditionalMeta) (*Con
 	}
 
 	res := &Conditional{
-		Key:       base64.StdEncoding.EncodeToString(meta.Key),
-		Status:    status,
-		Resolve:   meta.LastKnownResolve,
-		CreatedAt: meta.CreatedAt,
-		UpdatedAt: meta.UpdatedAt,
+		Key:        base64.StdEncoding.EncodeToString(meta.Key),
+		Status:     status,
+		Resolve:    meta.LastKnownResolve,
+		Derivative: getDerivativeMeta(meta.SpecialDetails),
+		CreatedAt:  meta.CreatedAt,
+		UpdatedAt:  meta.UpdatedAt,
 	}
 
 	if meta.Status != db.ConditionalStateClosed && meta.Status != db.ConditionalStateRemoved {
@@ -203,6 +209,32 @@ func (s *Server) getVirtual(ctx context.Context, meta *db.ConditionalMeta) (*Con
 	}
 
 	return res, nil
+}
+
+func getDerivativeMeta(details any) *DerivativeMeta {
+	if details == nil {
+		return nil
+	}
+
+	raw, err := json.Marshal(details)
+	if err != nil {
+		return nil
+	}
+
+	var state struct {
+		Details json.RawMessage `json:"details"`
+		Hedged  bool            `json:"hedged"`
+		AssetID uint32          `json:"AssetID"`
+	}
+	if err = json.Unmarshal(raw, &state); err != nil {
+		return nil
+	}
+
+	if len(state.Details) == 0 && state.AssetID == 0 {
+		return nil
+	}
+
+	return &DerivativeMeta{Hedged: state.Hedged}
 }
 
 func (s *Server) handleVirtualState(w http.ResponseWriter, r *http.Request) {

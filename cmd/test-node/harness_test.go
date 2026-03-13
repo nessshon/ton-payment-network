@@ -9,7 +9,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -28,6 +31,7 @@ import (
 	cfgpkg "github.com/xssnick/ton-payment-network/tonpayments/config"
 	dbpkg "github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/db/leveldb"
+	"github.com/xssnick/ton-payment-network/tonpayments/hedgeauth"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/liteclient"
@@ -64,6 +68,17 @@ type testNode struct {
 }
 
 func newTestNode(t *testing.T, hub *loopbackHub, idx, port int) *testNode {
+	return newTestNodeWithOptions(t, hub, idx, port, testNodeOptions{acceptingDerivatives: true})
+}
+
+type testNodeOptions struct {
+	acceptingDerivatives bool
+	hedgeWebhookURL      string
+	hedgeWebhookKey      string
+	hedgeWebhookSecret   string
+}
+
+func newTestNodeWithOptions(t *testing.T, hub *loopbackHub, idx, port int, opts testNodeOptions) *testNode {
 	t.Helper()
 
 	cfg, err := cfgpkg.Generate()
@@ -75,6 +90,14 @@ func newTestNode(t *testing.T, hub *loopbackHub, idx, port int) *testNode {
 	cfg.ChannelConfig.ActionsDuration = 8
 	cfg.ChannelConfig.ConditionalCloseDurationSec = 8
 	cfg.ChannelConfig.MinSafeVirtualChannelTimeoutSec = 1
+	cfg.ChannelConfig.AcceptingDerivatives = opts.acceptingDerivatives
+	cfg.ChannelConfig.DerivativesHedge.WebhookURL = opts.hedgeWebhookURL
+	if opts.hedgeWebhookKey != "" {
+		cfg.ChannelConfig.DerivativesHedge.WebhookKey = opts.hedgeWebhookKey
+	}
+	if opts.hedgeWebhookSecret != "" {
+		cfg.ChannelConfig.DerivativesHedge.WebhookSignatureHMACSHA256Key = opts.hedgeWebhookSecret
+	}
 	cfg.ChannelConfig.SupportedCoins.Ton.BalanceControl = nil
 	for key, jetton := range cfg.ChannelConfig.SupportedCoins.Jettons {
 		jetton.BalanceControl = nil
@@ -443,6 +466,10 @@ func newTestnetLoopbackHub(t *testing.T) *loopbackHub {
 }
 
 func newTestnetNode(t *testing.T, hub *loopbackHub, idx, port int) *testNode {
+	return newTestnetNodeWithOptions(t, hub, idx, port, testNodeOptions{acceptingDerivatives: true})
+}
+
+func newTestnetNodeWithOptions(t *testing.T, hub *loopbackHub, idx, port int, opts testNodeOptions) *testNode {
 	t.Helper()
 
 	if hub.live == nil {
@@ -459,6 +486,14 @@ func newTestnetNode(t *testing.T, hub *loopbackHub, idx, port int) *testNode {
 	cfg.ChannelConfig.ConditionalCloseDurationSec = 35
 	cfg.ChannelConfig.MinSafeVirtualChannelTimeoutSec = 1
 	cfg.ChannelConfig.ReplicationMessageAttachAmount = "0.047"
+	cfg.ChannelConfig.AcceptingDerivatives = opts.acceptingDerivatives
+	cfg.ChannelConfig.DerivativesHedge.WebhookURL = opts.hedgeWebhookURL
+	if opts.hedgeWebhookKey != "" {
+		cfg.ChannelConfig.DerivativesHedge.WebhookKey = opts.hedgeWebhookKey
+	}
+	if opts.hedgeWebhookSecret != "" {
+		cfg.ChannelConfig.DerivativesHedge.WebhookSignatureHMACSHA256Key = opts.hedgeWebhookSecret
+	}
 	cfg.ChannelConfig.SupportedCoins.Ton.BalanceControl = nil
 	for key, jetton := range cfg.ChannelConfig.SupportedCoins.Jettons {
 		jetton.BalanceControl = nil
@@ -518,6 +553,228 @@ func newTestnetNode(t *testing.T, hub *loopbackHub, idx, port int) *testNode {
 		scanner:     scanner,
 		done:        make(chan struct{}),
 	}
+}
+
+type hedgeWebhookEvent struct {
+	Event         string `json:"event"`
+	OrderID       string `json:"order_id"`
+	LinkedOrderID string `json:"linked_order_id"`
+	Status        string `json:"status"`
+}
+
+const testHedgeMaxRequestBodyBytes = 16 * 1024
+
+type testHedgeServer struct {
+	t *testing.T
+
+	server    *httptest.Server
+	key       string
+	secret    []byte
+	rawSecret string
+
+	mu                      sync.Mutex
+	rejectOpen              bool
+	delay                   time.Duration
+	tamperResponseSignature bool
+	hedged                  int
+	closed                  int
+	events                  []hedgeWebhookEvent
+}
+
+func newTestHedgeServer(t *testing.T) *testHedgeServer {
+	t.Helper()
+
+	key, rawSecret, secret := newTestHedgeAuth(t)
+	srv := &testHedgeServer{
+		t:         t,
+		key:       key,
+		rawSecret: rawSecret,
+		secret:    secret,
+	}
+	srv.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = w.Write([]byte(`{"success":false}`))
+			return
+		}
+
+		srv.mu.Lock()
+		delay := srv.delay
+		rejectOpen := srv.rejectOpen
+		tamperResponseSignature := srv.tamperResponseSignature
+		srv.mu.Unlock()
+
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+
+		defer r.Body.Close()
+
+		body, err := io.ReadAll(io.LimitReader(r.Body, testHedgeMaxRequestBodyBytes+1))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"success":false}`))
+			return
+		}
+		if len(body) > testHedgeMaxRequestBodyBytes {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"success":false}`))
+			return
+		}
+
+		target := r.URL.EscapedPath()
+		if target == "" {
+			target = "/"
+		}
+		meta, _, err := hedgeauth.VerifyRequest(
+			r.Header,
+			r.Method,
+			hedgeauth.CanonicalTarget(target, r.URL.RawQuery),
+			body,
+			srv.key,
+			srv.secret,
+			time.Now(),
+			hedgeauth.DefaultMaxClockSkew,
+		)
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"success":false}`))
+			return
+		}
+
+		var event hedgeWebhookEvent
+		if err := json.NewDecoder(bytes.NewReader(body)).Decode(&event); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"success":false}`))
+			return
+		}
+
+		status := http.StatusOK
+		respBody := []byte(`{"success":true}`)
+		if rejectOpen && event.Event == "open" {
+			status = http.StatusConflict
+			respBody = []byte(`{"success":false}`)
+		}
+
+		srv.mu.Lock()
+		srv.events = append(srv.events, event)
+		if status == http.StatusOK {
+			switch event.Event {
+			case "open":
+				srv.hedged++
+			case "close":
+				srv.closed++
+			}
+		}
+		srv.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if err = hedgeauth.ApplySignedResponseHeaders(w.Header(), meta, status, respBody, srv.key, srv.secret, time.Now()); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"success":false}`))
+			return
+		}
+		if tamperResponseSignature {
+			w.Header().Set(hedgeauth.HeaderSignature, "tampered")
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write(respBody)
+	}))
+
+	t.Cleanup(func() {
+		hedged, closed := srv.counts()
+		t.Logf("[hedge-server] hedged=%d closed=%d", hedged, closed)
+		srv.server.Close()
+	})
+
+	return srv
+}
+
+func (s *testHedgeServer) url() string {
+	if s == nil || s.server == nil {
+		return ""
+	}
+	return s.server.URL
+}
+
+func (s *testHedgeServer) auth() (string, string) {
+	if s == nil {
+		return "", ""
+	}
+	return s.key, s.rawSecret
+}
+
+func (s *testHedgeServer) setRejectOpen(v bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.rejectOpen = v
+	s.mu.Unlock()
+}
+
+func (s *testHedgeServer) setDelay(delay time.Duration) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.delay = delay
+	s.mu.Unlock()
+}
+
+func (s *testHedgeServer) setTamperResponseSignature(v bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.tamperResponseSignature = v
+	s.mu.Unlock()
+}
+
+func (s *testHedgeServer) counts() (int, int) {
+	if s == nil {
+		return 0, 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hedged, s.closed
+}
+
+func (s *testHedgeServer) snapshot() []hedgeWebhookEvent {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]hedgeWebhookEvent, len(s.events))
+	copy(out, s.events)
+	return out
+}
+
+func newTestHedgeAuth(t *testing.T) (string, string, []byte) {
+	t.Helper()
+
+	keyRaw := make([]byte, 12)
+	if _, err := rand.Read(keyRaw); err != nil {
+		t.Fatalf("generate hedge key failed: %v", err)
+	}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		t.Fatalf("generate hedge secret failed: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(keyRaw), base64.StdEncoding.EncodeToString(secret), secret
+}
+
+func waitHedgeCounts(t *testing.T, srv *testHedgeServer, hedged, closed int) {
+	t.Helper()
+
+	waitFor(t, 30*time.Second, 200*time.Millisecond, func() (bool, string) {
+		gotHedged, gotClosed := srv.counts()
+		if gotHedged == hedged && gotClosed == closed {
+			return true, fmt.Sprintf("hedge server counts hedged=%d closed=%d", gotHedged, gotClosed)
+		}
+		return false, fmt.Sprintf("waiting hedge counts hedged=%d/%d closed=%d/%d", gotHedged, hedged, gotClosed, closed)
+	})
 }
 
 func waitChannelByPeer(t *testing.T, node *testNode, peerKey ed25519.PublicKey) *dbpkg.Channel {
@@ -622,6 +879,7 @@ type derivativeMonitorStateJSON struct {
 	LastCheckedAt int64 `json:"last_checked_at"`
 	EntryCrossed  bool  `json:"entry_crossed"`
 	Liquidated    bool  `json:"liquidated"`
+	HistoryTooOld bool  `json:"history_too_old"`
 }
 
 func derivativeMonitor(meta *dbpkg.ConditionalMeta) (derivativeMonitorStateJSON, bool) {
@@ -647,6 +905,35 @@ func derivativeMonitor(meta *dbpkg.ConditionalMeta) (derivativeMonitorStateJSON,
 func isDerivativeMonitorLiquidated(meta *dbpkg.ConditionalMeta) bool {
 	monitor, ok := derivativeMonitor(meta)
 	return ok && monitor.Liquidated
+}
+
+func forceDerivativeHistoryTooOldForTest(t *testing.T, node *testNode, incomingKey ed25519.PublicKey) {
+	t.Helper()
+
+	meta, err := node.svc.GetVirtualChannelMeta(context.Background(), incomingKey)
+	if err != nil {
+		t.Fatalf("load incoming derivative meta failed: %v", err)
+	}
+
+	meta.CreatedAt = time.Now().UTC().Add(-3 * time.Minute)
+	meta.UpdatedAt = time.Now().UTC()
+
+	var packed map[string]any
+	raw, err := json.Marshal(meta.SpecialDetails)
+	if err != nil {
+		t.Fatalf("marshal derivative special details failed: %v", err)
+	}
+	if err = json.Unmarshal(raw, &packed); err != nil {
+		t.Fatalf("unmarshal derivative special details failed: %v", err)
+	}
+	packed["monitor"] = map[string]any{
+		"last_checked_at": meta.CreatedAt.Unix() - 1,
+	}
+	meta.SpecialDetails = packed
+
+	if err = node.db.UpdateVirtualChannelMeta(context.Background(), meta); err != nil {
+		t.Fatalf("update derivative meta for old-history scenario failed: %v", err)
+	}
 }
 
 type signedMockProvider struct {

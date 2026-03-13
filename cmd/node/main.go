@@ -136,7 +136,12 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to load config")
 		return
 	}
-	if config.Upgrade(cfg) {
+	updated, err := config.Upgrade(cfg)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to upgrade config")
+		return
+	}
+	if updated {
 		if err = config.SaveConfig(cfg, *ConfigPath); err != nil {
 			log.Fatal().Err(err).Msg("failed to update config file")
 			return
@@ -397,7 +402,21 @@ func main() {
 		}
 
 		derivSvc := tonpayments.NewDerivativesService(svc)
-		srv := api.NewServer(*API, *Webhook, cfg.WebhooksSignatureHMACSHA256Key, svc, derivSvc, fdb, credentials)
+		var hedgeAuthCfg *api.HedgeAuthConfig
+		if strings.TrimSpace(cfg.ChannelConfig.DerivativesHedge.WebhookURL) != "" &&
+			strings.TrimSpace(cfg.ChannelConfig.DerivativesHedge.WebhookKey) != "" &&
+			strings.TrimSpace(cfg.ChannelConfig.DerivativesHedge.WebhookSignatureHMACSHA256Key) != "" {
+			hedgeAuthCfg = &api.HedgeAuthConfig{
+				Key:                          cfg.ChannelConfig.DerivativesHedge.WebhookKey,
+				SignatureHMACSHA256KeyBase64: cfg.ChannelConfig.DerivativesHedge.WebhookSignatureHMACSHA256Key,
+			}
+		}
+
+		srv, err := api.NewServer(*API, *Webhook, cfg.WebhooksSignatureHMACSHA256Key, svc, derivSvc, fdb, credentials, hedgeAuthCfg)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to initialize api server")
+			return
+		}
 		if *Webhook != "" {
 			svc.SetWebhook(srv)
 		}

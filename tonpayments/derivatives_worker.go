@@ -22,12 +22,6 @@ var errNotIncomingDerivative = errors.New("meta is not active incoming derivativ
 
 const derivativeRemoveRefreshTimeout = 3 * time.Second
 
-type derivativeMetaAny struct {
-	Details  conditionals.ConditionalResolvableDetails `json:"details"`
-	Resolver *derivativeResolverMeta                   `json:"resolver,omitempty"`
-	Monitor  *derivativeMonitorState                   `json:"monitor,omitempty"`
-}
-
 type derivativeResolverMeta struct {
 	CodeHash string `json:"code_hash,omitempty"`
 	DataBOC  string `json:"data_boc,omitempty"`
@@ -43,6 +37,8 @@ type derivativeMonitorState struct {
 	LiquidatedAt      int64  `json:"liquidated_at,omitempty"`
 	LiquidatedPrice   string `json:"liquidated_price,omitempty"`
 	LiquidationPayout string `json:"liquidation_payout,omitempty"`
+	HistoryTooOld     bool   `json:"history_too_old,omitempty"`
+	HistoryTooOldAt   int64  `json:"history_too_old_at,omitempty"`
 }
 
 func (s *Service) derivativePriceWorker() {
@@ -140,13 +136,11 @@ func (s *Service) refreshIncomingDerivativeMeta(ctx context.Context, key ed25519
 				sec = now + 1
 				continue
 			case errors.Is(err, oracle.ErrTooOld):
-				// Safety-first fallback: if we cannot reconstruct the full history anymore,
-				// we treat the order as opened to prevent unsafe removal.
-				if !monitor.EntryCrossed {
-					monitor.EntryCrossed = true
-					if monitor.EntryCrossedAt == 0 {
-						monitor.EntryCrossedAt = sec
-					}
+				// Price retention window is exhausted. This blocks remove by default,
+				// but unhedged orders are allowed to cancel in ensureDerivativeRemovable.
+				if !monitor.HistoryTooOld {
+					monitor.HistoryTooOld = true
+					monitor.HistoryTooOldAt = sec
 					changed = true
 				}
 				lastChecked = now
@@ -181,10 +175,7 @@ func (s *Service) refreshIncomingDerivativeMeta(ctx context.Context, key ed25519
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
-		latestMeta.SpecialDetails = derivativeMetaAny{
-			Details: cond.Details,
-			Monitor: monitor,
-		}
+		derivativeMetaSetMonitor(latestMeta, monitor)
 		if err = s.db.UpdateVirtualChannelMeta(ctx, latestMeta); err != nil {
 			return nil, nil, nil, false, err
 		}
@@ -313,6 +304,9 @@ func (s *Service) ensureDerivativeRemovable(ctx context.Context, outgoingMeta *d
 	}
 
 	if derivativeOrderOpenedFromMonitor(meta, cond, monitor) {
+		if derivativeCanRemoveWithoutPriceHistory(meta, monitor) {
+			return nil
+		}
 		return fmt.Errorf("derivative order already opened, remove is denied")
 	}
 
@@ -383,6 +377,10 @@ func derivativeOrderOpenedFromMonitor(meta *db.ConditionalMeta, cond *conditiona
 	}
 
 	// If price history is incomplete (e.g. too old), keep conservative fallback.
+	if monitor.HistoryTooOld {
+		return true
+	}
+
 	return monitor.EntryCrossed
 }
 

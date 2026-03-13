@@ -201,6 +201,9 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		}
 
 		toExecute = func(ctx context.Context) error {
+			if err = s.scheduleDerivativeHedgeClose(ctx, meta, db.ConditionalStateRemoved); err != nil {
+				return fmt.Errorf("failed to schedule derivative hedge remove webhook: %w", err)
+			}
 			if meta.Incoming != nil {
 				err = s.db.CreateTask(ctx, PaymentsTaskPool, "remove-cond", meta.Incoming.ChannelAddress,
 					"remove-cond-"+base64.StdEncoding.EncodeToString(meta.Key),
@@ -380,6 +383,9 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 					return fmt.Errorf("failed to update virtual channel meta: %w", err)
 				}
 			}
+			if err = s.scheduleDerivativeHedgeClose(ctx, meta, db.ConditionalStateClosed); err != nil {
+				return fmt.Errorf("failed to schedule derivative hedge close webhook: %w", err)
+			}
 
 			if meta.Incoming != nil {
 				if err = s.closeConditional(ctx, meta); err != nil {
@@ -473,6 +479,9 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		if err = cond.ValidateOnAdd(); err != nil {
 			return nil, fmt.Errorf("failed to validate condition: %w", err)
 		}
+		if _, ok := cond.(*conditionals.ConditionalResolvable); ok && !s.cfg.AcceptingDerivatives {
+			return nil, fmt.Errorf("derivatives are not accepted on this node")
+		}
 
 		// we will not accept conditional with already used key
 		if _, err = s.db.GetVirtualChannelMeta(ctx, cond.GetKey()); err != nil && !errors.Is(err, db.ErrNotFound) {
@@ -562,6 +571,11 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 			if linkedActionAdded {
 				if err = s.SaveAction(ctx, linkedCond.GetAction()); err != nil {
 					return nil, fmt.Errorf("failed to save linked derivative action: %w", err)
+				}
+			}
+			if s.derivativesHedgingEnabled() {
+				if err = s.requestDerivativeHedgeOpen(ctx, channel, res, linkedCond); err != nil {
+					return nil, fmt.Errorf("derivative hedge webhook rejected order: %w", err)
 				}
 			}
 

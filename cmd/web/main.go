@@ -934,7 +934,12 @@ func start(peerKey, channelKey []byte) {
 	if err != nil {
 		panic(err)
 	}
-	if config.Upgrade(cfg) {
+	updated, err := config.Upgrade(cfg)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to upgrade config")
+		return
+	}
+	if updated {
 		if err = config.SaveConfig(cfg, configPath); err != nil {
 			log.Fatal().Err(err).Msg("failed to update config file")
 			return

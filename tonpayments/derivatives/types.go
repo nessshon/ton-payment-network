@@ -12,6 +12,7 @@ type PositionView struct {
 	Leverage         int     `json:"leverage"`
 	Status           string  `json:"status"`
 	Opened           bool    `json:"opened"`
+	Hedged           bool    `json:"hedged"`
 	OpenedAt         int64   `json:"opened_at,omitempty"`
 	EntryAt          int64   `json:"entry_at"`
 	EntryPrice       string  `json:"entry_price"`

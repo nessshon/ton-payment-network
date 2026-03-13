@@ -25,6 +25,11 @@ type closeReq struct {
 	Type    string `json:"type"` // market/cancel
 }
 
+type hedgedReq struct {
+	OrderID string `json:"order_id"`
+	Hedged  bool   `json:"hedged"`
+}
+
 const maxDerivativesRequestBodyBytes = 16 * 1024
 
 func (s *Server) handleDerivativesPosition(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +140,44 @@ func (s *Server) handleDerivativesClose(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err = s.deriv.ClosePosition(r.Context(), req.Channel, identifier, req.Type); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeSuccess(w)
+}
+
+func (s *Server) handleDerivativesHedged(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxDerivativesRequestBodyBytes+1))
+	if err != nil {
+		writeErr(w, 400, "failed to read request body")
+		return
+	}
+	if len(body) > maxDerivativesRequestBodyBytes {
+		writeErr(w, 413, "request body too large")
+		return
+	}
+
+	var req hedgedReq
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err = dec.Decode(&req); err != nil {
+		writeErr(w, 400, "invalid json")
+		return
+	}
+	if err = dec.Decode(&struct{}{}); err != io.EOF {
+		writeErr(w, 400, "invalid json")
+		return
+	}
+	if req.OrderID == "" {
+		writeErr(w, 400, "order_id required")
+		return
+	}
+	if err = s.deriv.SetPositionHedged(r.Context(), req.OrderID, req.Hedged); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}

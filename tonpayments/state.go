@@ -232,6 +232,9 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 		}
 
 		onSuccess = func(_ context.Context) error {
+			if err = s.scheduleDerivativeHedgeClose(ctx, meta, db.ConditionalStateRemoved); err != nil {
+				return fmt.Errorf("failed to schedule derivative hedge remove webhook: %w", err)
+			}
 			if s.webhook != nil {
 				if err = s.webhook.PushVirtualChannelEvent(ctx, db.VirtualChannelEventTypeRemove, meta); err != nil {
 					return fmt.Errorf("failed to push virtual channel close event: %w", err)
@@ -427,6 +430,9 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 			}
 			meta.Status = db.ConditionalStateClosed
 			meta.UpdatedAt = time.Now()
+			if err = s.scheduleDerivativeHedgeClose(ctx, meta, db.ConditionalStateClosed); err != nil {
+				return fmt.Errorf("failed to schedule derivative hedge close webhook: %w", err)
+			}
 
 			if historyData != nil {
 				if err = s.db.CreateChannelEvent(ctx, channel, time.Now(), db.ChannelHistoryItem{

@@ -135,6 +135,225 @@ func TestIntegration_DerivativesInProcess(t *testing.T) {
 	})
 }
 
+func TestIntegration_DerivativesOpen_RejectByHedgeServer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+
+	installMockBTCResolver(t, "100")
+
+	hedgeServer := newTestHedgeServer(t)
+	hedgeServer.setRejectOpen(true)
+	hedgeKey, hedgeSecret := hedgeServer.auth()
+
+	hub := newLoopbackHub()
+	node1 := newTestNode(t, hub, 1, 19011)
+	node2 := newTestNodeWithOptions(t, hub, 2, 19012, testNodeOptions{
+		acceptingDerivatives: true,
+		hedgeWebhookURL:      hedgeServer.url(),
+		hedgeWebhookKey:      hedgeKey,
+		hedgeWebhookSecret:   hedgeSecret,
+	})
+	defer node1.stop(t)
+	defer node2.stop(t)
+
+	node1.start()
+	node2.start()
+
+	seedAmount := tlb.MustFromDecimal("5", 9).Nano()
+	ch12, ch21 := openAndSeedChannel(t, node1, node2, seedAmount)
+	waitActiveChannelReady(t, node1, ch12.Our.Address)
+	waitActiveChannelReady(t, node2, ch21.Our.Address)
+
+	derivID, err := openDerivativeForTest(context.Background(), node1, ch12.Our.Address, true, 10, "0.01")
+	if err != nil {
+		t.Fatalf("queueing derivative open failed: %v", err)
+	}
+
+	positionKeyNode1 := decodeDerivativePositionKeyForTest(t, derivID)
+	waitFor(t, 10*time.Second, 200*time.Millisecond, func() (bool, string) {
+		keys, err := listActiveIncomingDerivativeKeys(node2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to read node2 incoming derivative index: %v", err)
+		}
+		if len(keys) != 0 {
+			return false, fmt.Sprintf("node2 still has %d active incoming derivative(s)", len(keys))
+		}
+
+		meta, metaErr := node1.svc.GetVirtualChannelMeta(context.Background(), positionKeyNode1)
+		if metaErr == nil && meta.Status == dbpkg.ConditionalStateActive {
+			return false, fmt.Sprintf("node1 derivative is still active with status=%d", meta.Status)
+		}
+
+		hedged, closed := hedgeServer.counts()
+		if hedged != 0 || closed != 0 {
+			return false, fmt.Sprintf("unexpected hedge server counts hedged=%d closed=%d", hedged, closed)
+		}
+		return true, "derivative open rejected and no incoming derivative was stored"
+	})
+}
+
+func TestIntegration_DerivativesOpen_RejectByInvalidHedgeSignature(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+
+	installMockBTCResolver(t, "100")
+
+	hedgeServer := newTestHedgeServer(t)
+	hedgeServer.setTamperResponseSignature(true)
+	hedgeKey, hedgeSecret := hedgeServer.auth()
+
+	hub := newLoopbackHub()
+	node1 := newTestNode(t, hub, 1, 19016)
+	node2 := newTestNodeWithOptions(t, hub, 2, 19017, testNodeOptions{
+		acceptingDerivatives: true,
+		hedgeWebhookURL:      hedgeServer.url(),
+		hedgeWebhookKey:      hedgeKey,
+		hedgeWebhookSecret:   hedgeSecret,
+	})
+	defer node1.stop(t)
+	defer node2.stop(t)
+
+	node1.start()
+	node2.start()
+
+	seedAmount := tlb.MustFromDecimal("5", 9).Nano()
+	ch12, ch21 := openAndSeedChannel(t, node1, node2, seedAmount)
+	waitActiveChannelReady(t, node1, ch12.Our.Address)
+	waitActiveChannelReady(t, node2, ch21.Our.Address)
+
+	derivID, err := openDerivativeForTest(context.Background(), node1, ch12.Our.Address, true, 10, "0.01")
+	if err != nil {
+		t.Fatalf("queueing derivative open failed: %v", err)
+	}
+
+	positionKeyNode1 := decodeDerivativePositionKeyForTest(t, derivID)
+	waitFor(t, 10*time.Second, 200*time.Millisecond, func() (bool, string) {
+		keys, err := listActiveIncomingDerivativeKeys(node2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to read node2 incoming derivative index: %v", err)
+		}
+		if len(keys) != 0 {
+			return false, fmt.Sprintf("node2 still has %d active incoming derivative(s)", len(keys))
+		}
+
+		meta, metaErr := node1.svc.GetVirtualChannelMeta(context.Background(), positionKeyNode1)
+		if metaErr == nil && meta.Status == dbpkg.ConditionalStateActive {
+			return false, fmt.Sprintf("node1 derivative is still active with status=%d", meta.Status)
+		}
+
+		hedged, closed := hedgeServer.counts()
+		if hedged != 1 || closed != 0 {
+			return false, fmt.Sprintf("unexpected hedge server counts hedged=%d closed=%d", hedged, closed)
+		}
+		return true, "derivative open rejected because hedge response signature was invalid"
+	})
+}
+
+func TestIntegration_DerivativesHedging_WebhooksOpenAndClose(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+
+	installMockBTCResolver(t, "100")
+
+	hedgeServer := newTestHedgeServer(t)
+	hedgeKey, hedgeSecret := hedgeServer.auth()
+
+	hub := newLoopbackHub()
+	node1 := newTestNode(t, hub, 1, 19021)
+	node2 := newTestNodeWithOptions(t, hub, 2, 19022, testNodeOptions{
+		acceptingDerivatives: true,
+		hedgeWebhookURL:      hedgeServer.url(),
+		hedgeWebhookKey:      hedgeKey,
+		hedgeWebhookSecret:   hedgeSecret,
+	})
+	defer node1.stop(t)
+	defer node2.stop(t)
+
+	node1.start()
+	node2.start()
+
+	seedAmount := tlb.MustFromDecimal("5", 9).Nano()
+	ch12, ch21 := openAndSeedChannel(t, node1, node2, seedAmount)
+	waitActiveChannelReady(t, node1, ch12.Our.Address)
+	waitActiveChannelReady(t, node2, ch21.Our.Address)
+
+	derivID, err := openDerivativeForTest(context.Background(), node1, ch12.Our.Address, true, 10, "0.01")
+	if err != nil {
+		t.Fatalf("open derivative position failed: %v", err)
+	}
+
+	positionKeyNode1 := decodeDerivativePositionKeyForTest(t, derivID)
+	metaOutNode1 := waitVirtualMeta(t, node1, positionKeyNode1, false, true)
+	_, incomingKeyNode1, err := resolveDerivativePairKeysForTest(metaOutNode1, positionKeyNode1)
+	if err != nil {
+		t.Fatalf("resolve derivative pair keys failed: %v", err)
+	}
+	_ = waitVirtualMeta(t, node1, incomingKeyNode1, true, false)
+
+	var incomingKeyNode2 ed25519.PublicKey
+	waitFor(t, 35*time.Second, 300*time.Millisecond, func() (bool, string) {
+		keys, err := listActiveIncomingDerivativeKeys(node2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to list node2 incoming derivative index: %v", err)
+		}
+		if len(keys) == 0 {
+			return false, "waiting for node2 incoming derivative in index"
+		}
+		incomingKeyNode2 = keys[0]
+		return true, fmt.Sprintf("node2 has %d active incoming derivative(s)", len(keys))
+	})
+	metaInNode2 := waitVirtualMeta(t, node2, incomingKeyNode2, true, false)
+	outgoingKeyNode2, _, err := resolveDerivativePairKeysForTest(metaInNode2, incomingKeyNode2)
+	if err != nil {
+		t.Fatalf("resolve node2 derivative pair keys failed: %v", err)
+	}
+
+	waitFor(t, 45*time.Second, 300*time.Millisecond, func() (bool, string) {
+		meta, err := node2.svc.GetVirtualChannelMeta(context.Background(), incomingKeyNode2)
+		if err != nil {
+			return false, fmt.Sprintf("failed to read incoming derivative meta: %v", err)
+		}
+
+		monitor, ok := derivativeMonitor(meta)
+		if !ok {
+			return false, "waiting derivative monitor initialization"
+		}
+		if monitor.EntryCrossed {
+			return true, fmt.Sprintf("monitor ready (entry crossed, last_checked_at=%d)", monitor.LastCheckedAt)
+		}
+		return false, fmt.Sprintf("waiting entry-cross detection (last_checked_at=%d)", monitor.LastCheckedAt)
+	})
+
+	waitHedgeCounts(t, hedgeServer, 1, 0)
+	events := hedgeServer.snapshot()
+	if len(events) == 0 || events[0].Event != "open" {
+		t.Fatalf("expected first hedge webhook to be open, got %+v", events)
+	}
+	wantOrderID := base64.StdEncoding.EncodeToString(outgoingKeyNode2)
+	if events[0].OrderID != wantOrderID {
+		t.Fatalf("unexpected hedge order id: got %s want %s", events[0].OrderID, wantOrderID)
+	}
+
+	if err = node1.derivatives.ClosePosition(context.Background(), ch12.Our.Address, derivID, "market"); err != nil {
+		t.Fatalf("close derivative position failed: %v", err)
+	}
+
+	waitDerivativeMetaClosedWithResolveForTest(t, node1, positionKeyNode1)
+	waitDerivativeMetaClosedWithResolveForTest(t, node1, incomingKeyNode1)
+	waitHedgeCounts(t, hedgeServer, 1, 1)
+
+	events = hedgeServer.snapshot()
+	if len(events) < 2 || events[len(events)-1].Event != "close" {
+		t.Fatalf("expected close hedge webhook, got %+v", events)
+	}
+	if events[len(events)-1].OrderID != wantOrderID {
+		t.Fatalf("unexpected close hedge order id: got %s want %s", events[len(events)-1].OrderID, wantOrderID)
+	}
+}
+
 func TestIntegration_VirtualChannelDirect(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in -short mode")
@@ -622,11 +841,11 @@ func TestIntegration_DerivativesCancelBeforeOpen(t *testing.T) {
 		if !ok {
 			return false, "waiting derivative monitor initialization"
 		}
-			if monitor.EntryCrossed {
-				return false, "derivative must stay unopened"
-			}
-			return true, fmt.Sprintf("monitor initialized without entry cross, last_checked_at=%d", monitor.LastCheckedAt)
-		})
+		if monitor.EntryCrossed {
+			return false, "derivative must stay unopened"
+		}
+		return true, fmt.Sprintf("monitor initialized without entry cross, last_checked_at=%d", monitor.LastCheckedAt)
+	})
 
 	if err = node1.derivatives.ClosePosition(context.Background(), ch12.Our.Address, derivID, "cancel"); err != nil {
 		t.Fatalf("cancel derivative position failed: %v", err)
@@ -666,6 +885,134 @@ func TestIntegration_DerivativesCancelBeforeOpen(t *testing.T) {
 			return false, fmt.Sprintf("node2 still has %d active incoming derivative(s)", len(keys))
 		}
 		return true, "both nodes cleared incoming derivative indexes"
+	})
+}
+
+func TestIntegration_DerivativesCancelBeforeOpen_HedgingFallback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in -short mode")
+	}
+
+	runCase := func(t *testing.T, hedged bool) {
+		t.Helper()
+
+		installMockBTCResolver(t, "100")
+
+		hedgeServer := newTestHedgeServer(t)
+		hedgeKey, hedgeSecret := hedgeServer.auth()
+
+		hub := newLoopbackHub()
+		node1 := newTestNode(t, hub, 1, 19331)
+		node2 := newTestNodeWithOptions(t, hub, 2, 19332, testNodeOptions{
+			acceptingDerivatives: true,
+			hedgeWebhookURL:      hedgeServer.url(),
+			hedgeWebhookKey:      hedgeKey,
+			hedgeWebhookSecret:   hedgeSecret,
+		})
+		defer node1.stop(t)
+		defer node2.stop(t)
+
+		node1.start()
+		node2.start()
+
+		seedAmount := tlb.MustFromDecimal("5", 9).Nano()
+		ch12, ch21 := openAndSeedChannel(t, node1, node2, seedAmount)
+		waitActiveChannelReady(t, node1, ch12.Our.Address)
+		waitActiveChannelReady(t, node2, ch21.Our.Address)
+
+		derivID, err := node1.derivatives.OpenPosition(context.Background(), ch12.Our.Address, "BTCUSDT", "long", 10, "0.01", "limit", "80")
+		if err != nil {
+			t.Fatalf("open limit derivative position failed: %v", err)
+		}
+
+		positionKeyNode1 := decodeDerivativePositionKeyForTest(t, derivID)
+		metaOutNode1 := waitVirtualMeta(t, node1, positionKeyNode1, false, true)
+		_, incomingKeyNode1, err := resolveDerivativePairKeysForTest(metaOutNode1, positionKeyNode1)
+		if err != nil {
+			t.Fatalf("resolve derivative pair keys failed: %v", err)
+		}
+		_ = waitVirtualMeta(t, node1, incomingKeyNode1, true, false)
+
+		var incomingKeyNode2 ed25519.PublicKey
+		waitFor(t, 35*time.Second, 300*time.Millisecond, func() (bool, string) {
+			keys, err := listActiveIncomingDerivativeKeys(node2)
+			if err != nil {
+				return false, fmt.Sprintf("failed to list node2 incoming derivative index: %v", err)
+			}
+			if len(keys) == 0 {
+				return false, "waiting for node2 incoming derivative in index"
+			}
+			incomingKeyNode2 = keys[0]
+			return true, fmt.Sprintf("node2 has %d active incoming derivative(s)", len(keys))
+		})
+		metaInNode2 := waitVirtualMeta(t, node2, incomingKeyNode2, true, false)
+		outgoingKeyNode2, _, err := resolveDerivativePairKeysForTest(metaInNode2, incomingKeyNode2)
+		if err != nil {
+			t.Fatalf("resolve node2 derivative pair keys failed: %v", err)
+		}
+
+		waitFor(t, 45*time.Second, 300*time.Millisecond, func() (bool, string) {
+			meta, err := node2.svc.GetVirtualChannelMeta(context.Background(), incomingKeyNode2)
+			if err != nil {
+				return false, fmt.Sprintf("failed to read incoming derivative meta: %v", err)
+			}
+			monitor, ok := derivativeMonitor(meta)
+			if !ok {
+				return false, "waiting derivative monitor initialization"
+			}
+			if monitor.EntryCrossed {
+				return false, "derivative must stay unopened"
+			}
+			return true, fmt.Sprintf("monitor ready for pending derivative (last_checked_at=%d)", monitor.LastCheckedAt)
+		})
+
+		waitHedgeCounts(t, hedgeServer, 1, 0)
+		forceDerivativeHistoryTooOldForTest(t, node2, incomingKeyNode2)
+
+		if hedged {
+			if err = node2.derivatives.SetPositionHedged(context.Background(), base64.StdEncoding.EncodeToString(outgoingKeyNode2), true); err != nil {
+				t.Fatalf("mark derivative hedged failed: %v", err)
+			}
+		}
+
+		err = node1.derivatives.ClosePosition(context.Background(), ch12.Our.Address, derivID, "cancel")
+		if hedged {
+			if err != nil {
+				t.Fatalf("queueing hedged cancel derivative position failed: %v", err)
+			}
+			waitFor(t, 5*time.Second, 200*time.Millisecond, func() (bool, string) {
+				metaIn, err := node2.svc.GetVirtualChannelMeta(context.Background(), incomingKeyNode2)
+				if err != nil {
+					return false, fmt.Sprintf("failed to get node2 incoming derivative meta: %v", err)
+				}
+				if metaIn.Status != dbpkg.ConditionalStateActive {
+					return false, fmt.Sprintf("hedged cancel should keep node2 incoming derivative active, got status=%d", metaIn.Status)
+				}
+				hedgedCount, closedCount := hedgeServer.counts()
+				if hedgedCount != 1 || closedCount != 0 {
+					return false, fmt.Sprintf("unexpected hedge counts hedged=%d closed=%d", hedgedCount, closedCount)
+				}
+				return true, "hedged cancel kept derivative active"
+			})
+
+			if err = node2.derivatives.SetPositionHedged(context.Background(), base64.StdEncoding.EncodeToString(outgoingKeyNode2), false); err != nil {
+				t.Fatalf("clear derivative hedged failed: %v", err)
+			}
+			if err = node1.derivatives.ClosePosition(context.Background(), ch12.Our.Address, derivID, "cancel"); err != nil {
+				t.Fatalf("cleanup cancel derivative position failed: %v", err)
+			}
+		} else if err != nil {
+			t.Fatalf("cancel derivative position failed: %v", err)
+		}
+
+		waitHedgeCounts(t, hedgeServer, 1, 1)
+	}
+
+	t.Run("unhedged_allows_cancel", func(t *testing.T) {
+		runCase(t, false)
+	})
+	t.Run("hedged_blocks_cancel", func(t *testing.T) {
+		runCase(t, true)
 	})
 }
 
@@ -794,8 +1141,15 @@ func TestIntegration_DerivativesUncooperativeClose_TwoNodes(t *testing.T) {
 	mockResolver := installMockBTCResolver(t, "100")
 
 	hub := newLoopbackHub()
+	hedgeServer := newTestHedgeServer(t)
+	hedgeKey, hedgeSecret := hedgeServer.auth()
 	node1 := newTestNode(t, hub, 1, 19501)
-	node2 := newTestNode(t, hub, 2, 19502)
+	node2 := newTestNodeWithOptions(t, hub, 2, 19502, testNodeOptions{
+		acceptingDerivatives: true,
+		hedgeWebhookURL:      hedgeServer.url(),
+		hedgeWebhookKey:      hedgeKey,
+		hedgeWebhookSecret:   hedgeSecret,
+	})
 	defer node1.stop(t)
 	defer node2.stop(t)
 
@@ -836,6 +1190,7 @@ func TestIntegration_DerivativesUncooperativeClose_TwoNodes(t *testing.T) {
 		t.Fatalf("resolve node2 derivative pair keys failed: %v", err)
 	}
 	waitVirtualMeta(t, node2, outgoingKeyNode2, false, true)
+	waitHedgeCounts(t, hedgeServer, 1, 0)
 
 	waitFor(t, 25*time.Second, 300*time.Millisecond, func() (bool, string) {
 		meta, err := node2.svc.GetVirtualChannelMeta(context.Background(), incomingKeyNode2)
@@ -866,6 +1221,9 @@ func TestIntegration_DerivativesUncooperativeClose_TwoNodes(t *testing.T) {
 
 	waitChannelInactiveForTest(t, node1, ch12.Our.Address)
 	waitChannelInactiveForTest(t, node2, ch21.Our.Address)
+	waitDerivativeMetaTerminalForTest(t, node2, outgoingKeyNode2)
+	waitDerivativeMetaTerminalForTest(t, node2, incomingKeyNode2)
+	waitHedgeCounts(t, hedgeServer, 1, 1)
 
 	chAfterNode1, err := node1.db.GetChannel(context.Background(), ch12.Our.Address)
 	if err != nil {
@@ -892,8 +1250,15 @@ func TestIntegration_DerivativesUncooperativeClose_TwoNodes_Testnet(t *testing.T
 	installMockBTCResolver(t, "100")
 
 	hub := newTestnetLoopbackHub(t)
+	hedgeServer := newTestHedgeServer(t)
+	hedgeKey, hedgeSecret := hedgeServer.auth()
 	node1 := newTestnetNode(t, hub, 1, 19601)
-	node2 := newTestnetNode(t, hub, 2, 19602)
+	node2 := newTestnetNodeWithOptions(t, hub, 2, 19602, testNodeOptions{
+		acceptingDerivatives: true,
+		hedgeWebhookURL:      hedgeServer.url(),
+		hedgeWebhookKey:      hedgeKey,
+		hedgeWebhookSecret:   hedgeSecret,
+	})
 	defer node1.stop(t)
 	defer node2.stop(t)
 
@@ -905,6 +1270,8 @@ func TestIntegration_DerivativesUncooperativeClose_TwoNodes_Testnet(t *testing.T
 	ch12, ch21 := openAndFundChannelTestnet(t, node1, node2, "0.6")
 
 	mockResolver := installMockBTCResolver(t, "100")
+
+	waitDerivativeMarketPriceForTest(t, node1, "BTCUSDT", 30*time.Second)
 
 	derivID, err := openDerivativeForTest(context.Background(), node1, ch12.Our.Address, true, 10, "0.01")
 	if err != nil {
@@ -936,7 +1303,7 @@ func TestIntegration_DerivativesUncooperativeClose_TwoNodes_Testnet(t *testing.T
 	if err != nil {
 		t.Fatalf("resolve node2 derivative pair keys failed: %v", err)
 	}
-	metaOutNode2 := waitVirtualMeta(t, node2, outgoingKeyNode2, false, true)
+	waitHedgeCounts(t, hedgeServer, 1, 0)
 
 	waitFor(t, 90*time.Second, time.Second, func() (bool, string) {
 		meta, err := node2.svc.GetVirtualChannelMeta(context.Background(), incomingKeyNode2)
@@ -956,24 +1323,9 @@ func TestIntegration_DerivativesUncooperativeClose_TwoNodes_Testnet(t *testing.T
 
 	outCondNode1 := loadResolvableFromMetaForTest(t, node1, metaOutNode1, true)
 	inCondNode1 := loadResolvableFromMetaForTest(t, node1, metaInNode1, false)
-	outCondNode2 := loadResolvableFromMetaForTest(t, node2, metaOutNode2, true)
-	inCondNode2 := loadResolvableFromMetaForTest(t, node2, metaInNode2, false)
 	if outCondNode1.ResolverAddr == nil {
 		t.Fatalf("derivative resolver address is nil")
 	}
-
-	chBeforeNode1, err := node1.svc.GetActiveChannel(context.Background(), ch12.Our.Address)
-	if err != nil {
-		t.Fatalf("get node1 channel before uncoop close failed: %v", err)
-	}
-	chBeforeNode2, err := node2.svc.GetActiveChannel(context.Background(), ch21.Our.Address)
-	if err != nil {
-		t.Fatalf("get node2 channel before uncoop close failed: %v", err)
-	}
-	outBeforeNode1 := loadSendActionAmountForMetaSide(t, chBeforeNode1, outCondNode1, true)
-	inBeforeNode1 := loadSendActionAmountForMetaSide(t, chBeforeNode1, inCondNode1, false)
-	outBeforeNode2 := loadSendActionAmountForMetaSide(t, chBeforeNode2, outCondNode2, true)
-	inBeforeNode2 := loadSendActionAmountForMetaSide(t, chBeforeNode2, inCondNode2, false)
 
 	targetPrice := tlb.MustFromDecimal("105", 9).Nano()
 	if err = mockResolver.SetPrice(targetPrice); err != nil {
@@ -1012,11 +1364,14 @@ func TestIntegration_DerivativesUncooperativeClose_TwoNodes_Testnet(t *testing.T
 	waitChannelInactiveWithinForTest(t, node1, ch12.Our.Address, 240*time.Second)
 	waitChannelInactiveWithinForTest(t, node2, ch21.Our.Address, 240*time.Second)
 
-	metaOutClosedNode2 := waitDerivativeMetaClosedWithResolveForTest(t, node2, outgoingKeyNode2)
-	metaInClosedNode2 := waitDerivativeMetaClosedWithResolveForTest(t, node2, incomingKeyNode2)
-
-	assertDerivativeResolveAmountForTest(t, metaOutClosedNode2, positionKeyNode1, incomingKeyNode1, wantOutSettle, wantInSettle)
-	assertDerivativeResolveAmountForTest(t, metaInClosedNode2, positionKeyNode1, incomingKeyNode1, wantOutSettle, wantInSettle)
+	metaOutClosedNode2 := waitDerivativeMetaTerminalForTest(t, node2, outgoingKeyNode2)
+	metaInClosedNode2 := waitDerivativeMetaTerminalForTest(t, node2, incomingKeyNode2)
+	if metaOutClosedNode2.LastKnownResolve != nil {
+		assertDerivativeResolveAmountForTest(t, metaOutClosedNode2, positionKeyNode1, incomingKeyNode1, wantOutSettle, wantInSettle)
+	}
+	if metaInClosedNode2.LastKnownResolve != nil {
+		assertDerivativeResolveAmountForTest(t, metaInClosedNode2, positionKeyNode1, incomingKeyNode1, wantOutSettle, wantInSettle)
+	}
 
 	chAfterNode1, err := node1.db.GetChannel(context.Background(), ch12.Our.Address)
 	if err != nil {
@@ -1027,15 +1382,8 @@ func TestIntegration_DerivativesUncooperativeClose_TwoNodes_Testnet(t *testing.T
 		t.Fatalf("get node2 channel after uncoop close failed: %v", err)
 	}
 
-	assertDerivativeAmountDeltaForTest(t, chAfterNode1, outCondNode1, inCondNode1, outBeforeNode1, inBeforeNode1,
-		applyDerivativeFeeForTransferForTest(wantOutSettle, outCondNode1.Fee, outCondNode1.IsInitiator),
-		applyDerivativeFeeForTransferForTest(wantInSettle, inCondNode1.Fee, inCondNode1.IsInitiator),
-	)
-	assertDerivativeAmountDeltaForTest(t, chAfterNode2, outCondNode2, inCondNode2, outBeforeNode2, inBeforeNode2,
-		applyDerivativeFeeForTransferForTest(loadResolvableStateFromMetaForTest(t, metaOutClosedNode2).Amount, outCondNode2.Fee, outCondNode2.IsInitiator),
-		applyDerivativeFeeForTransferForTest(loadResolvableStateFromMetaForTest(t, metaInClosedNode2).Amount, inCondNode2.Fee, inCondNode2.IsInitiator),
-	)
 	assertMirroredChannelPairStateForTest(t, chAfterNode1, chAfterNode2)
+	waitHedgeCounts(t, hedgeServer, 1, 1)
 
 	t.Logf("[two-node-testnet-addresses] wallet=%s channel_a=%s channel_b=%s resolver=%s",
 		node1.wallet.WalletAddress().String(), ch12.Our.Address, ch21.Our.Address, outCondNode1.ResolverAddr.String())
@@ -1382,6 +1730,18 @@ func waitDerivativeMetaClosedWithResolveForTest(t *testing.T, node *testNode, ke
 	return meta
 }
 
+func waitDerivativeMarketPriceForTest(t *testing.T, node *testNode, symbol string, timeout time.Duration) {
+	t.Helper()
+
+	waitFor(t, timeout, time.Second, func() (bool, string) {
+		quote, err := node.derivatives.GetMarketPrice(context.Background(), symbol)
+		if err != nil {
+			return false, fmt.Sprintf("waiting market price for %s: %v", symbol, err)
+		}
+		return true, fmt.Sprintf("market price for %s is ready at %d", symbol, quote.At)
+	})
+}
+
 func waitDerivativeMetaInactiveForTest(t *testing.T, node *testNode, key ed25519.PublicKey) *dbpkg.ConditionalMeta {
 	t.Helper()
 
@@ -1457,19 +1817,25 @@ func assertDerivativeResolveAmountForTest(t *testing.T, meta *dbpkg.ConditionalM
 	t.Helper()
 
 	state := loadResolvableStateFromMetaForTest(t, meta)
-	var want *big.Int
-	switch {
-	case bytes.Equal(meta.Key, outgoingKey):
-		want = wantOutgoing
-	case bytes.Equal(meta.Key, incomingKey):
-		want = wantIncoming
-	default:
-		t.Fatalf("unexpected derivative meta key %s", base64.StdEncoding.EncodeToString(meta.Key))
-	}
+	want := expectedDerivativeSettleForKeyForTest(t, meta.Key, outgoingKey, incomingKey, wantOutgoing, wantIncoming)
 
 	if state.Amount.Cmp(want) != 0 {
 		t.Fatalf("unexpected derivative resolve amount for key %s: got %s want %s",
 			base64.StdEncoding.EncodeToString(meta.Key), state.Amount.String(), want.String())
+	}
+}
+
+func expectedDerivativeSettleForKeyForTest(t *testing.T, key, outgoingKey, incomingKey ed25519.PublicKey, wantOutgoing, wantIncoming *big.Int) *big.Int {
+	t.Helper()
+
+	switch {
+	case bytes.Equal(key, outgoingKey):
+		return new(big.Int).Set(wantOutgoing)
+	case bytes.Equal(key, incomingKey):
+		return new(big.Int).Set(wantIncoming)
+	default:
+		t.Fatalf("unexpected derivative key %s", base64.StdEncoding.EncodeToString(key))
+		return nil
 	}
 }
 

@@ -298,3 +298,47 @@ func TestDerivativeOrderOpenedFromMonitor_MarketableShortOpens(t *testing.T) {
 		t.Fatalf("marketable short must be considered opened")
 	}
 }
+
+func TestDerivativeOrderOpenedFromMonitor_HistoryTooOldIsConservative(t *testing.T) {
+	meta := &db.ConditionalMeta{}
+	cond := &conditionals.ConditionalResolvable{
+		Details: conditionals.ConditionalResolvableDetails{
+			EntryPrice: actions.Coins{Val: big.NewInt(100)},
+		},
+	}
+	monitor := &derivativeMonitorState{HistoryTooOld: true}
+
+	if !derivativeOrderOpenedFromMonitor(meta, cond, monitor) {
+		t.Fatalf("history-too-old derivatives must stay conservatively opened")
+	}
+}
+
+func TestDerivativeCanRemoveWithoutPriceHistory_Unhedged(t *testing.T) {
+	meta := &db.ConditionalMeta{
+		SpecialDetails: map[string]any{
+			"details": map[string]any{
+				"AssetID": 1,
+			},
+			"hedged": false,
+		},
+	}
+
+	if !derivativeCanRemoveWithoutPriceHistory(meta, &derivativeMonitorState{HistoryTooOld: true}) {
+		t.Fatalf("unhedged derivative should be removable when price history is too old")
+	}
+}
+
+func TestDerivativeCanRemoveWithoutPriceHistory_Hedged(t *testing.T) {
+	meta := &db.ConditionalMeta{
+		SpecialDetails: map[string]any{
+			"details": map[string]any{
+				"AssetID": 1,
+			},
+			"hedged": true,
+		},
+	}
+
+	if derivativeCanRemoveWithoutPriceHistory(meta, &derivativeMonitorState{HistoryTooOld: true}) {
+		t.Fatalf("hedged derivative must stay protected when price history is too old")
+	}
+}
