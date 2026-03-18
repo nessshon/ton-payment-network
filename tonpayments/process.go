@@ -482,6 +482,9 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		if _, ok := cond.(*conditionals.ConditionalResolvable); ok && !s.cfg.AcceptingDerivatives {
 			return nil, fmt.Errorf("derivatives are not accepted on this node")
 		}
+		if err = s.validateIncomingAction(cond.GetAction()); err != nil {
+			return nil, err
+		}
 
 		// we will not accept conditional with already used key
 		if _, err = s.db.GetVirtualChannelMeta(ctx, cond.GetKey()); err != nil && !errors.Is(err, db.ErrNotFound) {

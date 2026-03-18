@@ -17,6 +17,7 @@ import (
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
+	paymentvault "github.com/xssnick/ton-payment-network/pkg/payments/vault"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain/client"
 	"github.com/xssnick/ton-payment-network/tonpayments/config"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
@@ -159,7 +160,8 @@ type Service struct {
 	virtualChannelsLimitPerChannel int
 	workerSignal                   chan bool
 
-	cfg config.ChannelsConfig
+	cfg      config.ChannelsConfig
+	vaultCfg config.VaultConfig
 
 	// TODO: channel based lock
 	mx sync.Mutex
@@ -186,9 +188,11 @@ type Service struct {
 
 	urgentPeersMx sync.RWMutex
 	discoveryMx   sync.Mutex
+
+	vaultManager *paymentvault.Manager
 }
 
-func NewService(api ChainAPI, database DB, transport, webTransport Transport, wallet Wallet, updates chan any, key ed25519.PrivateKey, cfg config.ChannelsConfig, useMetrics bool) (*Service, error) {
+func NewService(api ChainAPI, database DB, transport, webTransport Transport, wallet Wallet, updates chan any, key ed25519.PrivateKey, cfg config.ChannelsConfig, vaultCfg config.VaultConfig, useMetrics bool) (*Service, error) {
 	globalCtx, globalCancel := context.WithCancel(context.Background())
 	s := &Service{
 		ton:                            api,
@@ -202,6 +206,7 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 		virtualChannelsLimitPerChannel: 30000,
 		workerSignal:                   make(chan bool, 1),
 		cfg:                            cfg,
+		vaultCfg:                       vaultCfg,
 		channelLocks:                   map[string]*channelLock{},
 		knownBalanceTypes:              map[string]*payments.CoinConfig{},
 		knownBalanceTypesSymbols:       map[string]*payments.CoinConfig{},
@@ -325,6 +330,10 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 		s.knownBalanceTypesSymbols[b.Symbol] = b
 	}
 
+	if err := s.initVaultManager(); err != nil {
+		return nil, err
+	}
+
 	if err := s.loadUrgentPeers(context.Background()); err != nil {
 		return nil, err
 	}
@@ -362,27 +371,6 @@ func (s *Service) Stop() {
 
 func (s *Service) SetOnSwap(sh SwapHook) {
 	s.onSwap = sh
-}
-
-func (s *Service) ResolveVaults(ctx context.Context, addrA *address.Address, addrB *address.Address) (*payments.VaultData, *payments.VaultData, error) {
-	// universal resolver for now, assume we store all coin types in single vault contract
-
-	// one of addresses must be our channel addr
-	ch, err := s.GetActiveChannel(ctx, addrA.String())
-	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
-			ch, err = s.GetActiveChannel(ctx, addrB.String())
-			if err != nil {
-				return nil, nil, err
-			}
-		} else {
-			return nil, nil, err
-		}
-	}
-	_ = ch
-
-	// TODO: check real vaults
-	return nil, nil, nil // no vaults
 }
 
 func (s *Service) GetChannelsHistoryByPeriod(ctx context.Context, addr string, limit int, before, after *time.Time) ([]db.ChannelHistoryItem, error) {
@@ -936,6 +924,7 @@ func (s *Service) processSideUpdate(ctx context.Context, ch *db.Channel, isOur b
 func (s *Service) Start() {
 	go s.taskExecutor()
 	go s.derivativePriceWorker()
+	s.startVaultWorker()
 	if s.useMetrics {
 		go s.channelsMonitor()
 		go s.walletMonitor()

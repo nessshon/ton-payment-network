@@ -81,6 +81,18 @@ type CoinTypes struct {
 	ExtraCurrencies map[uint32]CoinConfig
 }
 
+type VaultCoinBalanceConfig struct {
+	MinBalance string
+	MaxBalance string
+}
+
+type VaultConfig struct {
+	UseOnOurSide     bool
+	AllowOnTheirSide bool
+	PrivateKey       []byte
+	Coins            map[string]VaultCoinBalanceConfig
+}
+
 type Config struct {
 	Version                        int
 	ADNLServerKey                  []byte
@@ -96,10 +108,11 @@ type Config struct {
 	NetworkConfigUrl               string
 	DBPath                         string
 	SecureProofPolicy              bool
+	Vault                          VaultConfig
 	ChannelConfig                  ChannelsConfig
 }
 
-const LatestConfigVersion = 5
+const LatestConfigVersion = 6
 
 func generateBase64Random(size int) (string, error) {
 	buf := make([]byte, size)
@@ -116,6 +129,11 @@ func Generate() (*Config, error) {
 	}
 
 	_, walletPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	_, vaultPriv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -153,6 +171,12 @@ func Generate() (*Config, error) {
 		DBPath:                         "./payment-node-db",
 		WebhooksSignatureHMACSHA256Key: base64.StdEncoding.EncodeToString(whKey),
 		SecureProofPolicy:              false,
+		Vault: VaultConfig{
+			UseOnOurSide:     false,
+			AllowOnTheirSide: false,
+			PrivateKey:       vaultPriv.Seed(),
+			Coins:            map[string]VaultCoinBalanceConfig{},
+		},
 		ChannelConfig: ChannelsConfig{
 			SupportedCoins: CoinTypes{
 				Ton: CoinConfig{
@@ -288,6 +312,19 @@ func Upgrade(cfg *Config) (bool, error) {
 				}
 				cfg.ChannelConfig.DerivativesHedge.WebhookSignatureHMACSHA256Key = key
 			}
+		}
+	}
+
+	if cfg.Version < 6 {
+		if len(cfg.Vault.PrivateKey) == 0 {
+			_, vaultPriv, err := ed25519.GenerateKey(nil)
+			if err != nil {
+				return false, fmt.Errorf("generate vault key: %w", err)
+			}
+			cfg.Vault.PrivateKey = vaultPriv.Seed()
+		}
+		if cfg.Vault.Coins == nil {
+			cfg.Vault.Coins = map[string]VaultCoinBalanceConfig{}
 		}
 	}
 

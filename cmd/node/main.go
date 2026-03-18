@@ -340,7 +340,7 @@ func main() {
 	}
 	log.Info().Str("addr", w.WalletAddress().String()).Msg("wallet initialized")
 
-	svc, err := tonpayments.NewService(chainClient.NewTON(apiClient), fdb, tr, webTr, w, inv, ed25519.NewKeyFromSeed(cfg.PaymentNodePrivateKey), cfg.ChannelConfig, metrics.Registered)
+	svc, err := tonpayments.NewService(chainClient.NewTON(apiClient), fdb, tr, webTr, w, inv, ed25519.NewKeyFromSeed(cfg.PaymentNodePrivateKey), cfg.ChannelConfig, cfg.Vault, metrics.Registered)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to init service")
 		return

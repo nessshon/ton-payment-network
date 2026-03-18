@@ -26,6 +26,8 @@ type ActionSendTonVault struct {
 	VaultB *payments.VaultData
 }
 
+func (*ActionSendTonVault) isVaultAction() {}
+
 func (a *ActionSendTonVault) Serialize() *cell.Cell {
 	c := cell.BeginCell()
 	if a.VaultA != nil {
@@ -48,7 +50,7 @@ func (a *ActionSendTonVault) Serialize() *cell.Cell {
 		c.MustStoreBuilder(vm.PushNull())
 	}
 
-	return c.MustStoreRef(actionSendTonStaticCode).EndCell()
+	return c.MustStoreRef(actionSendTonVaultStaticCode).EndCell()
 }
 
 func (a *ActionSendTonVault) Parse(ctx context.Context, balanceTypes payments.BalanceTypeResolver, s *cell.Slice) error {
@@ -83,7 +85,7 @@ func (a *ActionSendTonVault) Parse(ctx context.Context, balanceTypes payments.Ba
 		return fmt.Errorf("failed to parse code: %w", err)
 	}
 
-	if !bytes.Equal(code.Hash(), actionSendTonStaticCode.Hash()) {
+	if !bytes.Equal(code.Hash(), actionSendTonVaultStaticCode.Hash()) {
 		return fmt.Errorf("incorrect code")
 	}
 

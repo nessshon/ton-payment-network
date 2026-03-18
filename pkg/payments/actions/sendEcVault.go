@@ -28,6 +28,8 @@ type ActionSendECVault struct {
 	EC uint32
 }
 
+func (*ActionSendECVault) isVaultAction() {}
+
 func (a *ActionSendECVault) Serialize() *cell.Cell {
 	c := cell.BeginCell()
 	if a.VaultA != nil {
@@ -50,7 +52,7 @@ func (a *ActionSendECVault) Serialize() *cell.Cell {
 		c.MustStoreBuilder(vm.PushNull())
 	}
 
-	return c.MustStoreBuilder(vm.PushIntOP(new(big.Int).SetUint64(uint64(a.EC)))).MustStoreRef(actionSendTonStaticCode).EndCell()
+	return c.MustStoreBuilder(vm.PushIntOP(new(big.Int).SetUint64(uint64(a.EC)))).MustStoreRef(actionSendECVaultStaticCode).EndCell()
 }
 
 func (a *ActionSendECVault) Parse(ctx context.Context, balanceTypes payments.BalanceTypeResolver, s *cell.Slice) error {
@@ -94,7 +96,7 @@ func (a *ActionSendECVault) Parse(ctx context.Context, balanceTypes payments.Bal
 		return fmt.Errorf("failed to parse code: %w", err)
 	}
 
-	if !bytes.Equal(code.Hash(), actionSendECStaticCode.Hash()) {
+	if !bytes.Equal(code.Hash(), actionSendECVaultStaticCode.Hash()) {
 		return fmt.Errorf("incorrect code")
 	}
 
@@ -170,7 +172,6 @@ func (a *ActionSendECVault) EmulateBalance(state *cell.Cell, balances map[string
 
 	amt := new(big.Int).Sub(curState.Amount.Nano(), curState.Commited.Nano())
 	if fromUs {
-		b.Action.Sub(b.Action, amt)
 	} else {
 		b.Action.Add(b.Action, amt)
 	}

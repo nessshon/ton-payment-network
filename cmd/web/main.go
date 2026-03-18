@@ -934,6 +934,7 @@ func start(peerKey, channelKey []byte) {
 	if err != nil {
 		panic(err)
 	}
+	cfg.Vault.AllowOnTheirSide = true
 	updated, err := config.Upgrade(cfg)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to upgrade config")
@@ -1142,7 +1143,7 @@ func start(peerKey, channelKey []byte) {
 		pcuHistoryFunc.Invoke()
 	})
 
-	svc, err := tonpayments.NewService(tn, d, tr, nil, wl, ch, ed25519.NewKeyFromSeed(cfg.PaymentNodePrivateKey), cfg.ChannelConfig, false)
+	svc, err := tonpayments.NewService(tn, d, tr, nil, wl, ch, ed25519.NewKeyFromSeed(cfg.PaymentNodePrivateKey), cfg.ChannelConfig, cfg.Vault, false)
 	if err != nil {
 		panic(err)
 	}

@@ -136,7 +136,7 @@ func newTestNodeWithOptions(t *testing.T, hub *loopbackHub, idx, port int, opts 
 	wallet := newStubWallet(pub, hub.chain)
 	updates := make(chan any, 64)
 
-	svc, err := tonpayments.NewService(hub.chain, database, tr, nil, wallet, updates, priv, cfg.ChannelConfig, false)
+	svc, err := tonpayments.NewService(hub.chain, database, tr, nil, wallet, updates, priv, cfg.ChannelConfig, cfg.Vault, false)
 	if err != nil {
 		t.Fatalf("node %d: init service failed: %v", idx, err)
 	}
@@ -532,7 +532,7 @@ func newTestnetNodeWithOptions(t *testing.T, hub *loopbackHub, idx, port int, op
 	scanner := chainscan.NewScanner(hub.live.api, 0, zerolog.Nop(), updates)
 	database.SetOnChannelUpdated(scanner.OnChannelUpdate)
 
-	svc, err := tonpayments.NewService(hub.live.chain, database, tr, nil, hub.live.wallet, updates, priv, cfg.ChannelConfig, false)
+	svc, err := tonpayments.NewService(hub.live.chain, database, tr, nil, hub.live.wallet, updates, priv, cfg.ChannelConfig, cfg.Vault, false)
 	if err != nil {
 		t.Fatalf("node %d: init service failed: %v", idx, err)
 	}

@@ -603,7 +603,7 @@ func (s *DerivativesService) OpenPosition(ctx context.Context, channelAddr strin
 			return "", fmt.Errorf("failed to get valid current price")
 		}
 
-		// TODO: add slippage
+		// TODO: add slippage?
 		entryPrice = tlb.MustFromNano(lastPrice, 9)
 	}
 

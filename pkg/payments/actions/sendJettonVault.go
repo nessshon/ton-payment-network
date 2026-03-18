@@ -30,6 +30,8 @@ type ActionSendJettonVault struct {
 	WalletB  *address.Address
 }
 
+func (*ActionSendJettonVault) isVaultAction() {}
+
 func (a *ActionSendJettonVault) Serialize() *cell.Cell {
 	c := cell.BeginCell()
 	if a.VaultA != nil {
@@ -57,8 +59,8 @@ func (a *ActionSendJettonVault) Serialize() *cell.Cell {
 			MustStoreBuilder(vm.PushSliceRef(cell.BeginCell().MustStoreAddr(a.WalletA).ToSlice())).
 			MustStoreBuilder(vm.PushSliceRef(cell.BeginCell().MustStoreAddr(a.WalletB).ToSlice())).
 			// we pack immutable part of code to ref for better BoC compression and cheaper transactions
-			MustStoreRef(actionSendJettonStaticCode). // implicit jump
-			EndCell()).                               // implicit jump
+			MustStoreRef(actionSendJettonVaultStaticCode). // implicit jump
+			EndCell()).                                    // implicit jump
 		EndCell()
 }
 
@@ -130,7 +132,7 @@ func (a *ActionSendJettonVault) Parse(ctx context.Context, balanceTypes payments
 		return fmt.Errorf("failed to parse code: %w", err)
 	}
 
-	if !bytes.Equal(code.Hash(), actionSendJettonStaticCode.Hash()) {
+	if !bytes.Equal(code.Hash(), actionSendJettonVaultStaticCode.Hash()) {
 		return fmt.Errorf("incorrect code")
 	}
 
@@ -188,16 +190,6 @@ func (a *ActionSendJettonVault) GetAffectedCoins() []*payments.CoinConfig {
 }
 
 func (a *ActionSendJettonVault) PrepareNext(ctx context.Context, addrA, addrB *address.Address) (payments.Action, error) {
-	wA, err := a.Coin.JettonClient.GetWalletAddress(ctx, addrA)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get wallet address A for %s: %w", addrA, err)
-	}
-
-	wB, err := a.Coin.JettonClient.GetWalletAddress(ctx, addrB)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get wallet address B for %s: %w", addrB, err)
-	}
-
 	if a.Coin.VaultResolver == nil {
 		return nil, fmt.Errorf("no vault resolver set")
 	}
@@ -205,6 +197,20 @@ func (a *ActionSendJettonVault) PrepareNext(ctx context.Context, addrA, addrB *a
 	av, bv, err := a.Coin.VaultResolver.ResolveVaults(ctx, addrA, addrB)
 	if err != nil {
 		return nil, err
+	}
+
+	var wA, wB *address.Address
+	if av != nil {
+		wA, err = a.Coin.JettonClient.GetWalletAddress(ctx, av.Address)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get vault wallet address A for %s: %w", av.Address, err)
+		}
+	}
+	if bv != nil {
+		wB, err = a.Coin.JettonClient.GetWalletAddress(ctx, bv.Address)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get vault wallet address B for %s: %w", bv.Address, err)
+		}
 	}
 
 	return &ActionSendJettonVault{
@@ -251,7 +257,6 @@ func (a *ActionSendJettonVault) EmulateBalance(state *cell.Cell, balances map[st
 
 	amt := new(big.Int).Sub(curState.Amount.Nano(), curState.Commited.Nano())
 	if fromUs {
-		b.Action.Sub(b.Action, amt)
 	} else {
 		b.Action.Add(b.Action, amt)
 	}
