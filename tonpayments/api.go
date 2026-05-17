@@ -873,18 +873,16 @@ func (s *Service) closeConditional(ctx context.Context, meta *db.ConditionalMeta
 		return fmt.Errorf("conditional meta is nil")
 	}
 
+	if meta.Incoming == nil {
+		if meta.Outgoing != nil {
+			return ErrCannotCloseOutgoingVirtual
+		}
+		return fmt.Errorf("conditional has no incoming channel")
+	}
+
 	resolve := meta.LastKnownResolve
 	if resolve == nil {
 		return ErrNoResolveExists
-	}
-
-	if meta.Incoming == nil {
-		if err := s.db.ClosePairMeta(ctx, meta.Key, db.ConditionalStateWantClose); err != nil {
-			return fmt.Errorf("failed to update outgoing virtual channel pair in db: %w", err)
-		}
-		meta.Status = db.ConditionalStateWantClose
-		meta.UpdatedAt = time.Now()
-		return nil
 	}
 
 	ch, err := s.GetActiveChannel(ctx, meta.Incoming.ChannelAddress)
