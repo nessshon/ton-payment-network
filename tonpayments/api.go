@@ -727,6 +727,14 @@ func (s *Service) CloseDerivative(ctx context.Context, virtualKey ed25519.Public
 	if meta.Outgoing == nil {
 		return fmt.Errorf("derivative is not outgoing")
 	}
+	if meta.Outgoing.Conditional == nil {
+		return fmt.Errorf("outgoing derivative conditional is missing")
+	}
+
+	linkedMeta, err := s.loadLinkedIncomingDerivativeMeta(ctx, meta)
+	if err != nil {
+		return err
+	}
 
 	ch, err := s.GetActiveChannel(ctx, meta.Outgoing.ChannelAddress)
 	if err != nil {
@@ -773,71 +781,58 @@ func (s *Service) CloseDerivative(ctx context.Context, virtualKey ed25519.Public
 
 		till := cond.GetDeadline()
 
-		// For derivatives, the close-conditional worker requires meta.Incoming != nil.
-		// The outgoing meta only has Outgoing, so we must create the task for the
-		// linked incoming key instead.
-		taskKey := meta.Key
-		if len(meta.Outgoing.LinkedKey) == ed25519.PublicKeySize {
-			linkedMeta, lErr := s.db.GetVirtualChannelMeta(ctx, meta.Outgoing.LinkedKey)
-			if lErr != nil {
-				return fmt.Errorf("failed to load linked incoming meta: %w", lErr)
+		// Propagate resolve to the incoming meta.
+		// If outgoing settle is already > 0 (our loss), incoming settle is
+		// deterministically 0 and does not require oracle access.
+		if meta.LastKnownResolve != nil {
+			var outResolve conditionals.ResolvableState
+			if rErr := payments.LoadState(&outResolve, meta.LastKnownResolve); rErr != nil {
+				return fmt.Errorf("failed to parse outgoing derivative resolve: %w", rErr)
 			}
 
-			// Propagate resolve to the incoming meta.
-			// If outgoing settle is already > 0 (our loss), incoming settle is
-			// deterministically 0 and does not require oracle access.
-			if meta.LastKnownResolve != nil {
-				var outResolve conditionals.ResolvableState
-				if rErr := payments.LoadState(&outResolve, meta.LastKnownResolve); rErr != nil {
-					return fmt.Errorf("failed to parse outgoing derivative resolve: %w", rErr)
+			if outResolve.Amount.Sign() > 0 {
+				zeroIncoming, zErr := tlb.ToCell(conditionals.ResolvableState{
+					Key:    linkedMeta.Key,
+					Amount: big.NewInt(0),
+					At:     outResolve.At,
+				})
+				if zErr != nil {
+					return fmt.Errorf("failed to build incoming zero resolve: %w", zErr)
 				}
-
-				if outResolve.Amount.Sign() > 0 {
-					zeroIncoming, zErr := tlb.ToCell(conditionals.ResolvableState{
-						Key:    linkedMeta.Key,
-						Amount: big.NewInt(0),
-						At:     outResolve.At,
-					})
-					if zErr != nil {
-						return fmt.Errorf("failed to build incoming zero resolve: %w", zErr)
-					}
-					linkedMeta.LastKnownResolve = zeroIncoming
-				}
+				linkedMeta.LastKnownResolve = zeroIncoming
 			}
-
-			if linkedMeta.LastKnownResolve == nil && meta.LastKnownResolve != nil {
-				if res, ok := cond.(*conditionals.ConditionalResolvable); ok {
-					incomingResolve, rErr := s.buildIncomingDerivativeResolve(res, linkedMeta.Key)
-					if rErr != nil {
-						return fmt.Errorf("failed to build incoming derivative resolve: %w", rErr)
-					} else {
-						linkedMeta.LastKnownResolve = incomingResolve
-					}
-				} else {
-					return fmt.Errorf("conditional is not derivative resolvable")
-				}
-			}
-
-			if linkedMeta.LastKnownResolve == nil {
-				return fmt.Errorf("linked incoming resolve is not set")
-			}
-
-			linkedMeta.Status = db.ConditionalStateWantClose
-			linkedMeta.UpdatedAt = time.Now()
-			if lErr = s.db.UpdateVirtualChannelMeta(ctx, linkedMeta); lErr != nil {
-				return fmt.Errorf("failed to update linked incoming meta: %w", lErr)
-			}
-
-			taskKey = linkedMeta.Key
 		}
 
-		log.Debug().Str("key", base64.StdEncoding.EncodeToString(taskKey)).
+		if linkedMeta.LastKnownResolve == nil && meta.LastKnownResolve != nil {
+			if res, ok := cond.(*conditionals.ConditionalResolvable); ok {
+				incomingResolve, rErr := s.buildIncomingDerivativeResolve(res, linkedMeta.Key)
+				if rErr != nil {
+					return fmt.Errorf("failed to build incoming derivative resolve: %w", rErr)
+				} else {
+					linkedMeta.LastKnownResolve = incomingResolve
+				}
+			} else {
+				return fmt.Errorf("conditional is not derivative resolvable")
+			}
+		}
+
+		if linkedMeta.LastKnownResolve == nil {
+			return fmt.Errorf("linked incoming resolve is not set")
+		}
+
+		linkedMeta.Status = db.ConditionalStateWantClose
+		linkedMeta.UpdatedAt = time.Now()
+		if lErr := s.db.UpdateVirtualChannelMeta(ctx, linkedMeta); lErr != nil {
+			return fmt.Errorf("failed to update linked incoming meta: %w", lErr)
+		}
+
+		log.Debug().Str("key", base64.StdEncoding.EncodeToString(linkedMeta.Key)).
 			Msg("creating task to close conditional")
 
 		if err = s.db.CreateTask(ctx, PaymentsTaskPool, "close-conditional", ch.Our.Address+"-deriv-close",
 			"close-conditional-"+ch.Our.Address+"-vc-"+base64.StdEncoding.EncodeToString(condId),
 			db.CloseConditionalTask{
-				VirtualKey: taskKey,
+				VirtualKey: linkedMeta.Key,
 			}, nil, &till,
 		); err != nil {
 			return fmt.Errorf("failed to create close conditional task: %w", err)
@@ -851,6 +846,33 @@ func (s *Service) CloseDerivative(ctx context.Context, virtualKey ed25519.Public
 	s.touchWorker()
 
 	return nil
+}
+
+func (s *Service) loadLinkedIncomingDerivativeMeta(ctx context.Context, meta *db.ConditionalMeta) (*db.ConditionalMeta, error) {
+	if meta == nil || meta.Outgoing == nil {
+		return nil, fmt.Errorf("derivative is not outgoing")
+	}
+	if len(meta.Outgoing.LinkedKey) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("outgoing derivative has no linked incoming side")
+	}
+
+	linkedMeta, err := s.db.GetVirtualChannelMeta(ctx, meta.Outgoing.LinkedKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load linked incoming meta: %w", err)
+	}
+	if linkedMeta.Incoming == nil {
+		return nil, fmt.Errorf("linked derivative meta is not incoming")
+	}
+	if linkedMeta.Incoming.Conditional == nil {
+		return nil, fmt.Errorf("linked incoming derivative conditional is missing")
+	}
+	if len(linkedMeta.Incoming.LinkedKey) != ed25519.PublicKeySize || !bytes.Equal(linkedMeta.Incoming.LinkedKey, meta.Key) {
+		return nil, fmt.Errorf("linked incoming derivative does not point back to outgoing meta")
+	}
+	if linkedMeta.Incoming.ChannelAddress != meta.Outgoing.ChannelAddress {
+		return nil, fmt.Errorf("linked incoming derivative channel mismatch")
+	}
+	return linkedMeta, nil
 }
 
 func (s *Service) CloseConditional(ctx context.Context, virtualKey ed25519.PublicKey) error {
