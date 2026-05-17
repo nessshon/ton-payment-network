@@ -1,3 +1,5 @@
+//go:build !js || !wasm
+
 package derivatives
 
 import (
@@ -16,12 +18,6 @@ import (
 
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 )
-
-// CandleProvider provides 1-minute candles for symbols.
-type CandleProvider interface {
-	Fetch1m(ctx context.Context, symbol string, start, end time.Time, limit int) ([]db.Candle1m, error)
-	FetchOrderBookAndVolume(ctx context.Context, symbol string, depthLimit int, volumeLimit int) (*OrderBookVolumeView, error)
-}
 
 // BinanceFuturesProvider implements CandleProvider using Binance USD-M futures REST API.
 // Endpoint: GET /fapi/v1/klines with interval=1m

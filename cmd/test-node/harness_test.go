@@ -240,27 +240,27 @@ func classifyExternalFlow(body *cell.Cell) string {
 	}
 
 	var uncoop payments.UncoopCloseMsg
-	if err := tlb.LoadFromCell(&uncoop, body.BeginParse()); err == nil {
+	if err := tlb.LoadFromCell(&uncoop, body.MustBeginParse()); err == nil {
 		return "uncoop-start"
 	}
 
 	var settle payments.SettleMsg
-	if err := tlb.LoadFromCell(&settle, body.BeginParse()); err == nil {
+	if err := tlb.LoadFromCell(&settle, body.MustBeginParse()); err == nil {
 		return "settle"
 	}
 
 	var fin payments.FinalizeSettleMsg
-	if err := tlb.LoadFromCell(&fin, body.BeginParse()); err == nil {
+	if err := tlb.LoadFromCell(&fin, body.MustBeginParse()); err == nil {
 		return "finalize-settle"
 	}
 
 	var exec payments.ProxyExecuteActionsMsg
-	if err := tlb.LoadFromCell(&exec, body.BeginParse()); err == nil {
+	if err := tlb.LoadFromCell(&exec, body.MustBeginParse()); err == nil {
 		return "execute-action"
 	}
 
 	var finish payments.FinishUncooperativeClose
-	if err := tlb.LoadFromCell(&finish, body.BeginParse()); err == nil {
+	if err := tlb.LoadFromCell(&finish, body.MustBeginParse()); err == nil {
 		return "finish-close"
 	}
 
@@ -1831,17 +1831,17 @@ func (c *testChain) handleWalletMessagesLocked(reason string, messages []tonpaym
 
 		if bytes.Equal(acc.Code.Hash(), condcontracts.Codes[0].Hash()) {
 			var commit condcontracts.Commit
-			if err := tlb.LoadFromCell(&commit, msg.Body.BeginParse()); err == nil {
+			if err := tlb.LoadFromCell(&commit, msg.Body.MustBeginParse()); err == nil {
 				storage, err := condcontracts.LoadDerivativeStorage(acc.Data)
 				if err != nil {
 					return nil, nil, err
 				}
 
 				var entry, exit condcontracts.PriceProof
-				if err = tlb.LoadFromCell(&entry, commit.Entry.SignedBody.BeginParse()); err != nil {
+				if err = tlb.LoadFromCell(&entry, commit.Entry.SignedBody.MustBeginParse()); err != nil {
 					return nil, nil, err
 				}
-				if err = tlb.LoadFromCell(&exit, commit.Exit.SignedBody.BeginParse()); err != nil {
+				if err = tlb.LoadFromCell(&exit, commit.Exit.SignedBody.MustBeginParse()); err != nil {
 					return nil, nil, err
 				}
 
@@ -1874,7 +1874,7 @@ func (c *testChain) handleWalletMessagesLocked(reason string, messages []tonpaym
 			}
 
 			var proxy condcontracts.ProxySettle
-			if err := tlb.LoadFromCell(&proxy, msg.Body.BeginParse()); err == nil {
+			if err := tlb.LoadFromCell(&proxy, msg.Body.MustBeginParse()); err == nil {
 				storage, err := condcontracts.LoadDerivativeStorage(acc.Data)
 				if err != nil {
 					return nil, nil, err
@@ -1890,7 +1890,7 @@ func (c *testChain) handleWalletMessagesLocked(reason string, messages []tonpaym
 				}
 
 				var settle payments.SettleMsg
-				if err = tlb.LoadFromCell(&settle, proxy.Msg.BeginParse()); err != nil {
+				if err = tlb.LoadFromCell(&settle, proxy.Msg.MustBeginParse()); err != nil {
 					return nil, nil, err
 				}
 				upd, _, err := c.applySettleLocked(targetState, proxy.Msg, &settle, "proxy-settle")
@@ -1927,23 +1927,23 @@ func (c *testChain) SendWaitExternalMessage(_ context.Context, to *address.Addre
 	)
 
 	var uncoop payments.UncoopCloseMsg
-	if err = tlb.LoadFromCell(&uncoop, body.BeginParse()); err == nil {
+	if err = tlb.LoadFromCell(&uncoop, body.MustBeginParse()); err == nil {
 		updates, hash, err = c.applyUncoopCloseLocked(target, body, &uncoop)
 	} else {
 		var settle payments.SettleMsg
-		if err = tlb.LoadFromCell(&settle, body.BeginParse()); err == nil {
+		if err = tlb.LoadFromCell(&settle, body.MustBeginParse()); err == nil {
 			updates, hash, err = c.applySettleLocked(target, body, &settle, "settle")
 		} else {
 			var fin payments.FinalizeSettleMsg
-			if err = tlb.LoadFromCell(&fin, body.BeginParse()); err == nil {
+			if err = tlb.LoadFromCell(&fin, body.MustBeginParse()); err == nil {
 				updates, hash, err = c.applyFinalizeLocked(target, body, &fin)
 			} else {
 				var exec payments.ProxyExecuteActionsMsg
-				if err = tlb.LoadFromCell(&exec, body.BeginParse()); err == nil {
+				if err = tlb.LoadFromCell(&exec, body.MustBeginParse()); err == nil {
 					updates, hash, err = c.applyProxyExecuteLocked(target, body, &exec)
 				} else {
 					var finish payments.FinishUncooperativeClose
-					if err = tlb.LoadFromCell(&finish, body.BeginParse()); err == nil {
+					if err = tlb.LoadFromCell(&finish, body.MustBeginParse()); err == nil {
 						updates, hash, err = c.applyFinishCloseLocked(target, body)
 					} else {
 						payload := append([]byte{}, to.Data()...)

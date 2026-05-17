@@ -144,7 +144,7 @@ func (c *Client) ParseChannel(addr *address.Address, code, data *cell.Cell, veri
 		Code:    code,
 	}
 
-	err := tlb.LoadFromCell(&ch.Storage, data.BeginParse())
+	err := tlb.Parse(&ch.Storage, data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load storage: %w", err)
 	}
@@ -599,7 +599,7 @@ func UnpackOutActions(list *cell.Cell) ([]WalletMessage, error) {
 			break
 		}
 
-		sl := list.BeginParse()
+		sl := list.MustBeginParse()
 		prev, err := sl.LoadRef()
 		if err != nil {
 			return nil, fmt.Errorf("failed to load prev ref: %w", err)

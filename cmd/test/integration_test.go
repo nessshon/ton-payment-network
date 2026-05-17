@@ -560,10 +560,14 @@ func TestClient_AsyncChannelFullFlow(t *testing.T) {
 	println("GET STATE", res.MustInt(0).Uint64())
 	t.Log("cur actions hash", hex.EncodeToString(ch2.Storage.Quarantine.TheirState.ActionStatesHash))
 
-	var sk = cell.CreateProofSkeleton()
-	sk.SetRecursive()
-	condAProof, _ := condA.AsCell().CreateProof(sk)
-	actAProof, _ := actA.AsCell().CreateProof(sk)
+	condAProof, err := payments.CreateFullCellUsageProof(condA.AsCell())
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to build conditionals proof: %w", err))
+	}
+	actAProof, err := payments.CreateFullCellUsageProof(actA.AsCell())
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to build actions proof: %w", err))
+	}
 
 	state := conditionals.VirtualChannelState{
 		Amount: tlb.MustFromTON("0.03").Nano(),
@@ -634,7 +638,10 @@ func TestClient_AsyncChannelFullFlow(t *testing.T) {
 	toSettleNorm.SetIntKey(big.NewInt(5), condInput)
 
 	// Rebuild proof of actions input against the updated action state after phase 1
-	actAProof2, _ := actAfterDrv.AsCell().CreateProof(sk)
+	actAProof2, err := payments.CreateFullCellUsageProof(actAfterDrv.AsCell())
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to build actions proof after derivative settle: %w", err))
+	}
 
 	// Rebuild conditionals proof after phase 1: mark derivative key (7) as removed by empty cell
 	condAAfterDrv := cell.NewDict(256)
@@ -642,7 +649,10 @@ func TestClient_AsyncChannelFullFlow(t *testing.T) {
 	condAAfterDrv.SetIntKey(big.NewInt(5), vch2.Serialize())
 	// empty cell value denotes removed key in proof semantics
 	condAAfterDrv.SetIntKey(big.NewInt(7), cell.BeginCell().EndCell())
-	condAProof2, _ := condAAfterDrv.AsCell().CreateProof(sk)
+	condAProof2, err := payments.CreateFullCellUsageProof(condAAfterDrv.AsCell())
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to build conditionals proof after derivative settle: %w", err))
+	}
 
 	// ExpectedSender = addr_none for normal resolves
 	body, err = ch2.PrepareSettleMessage(bKey, toSettleNorm, condAProof2, actAProof2, nil)
@@ -711,8 +721,14 @@ func TestClient_AsyncChannelFullFlow(t *testing.T) {
 
 	waitBlock(4)
 
-	actAProof, _ = actA.AsCell().CreateProof(sk)
-	actBProof, _ := actB.AsCell().CreateProof(sk)
+	actAProof, err = payments.CreateFullCellUsageProof(actA.AsCell())
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to build final A actions proof: %w", err))
+	}
+	actBProof, err := payments.CreateFullCellUsageProof(actB.AsCell())
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to build final B actions proof: %w", err))
+	}
 
 	body, err = ch2.PrepareProxyExecuteActionsMessage(bKey, actC, actAProof, actBProof)
 	if err != nil {

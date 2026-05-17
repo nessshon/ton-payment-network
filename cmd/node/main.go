@@ -234,12 +234,13 @@ func main() {
 			return
 		}
 
-		gate.SetAddressList([]*adnlAddress.UDP{
-			{
-				IP:   ip,
-				Port: int32(addr.Port()),
-			},
-		})
+		nodeAddress, err := adnlAddress.NewAddress(ip, int32(addr.Port()))
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to build external adnl address")
+			return
+		}
+
+		gate.SetAddressList([]adnlAddress.Address{nodeAddress})
 		if err := gate.StartServer(cfg.NodeListenAddr); err != nil {
 			log.Fatal().Err(err).Msg("failed to init adnl gateway")
 			return

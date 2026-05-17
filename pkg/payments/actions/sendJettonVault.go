@@ -73,7 +73,7 @@ func (a *ActionSendJettonVault) Parse(ctx context.Context, balanceTypes payments
 	}
 	if cll != nil {
 		var v payments.VaultData
-		if err = tlb.LoadFromCell(&v, cll.BeginParse()); err != nil {
+		if err = tlb.Parse(&v, cll); err != nil {
 			return fmt.Errorf("failed to parse addr: %w", err)
 		}
 		vaultA = &v
@@ -85,7 +85,7 @@ func (a *ActionSendJettonVault) Parse(ctx context.Context, balanceTypes payments
 	}
 	if cll != nil {
 		var v payments.VaultData
-		if err = tlb.LoadFromCell(&v, cll.BeginParse()); err != nil {
+		if err = tlb.Parse(&v, cll); err != nil {
 			return fmt.Errorf("failed to parse addr: %w", err)
 		}
 		vaultB = &v

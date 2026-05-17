@@ -152,7 +152,7 @@ func LoadDerivativeStorage(data *cell.Cell) (*DerivativeStorage, error) {
 		return nil, fmt.Errorf("nil storage data")
 	}
 	var st DerivativeStorage
-	if err := tlb.LoadFromCell(&st, data.BeginParse()); err != nil {
+	if err := tlb.Parse(&st, data); err != nil {
 		return nil, fmt.Errorf("failed to parse derivative storage: %w", err)
 	}
 	return &st, nil

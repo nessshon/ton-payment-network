@@ -836,7 +836,7 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 				return nil, fmt.Errorf("failed to load from action state: %w", err)
 			}
 			saveTheirAction = true
-			theirState = fromAct.GetEmptyState().BeginParse()
+			theirState = fromAct.GetEmptyState().MustBeginParse()
 		}
 		ourState, err := channel.Our.Data.ActionStates.LoadValue(toAct.IDCell())
 		if err != nil {
@@ -844,7 +844,7 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 				return nil, fmt.Errorf("failed to load to action state: %w", err)
 			}
 			saveOurAction = true
-			ourState = toAct.GetEmptyState().BeginParse()
+			ourState = toAct.GetEmptyState().MustBeginParse()
 		}
 
 		newTheirState, err := fromAct.AddCoins(theirState.MustToCell(), fromAmt.Nano(), channel.Their.LockedDeposits)
@@ -1019,7 +1019,7 @@ func (s *Service) ProcessAction(ctx context.Context, key ed25519.PublicKey, lock
 		var saveAction bool
 		if aState == nil {
 			saveAction = true
-			aState = a.GetEmptyState().BeginParse()
+			aState = a.GetEmptyState().MustBeginParse()
 		}
 
 		amount := new(big.Int).SetBytes(data.Amount)
@@ -1214,7 +1214,7 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 	switch data := action.(type) {
 	case transport.ExecuteTransactionAction:
 		var req payments.ExternalMsgDoubleSigned
-		err = tlb.LoadFromCell(&req, data.ExternalBody.BeginParse())
+		err = tlb.Parse(&req, data.ExternalBody)
 		if err != nil {
 			return nil, fmt.Errorf("failed to serialize message request: %w", err)
 		}
@@ -1306,7 +1306,7 @@ func (s *Service) ProcessActionRequest(ctx context.Context, key ed25519.PublicKe
 		return nil, nil
 	case transport.CooperativeCloseAction:
 		var req payments.CooperativeClose
-		err = tlb.LoadFromCell(&req, data.SignedCloseRequest.BeginParse())
+		err = tlb.Parse(&req, data.SignedCloseRequest)
 		if err != nil {
 			return nil, fmt.Errorf("failed to serialize their close channel request: %w", err)
 		}

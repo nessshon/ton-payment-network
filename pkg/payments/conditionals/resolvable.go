@@ -599,7 +599,7 @@ var resolvableStaticCode = func() *cell.Cell {
 				v.amount += input.amount - fee;
 			}
 
-			targetActionsInput.uDictSet(256, actionHash, v.toCell().beginParse());
+			targetActionsInput.uDictSet(256, actionHash, v.toCell().MustBeginParse());
 
 			return targetActionsInput;
 		}

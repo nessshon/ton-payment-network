@@ -475,7 +475,7 @@ func ParsePriceProof(proofCell *cell.Cell) (at int64, price *big.Int, err error)
 	}
 
 	var pi condcontracts.PriceInner
-	if err := tlb.LoadFromCell(&pi, proofCell.BeginParse()); err != nil {
+	if err := tlb.Parse(&pi, proofCell); err != nil {
 		return 0, nil, fmt.Errorf("failed to parse PriceInner: %w", err)
 	}
 	if pi.SignedBody == nil {
@@ -483,7 +483,7 @@ func ParsePriceProof(proofCell *cell.Cell) (at int64, price *big.Int, err error)
 	}
 
 	var pp condcontracts.PriceProof
-	if err := tlb.LoadFromCell(&pp, pi.SignedBody.BeginParse()); err != nil {
+	if err := tlb.Parse(&pp, pi.SignedBody); err != nil {
 		return 0, nil, fmt.Errorf("failed to parse PriceProof: %w", err)
 	}
 
@@ -497,7 +497,7 @@ func VerifyProofCell(proofCell *cell.Cell, pubKey ed25519.PublicKey) bool {
 	}
 
 	var pi condcontracts.PriceInner
-	if err := tlb.LoadFromCell(&pi, proofCell.BeginParse()); err != nil {
+	if err := tlb.Parse(&pi, proofCell); err != nil {
 		return false
 	}
 	if pi.SignedBody == nil || len(pi.Signature.V) != ed25519.SignatureSize {

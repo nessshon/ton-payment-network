@@ -417,7 +417,7 @@ func TestSettleChannelConditionals_PreparesDerivativeResolveAndExpectedSender(t 
 	}
 
 	var commit condcontracts.Commit
-	if err := tlb.LoadFromCell(&commit, wallet.calls[0].Messages[0].Body.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&commit, wallet.calls[0].Messages[0].Body.MustBeginParse()); err != nil {
 		t.Fatalf("failed to parse resolver commit body: %v", err)
 	}
 	if commit.Entry.SignedBody == nil || commit.Exit.SignedBody == nil {
@@ -473,7 +473,7 @@ func TestSettleChannelConditionals_PreparesDerivativeResolveAndExpectedSender(t 
 	}
 
 	var settleMsg payments.SettleMsg
-	if err = tlb.LoadFromCell(&settleMsg, settleTask.Message.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&settleMsg, settleTask.Message.MustBeginParse()); err != nil {
 		t.Fatalf("failed to parse settle message: %v", err)
 	}
 	if settleMsg.Signed.ExpectedSender == nil || !settleMsg.Signed.ExpectedSender.Equals(resolverAddr) {
@@ -521,7 +521,7 @@ func TestExecuteSettleStep_ProxiesDerivativeViaResolver(t *testing.T) {
 	}
 
 	var proxy condcontracts.ProxySettle
-	if err = tlb.LoadFromCell(&proxy, call.Messages[0].Body.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&proxy, call.Messages[0].Body.MustBeginParse()); err != nil {
 		t.Fatalf("failed to parse proxy settle body: %v", err)
 	}
 	if proxy.ToA {
@@ -529,7 +529,7 @@ func TestExecuteSettleStep_ProxiesDerivativeViaResolver(t *testing.T) {
 	}
 
 	var proxied payments.SettleMsg
-	if err = tlb.LoadFromCell(&proxied, proxy.Msg.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&proxied, proxy.Msg.MustBeginParse()); err != nil {
 		t.Fatalf("failed to parse proxied settle message: %v", err)
 	}
 	if proxied.Signed.ExpectedSender == nil || !proxied.Signed.ExpectedSender.Equals(resolverAddr) {

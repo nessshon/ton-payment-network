@@ -10,10 +10,13 @@ import (
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/adnl"
+	adnlAddress "github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"github.com/xssnick/tonutils-go/tl"
+	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -133,7 +136,7 @@ func (s *Server) updateDHT(ctx context.Context) error {
 	addr := s.gate.GetAddressList()
 
 	ctxStore, cancel := context.WithTimeout(ctx, 120*time.Second)
-	stored, id, err := s.dht.StoreAddress(ctxStore, addr, 30*time.Minute, s.key, 3)
+	stored, id, err := s.dht.StoreAddress(ctxStore, addr, 30*time.Minute, s.key)
 	cancel()
 	if err != nil && stored == 0 {
 		return err
@@ -148,7 +151,7 @@ func (s *Server) updateDHT(ctx context.Context) error {
 	}
 
 	stored, _, err = s.dht.Store(ctx, chanKey, []byte("payment-node"), 0,
-		dhtVal, dht.UpdateRuleSignature{}, 30*time.Minute, s.channelKey, 0)
+		dhtVal, dht.UpdateRuleSignature{}, 30*time.Minute, s.channelKey)
 	if err != nil {
 		return fmt.Errorf("failed to store node payment-node value in dht: %w", err)
 	}
@@ -263,7 +266,12 @@ func (s *Server) Connect(ctx context.Context, channelKey ed25519.PublicKey) (*tr
 	if len(list.Addresses) == 0 {
 		return nil, fmt.Errorf("no addresses for %s", base64.StdEncoding.EncodeToString(channelKey))
 	}
-	addr := fmt.Sprintf("%s:%d", list.Addresses[0].IP.String(), list.Addresses[0].Port)
+	ip := adnlAddress.IPValue(list.Addresses[0])
+	port := adnlAddress.PortValue(list.Addresses[0])
+	if ip == nil || port == 0 {
+		return nil, fmt.Errorf("invalid address for %s", base64.StdEncoding.EncodeToString(channelKey))
+	}
+	addr := net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))
 
 	peer, err := s.gate.RegisterClient(addr, key)
 	if err != nil {

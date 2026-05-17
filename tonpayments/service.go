@@ -576,7 +576,7 @@ func (s *Service) scanSettledConditionals(ctx context.Context, ch *db.Channel, t
 	for _, info := range tx.Out {
 		if info.Type == tlb.MsgTypeExternalOut {
 			var ev payments.ConditionalsSettledEvent
-			if err := tlb.LoadFromCell(&ev, info.Body.BeginParse()); err != nil {
+			if err := tlb.Parse(&ev, info.Body); err != nil {
 				continue
 			}
 
@@ -994,7 +994,7 @@ func (s *Service) Start() {
 
 					if upd.Transaction.Success && upd.Transaction.In.Type == tlb.MsgTypeExternalIn {
 						var settle payments.SettleMsg
-						if err := tlb.LoadFromCell(&settle, upd.Transaction.In.Body.BeginParse()); err == nil {
+						if err := tlb.Parse(&settle, upd.Transaction.In.Body); err == nil {
 							// we need to check their conditional resolves and add missing if any, to resolve our next channels
 							// it will also update channel actions to execute later
 							s.scanSettledConditionals(context.Background(), channel, upd.Transaction, settle, false)
@@ -1108,7 +1108,7 @@ func (s *Service) Start() {
 
 			if upd.Transaction.Success && upd.Transaction.In.Type == tlb.MsgTypeExternalIn {
 				var settle payments.SettleMsg
-				if err := tlb.LoadFromCell(&settle, upd.Transaction.In.Body.BeginParse()); err == nil {
+				if err := tlb.Parse(&settle, upd.Transaction.In.Body); err == nil {
 					// it will update channel actions to execute later
 					s.scanSettledConditionals(context.Background(), channel, upd.Transaction, settle, true)
 				}
@@ -1117,7 +1117,7 @@ func (s *Service) Start() {
 			if upd.Transaction.Success && upd.Transaction.In.Type == tlb.MsgTypeInternal && upd.LatestChannel.Status == payments.ChannelStatusClosureStarted {
 				ourState := channel.LoadSignedState()
 				var msg payments.UncoopCloseReplicateMsg
-				if err := tlb.LoadFromCell(&msg, upd.Transaction.In.Body.BeginParse()); err == nil &&
+				if err := tlb.Parse(&msg, upd.Transaction.In.Body); err == nil &&
 					msg.State != nil && msg.State.Body.Seqno >= ourState.Body.Seqno {
 					// We are checking their committed state from tx data and comparing it with ours,
 					// it can happen that party will use pending state signed by us, but not respond with his signature.
@@ -1498,7 +1498,7 @@ func (s *Service) DebugPrintChannels(ctx context.Context, status db.ChannelStatu
 			lg.Msg("active onchain channel")
 
 			for _, kv := range ch.Our.Conditionals.All() {
-				vch, _ := payments.ParseVirtualChannelCond(kv.Value.BeginParse())
+				vch, _ := payments.ParseVirtualChannelCond(kv.Value.MustBeginParse())
 				till := time.Unix(vch.Deadline, 0).Sub(time.Now())
 				log.Info().
 					Str("capacity", cc.MustAmount(vch.Capacity).String()).
@@ -1510,7 +1510,7 @@ func (s *Service) DebugPrintChannels(ctx context.Context, status db.ChannelStatu
 					Msg("virtual from us")
 			}
 			for _, kv := range ch.Their.Conditionals.All() {
-				vch, _ := payments.ParseVirtualChannelCond(kv.Value.BeginParse())
+				vch, _ := payments.ParseVirtualChannelCond(kv.Value.MustBeginParse())
 
 				log.Info().
 					Str("capacity", tlb.MustFromNano(vch.Capacity, int(cc.Decimals)).String()).
@@ -1774,7 +1774,7 @@ func (s *Service) proposeAction(ctx context.Context, lockId int64, channelAddres
 	}
 
 	var theirState payments.StateBodySigned
-	if err = tlb.LoadFromCell(&theirState, res.SignedState.BeginParse()); err != nil {
+	if err = tlb.Parse(&theirState, res.SignedState); err != nil {
 		return fmt.Errorf("failed to parse their updated channel state: %w", err)
 	}
 

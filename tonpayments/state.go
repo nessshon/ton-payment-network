@@ -486,7 +486,7 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 		var saveAction bool
 		if aState == nil {
 			saveAction = true
-			aState = a.GetEmptyState().BeginParse()
+			aState = a.GetEmptyState().MustBeginParse()
 		}
 
 		var actState actions.StateActionSend
@@ -674,7 +674,7 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 				return nil, nil, fmt.Errorf("failed to load to action state: %w", err)
 			}
 			saveTheirAction = true
-			theirState = toAct.GetEmptyState().BeginParse()
+			theirState = toAct.GetEmptyState().MustBeginParse()
 		}
 		ourState, err := channel.Our.Data.ActionStates.LoadValue(fromAct.IDCell())
 		if err != nil {
@@ -682,7 +682,7 @@ func (s *Service) updateOurStateWithAction(ctx context.Context, channel *db.Chan
 				return nil, nil, fmt.Errorf("failed to load from action state: %w", err)
 			}
 			saveOurAction = true
-			ourState = fromAct.GetEmptyState().BeginParse()
+			ourState = fromAct.GetEmptyState().MustBeginParse()
 		}
 
 		newTheirState, err := toAct.AddCoins(theirState.MustToCell(), toAmt.Nano(), channel.Their.LockedDeposits)

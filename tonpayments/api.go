@@ -1566,18 +1566,18 @@ func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr str
 	var resolved int
 	var pending int
 
-	addMessage := func(data *payments.SettleMsg, condProofPath, actProofPath *cell.ProofSkeleton) error {
+	addMessage := func(data *payments.SettleMsg, condProofBuilder, actProofBuilder *cell.MerkleProofBuilder) error {
 		if data.Signed.ToSettle == nil || data.Signed.ToSettle.IsEmpty() {
 			return nil
 		}
 
-		condDictProof, err := channel.Their.Data.Conditionals.AsCell().CreateProof(condProofPath)
+		condDictProof, err := condProofBuilder.CreateProof()
 		if err != nil {
 			log.Warn().Err(err).Msg("failed to find proof path for conditionals dict")
 			return err
 		}
 
-		actDictProof, err := channel.Their.Data.ActionStates.AsCell().CreateProof(actProofPath)
+		actDictProof, err := actProofBuilder.CreateProof()
 		if err != nil {
 			log.Warn().Err(err).Msg("failed to find proof path for action states dict")
 			return err
@@ -1608,22 +1608,23 @@ func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr str
 	updatedActions := channel.Their.Data.ActionStates.Copy()
 
 	condNum := 0
-	condProofPath, actProofPath := cell.CreateProofSkeleton(), cell.CreateProofSkeleton()
+	condProofBuilder := cell.NewMerkleProofBuilder(channel.Their.Data.Conditionals.AsCell())
+	actProofBuilder := cell.NewMerkleProofBuilder(channel.Their.Data.ActionStates.AsCell())
 	flushMessage := func() error {
 		if condNum == 0 {
 			return nil
 		}
 
-		if err := addMessage(&msg, condProofPath, actProofPath); err != nil {
+		if err := addMessage(&msg, condProofBuilder, actProofBuilder); err != nil {
 			log.Warn().Err(err).Msg("failed to add settle message")
 			return err
 		}
 
 		condNum = 0
-		condProofPath = cell.CreateProofSkeleton()
-		actProofPath = cell.CreateProofSkeleton()
 		channel.Their.Data.Conditionals = updatedState.Copy()
 		channel.Their.Data.ActionStates = updatedActions.Copy()
+		condProofBuilder = cell.NewMerkleProofBuilder(channel.Their.Data.Conditionals.AsCell())
+		actProofBuilder = cell.NewMerkleProofBuilder(channel.Their.Data.ActionStates.AsCell())
 		msg.Signed.ExpectedSender = nil
 		msg.Signed.ToSettle = cell.NewDict(256)
 
@@ -1672,14 +1673,18 @@ func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr str
 				msg.Signed.ExpectedSender = expectedSender
 			}
 
-			actionState, sk, err := channel.Their.Data.ActionStates.LoadValueWithProof(vch.GetAction().IDCell(), actProofPath)
+			actionState, err := actProofBuilder.Root().AsDict(channel.Their.Data.ActionStates.GetKeySize()).LoadValue(vch.GetAction().IDCell())
 			if err != nil {
 				log.Warn().Err(err).Msg("failed to find proof path for action state")
 				continue
 			}
-			sk.SetRecursive() // we need full value in proof
+			actionStateCell := actionState.MustToCell()
+			if err = payments.MarkCellUsedRecursive(actionStateCell); err != nil {
+				log.Warn().Err(err).Msg("failed to mark full action state proof")
+				continue
+			}
 
-			updatedActionState, err := vch.Execute(actionState.MustToCell(), resolve, map[string]*payments.LockedDepositInfo{})
+			updatedActionState, err := vch.Execute(actionStateCell, resolve, map[string]*payments.LockedDepositInfo{})
 			if err != nil {
 				log.Warn().Err(err).Msg("failed to execute conditional")
 				continue
@@ -1690,12 +1695,15 @@ func (s *Service) settleChannelConditionals(ctx context.Context, channelAddr str
 				continue
 			}
 
-			_, sk, err = channel.Their.Data.Conditionals.LoadValueWithProof(key, condProofPath)
+			condValue, err := condProofBuilder.Root().AsDict(channel.Their.Data.Conditionals.GetKeySize()).LoadValue(key)
 			if err != nil {
 				log.Warn().Err(err).Msg("failed to find proof path for conditionals dict")
 				continue
 			}
-			sk.SetRecursive() // we need full value in proof
+			if err = payments.MarkCellUsedRecursive(condValue.MustToCell()); err != nil {
+				log.Warn().Err(err).Msg("failed to mark full conditional proof")
+				continue
+			}
 			condNum++
 
 			// replace value to empty cell, we need 2 dictionaries: before and after, to save and continue
@@ -1834,33 +1842,39 @@ func (s *Service) settleChannelActions(ctx context.Context, channelAddr string) 
 			continue
 		}
 
-		theirProofPath := cell.CreateProofSkeleton()
-		_, skTheir, err := channel.Their.Data.ActionStates.LoadValueWithProof(key, theirProofPath)
+		theirProofBuilder := cell.NewMerkleProofBuilder(channel.Their.Data.ActionStates.AsCell())
+		theirActionState, err := theirProofBuilder.Root().AsDict(channel.Their.Data.ActionStates.GetKeySize()).LoadValue(key)
 		if err != nil {
 			log.Warn().Err(err).Str("id", base64.StdEncoding.EncodeToString(actId)).Msg("failed to find proof path for their action")
 			continue
 		}
-		skTheir.SetRecursive()
+		if err = payments.MarkCellUsedRecursive(theirActionState.MustToCell()); err != nil {
+			log.Warn().Err(err).Str("id", base64.StdEncoding.EncodeToString(actId)).Msg("failed to mark full proof for their action")
+			continue
+		}
 
-		ourProofPath := cell.CreateProofSkeleton()
-		_, skOur, err := channel.Our.Data.ActionStates.LoadValueWithProof(key, ourProofPath)
+		ourProofBuilder := cell.NewMerkleProofBuilder(channel.Our.Data.ActionStates.AsCell())
+		ourActionState, err := ourProofBuilder.Root().AsDict(channel.Our.Data.ActionStates.GetKeySize()).LoadValue(key)
 		if err != nil {
 			if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
 				log.Warn().Err(err).Str("id", base64.StdEncoding.EncodeToString(actId)).Msg("failed to find proof path for our action")
 				continue
 			}
 		} else {
-			skOur.SetRecursive()
+			if err = payments.MarkCellUsedRecursive(ourActionState.MustToCell()); err != nil {
+				log.Warn().Err(err).Str("id", base64.StdEncoding.EncodeToString(actId)).Msg("failed to mark full proof for our action")
+				continue
+			}
 		}
 
-		theirDictProof, err := channel.Their.Data.ActionStates.AsCell().CreateProof(theirProofPath)
+		theirDictProof, err := theirProofBuilder.CreateProof()
 		if err != nil {
 			log.Warn().Err(err).Str("id", base64.StdEncoding.EncodeToString(actId)).Msg("failed to create proof for their actions")
 			return err
 		}
 
 		if !channel.Our.Data.ActionStates.IsEmpty() {
-			ourDictProof, err := channel.Our.Data.ActionStates.AsCell().CreateProof(ourProofPath)
+			ourDictProof, err := ourProofBuilder.CreateProof()
 			if err != nil {
 				log.Warn().Err(err).Str("id", base64.StdEncoding.EncodeToString(actId)).Msg("failed to create proof for our actions")
 				return err
@@ -1932,7 +1946,7 @@ func (s *Service) executeSettleActionStep(ctx context.Context, channelAddr strin
 	log.Info().Str("address", channelAddr).Int("step", step).Msg("executing settle action step...")
 
 	var mm payments.ExecuteActionsMsg
-	if err := tlb.LoadFromCell(&mm, executeMsg.BeginParse()); err != nil {
+	if err := tlb.Parse(&mm, executeMsg); err != nil {
 		return fmt.Errorf("failed to load execute message: %w", err)
 	}
 
@@ -1964,13 +1978,13 @@ func (s *Service) executeSettleActionStep(ctx context.Context, channelAddr strin
 		return fmt.Errorf("their channel is not quarantined")
 	}
 
-	ourProofHash := mm.Signed.OurActionsInputProof.BeginParse().MustLoadSlice(8 + 256)[1:]
+	ourProofHash := mm.Signed.OurActionsInputProof.MustBeginParse().MustLoadSlice(8 + 256)[1:]
 	if !bytes.Equal(theirC.Storage.Quarantine.ActionsToExecuteHash, ourProofHash) {
 		return fmt.Errorf("their proof hash mismatch, expected %x, got %x", theirC.Storage.Quarantine.ActionsToExecuteHash, ourProofHash)
 	}
 
 	if mm.Signed.TheirActionsInputProof != nil {
-		theirProofHash := mm.Signed.TheirActionsInputProof.BeginParse().MustLoadSlice(8 + 256)[1:]
+		theirProofHash := mm.Signed.TheirActionsInputProof.MustBeginParse().MustLoadSlice(8 + 256)[1:]
 		if !bytes.Equal(theirC.Storage.Quarantine.TheirState.ActionStatesHash, theirProofHash) {
 			return fmt.Errorf("our proof hash mismatch, expected %x, got %x", theirC.Storage.Quarantine.TheirState.ActionStatesHash, theirProofHash)
 		}
@@ -2006,7 +2020,7 @@ func (s *Service) executeSettleStep(ctx context.Context, channelAddr string, raw
 	log.Info().Str("address", channelAddr).Int("step", step).Msg("executing settle step...")
 
 	var msg payments.SettleMsg
-	if err := tlb.LoadFromCell(&msg, rawMessage.BeginParse()); err != nil {
+	if err := tlb.Parse(&msg, rawMessage); err != nil {
 		return fmt.Errorf("failed to load execute message: %w", err)
 	}
 
@@ -2396,7 +2410,7 @@ func (s *Service) validateOutMessages(ctx context.Context, channel *db.Channel, 
 			// checking that it is not masking like ec or ton
 			// checking for supported jetton amounts
 			var pfx uint64
-			body := m.InternalMessage.Body.BeginParse()
+			body := m.InternalMessage.Body.MustBeginParse()
 			if body.BitsLeft() >= 32 {
 				pfx, err = body.PreloadUInt(32)
 				if err != nil {

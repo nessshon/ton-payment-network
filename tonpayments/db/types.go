@@ -212,7 +212,7 @@ func (s *AgreedData) UnmarshalJSON(bytes []byte) error {
 		return err
 	}
 
-	sl := cl.BeginParse()
+	sl := cl.MustBeginParse()
 
 	s.Conditionals, err = sl.LoadDict(256)
 	if err != nil {

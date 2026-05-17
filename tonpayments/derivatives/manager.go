@@ -8,6 +8,12 @@ import (
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 )
 
+// CandleProvider provides 1-minute candles for symbols.
+type CandleProvider interface {
+	Fetch1m(ctx context.Context, symbol string, start, end time.Time, limit int) ([]db.Candle1m, error)
+	FetchOrderBookAndVolume(ctx context.Context, symbol string, depthLimit int, volumeLimit int) (*OrderBookVolumeView, error)
+}
+
 // Manager coordinates fetching/storing 1m candles and provides helpers for APIs.
 type Manager struct {
 	store    Store
@@ -38,7 +44,7 @@ func (m *Manager) EnsureRange(ctx context.Context, symbol string, from, to int64
 			return err
 		}
 		if last == 0 {
-			from = alignMinute(to-1000*60) // ~ 16h back
+			from = alignMinute(to - 1000*60) // ~ 16h back
 		} else {
 			from = last + 60
 		}

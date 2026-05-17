@@ -345,7 +345,7 @@ func (c *ConditionalVirtualChannel) CheckInstruction(detailsCell *cell.Cell, isF
 
 func (c *ConditionalVirtualChannel) PrepareNext(instructionDetailsCell *cell.Cell, act payments.Action, nextDeadline time.Time) (payments.Conditional, error) {
 	var details ConditionalVirtualChannelInstructionDetails
-	if err := tlb.LoadFromCell(&details, instructionDetailsCell.BeginParse()); err != nil {
+	if err := tlb.Parse(&details, instructionDetailsCell); err != nil {
 		return nil, err
 	}
 
@@ -394,7 +394,7 @@ func (c *ConditionalVirtualChannel) ScoreTunnelTarget(instructionDetailsCell *ce
 	}
 
 	var details ConditionalVirtualChannelInstructionDetails
-	if err := tlb.LoadFromCell(&details, instructionDetailsCell.BeginParse()); err != nil {
+	if err := tlb.Parse(&details, instructionDetailsCell); err != nil {
 		return nil, err
 	}
 
@@ -552,7 +552,7 @@ func ParseVirtualChannelState(data []byte, to ed25519.PrivateKey) (ed25519.Publi
 	}
 
 	var res VirtualChannelState
-	if err = tlb.LoadFromCell(&res, cll.BeginParse()); err != nil {
+	if err = tlb.Parse(&res, cll); err != nil {
 		return nil, VirtualChannelState{}, fmt.Errorf("failed to parse state: %w", err)
 	}
 
@@ -641,7 +641,7 @@ var virtualChannelUniversalStaticCode = func() *cell.Cell {
 		    var v = actInput.loadAny<FeeActionInput>();
 		    v.amount += (amount - prepaid) + fee;
 
-		    targetActionsInput.uDictSet(256, actionHash, v.toCell().beginParse());
+		    targetActionsInput.uDictSet(256, actionHash, v.toCell().MustBeginParse());
 
 		    return targetActionsInput;
 		}

@@ -192,7 +192,7 @@ func TestBuildTransferBodyRoundTrip(t *testing.T) {
 	}
 
 	var req ExternalSignedRequest
-	if err = tlb.LoadFromCell(&req, body.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&req, body.MustBeginParse()); err != nil {
 		t.Fatalf("parse external request failed: %v", err)
 	}
 	if !ed25519.Verify(key.Public().(ed25519.PublicKey), req.SignedBody.Hash(), req.Signature) {
@@ -200,7 +200,7 @@ func TestBuildTransferBodyRoundTrip(t *testing.T) {
 	}
 
 	var signed ExternalSignedSendBody
-	if err = tlb.LoadFromCell(&signed, req.SignedBody.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&signed, req.SignedBody.MustBeginParse()); err != nil {
 		t.Fatalf("parse signed body failed: %v", err)
 	}
 	if hex.EncodeToString(signed.ID) != hex.EncodeToString(storage.ID) {
@@ -325,11 +325,11 @@ func TestManagerReconcileWithdrawTON(t *testing.T) {
 	}
 
 	var req ExternalSignedRequest
-	if err = tlb.LoadFromCell(&req, chain.sentExternal[0].body.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&req, chain.sentExternal[0].body.MustBeginParse()); err != nil {
 		t.Fatalf("parse external request failed: %v", err)
 	}
 	var signed ExternalSignedSendBody
-	if err = tlb.LoadFromCell(&signed, req.SignedBody.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&signed, req.SignedBody.MustBeginParse()); err != nil {
 		t.Fatalf("parse external signed body failed: %v", err)
 	}
 	msgs, err := payments.UnpackOutActions(signed.OutActions)
@@ -390,7 +390,7 @@ func TestManagerReconcileTopUpJetton(t *testing.T) {
 		t.Fatalf("jetton top up body is nil")
 	}
 	var payload jettonTransferPayload
-	if err = tlb.LoadFromCell(&payload, msg.Body.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&payload, msg.Body.MustBeginParse()); err != nil {
 		t.Fatalf("parse jetton payload failed: %v", err)
 	}
 	if !payload.Destination.Equals(manager.Address()) {
@@ -483,11 +483,11 @@ func TestManagerReconcileWithdrawEC(t *testing.T) {
 	}
 
 	var req ExternalSignedRequest
-	if err = tlb.LoadFromCell(&req, chain.sentExternal[0].body.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&req, chain.sentExternal[0].body.MustBeginParse()); err != nil {
 		t.Fatalf("parse external request failed: %v", err)
 	}
 	var signed ExternalSignedSendBody
-	if err = tlb.LoadFromCell(&signed, req.SignedBody.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&signed, req.SignedBody.MustBeginParse()); err != nil {
 		t.Fatalf("parse external signed body failed: %v", err)
 	}
 	msgs, err := payments.UnpackOutActions(signed.OutActions)
@@ -540,7 +540,7 @@ func assertSignedTopUpBody(t *testing.T, body *cell.Cell, sender, vault *address
 	t.Helper()
 
 	var req InternalSignedSenderRequest
-	if err := tlb.LoadFromCell(&req, body.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&req, body.MustBeginParse()); err != nil {
 		t.Fatalf("parse internal signed request failed: %v", err)
 	}
 	if len(req.Signature) != ed25519.SignatureSize {
@@ -548,7 +548,7 @@ func assertSignedTopUpBody(t *testing.T, body *cell.Cell, sender, vault *address
 	}
 
 	var msg tlb.InternalMessage
-	if err := tlb.LoadFromCell(&msg, req.Message.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&msg, req.Message.MustBeginParse()); err != nil {
 		t.Fatalf("parse inner top up message failed: %v", err)
 	}
 	if msg.DstAddr == nil || !msg.DstAddr.Equals(sender) {

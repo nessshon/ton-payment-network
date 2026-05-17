@@ -363,36 +363,67 @@ func FindConditional(ctx context.Context, conditionals *cell.Dictionary, id []by
 	return FindConditionalWithProof(ctx, conditionals, id, nil, actions)
 }
 
-func FindConditionalWithProof(ctx context.Context, conditionals *cell.Dictionary, id []byte, proofRoot *cell.ProofSkeleton, actions ActionResolver) (idx *cell.Cell, _ Conditional, _ error) {
+func FindConditionalWithProof(ctx context.Context, conditionals *cell.Dictionary, id []byte, proofBuilder *cell.MerkleProofBuilder, actions ActionResolver) (idx *cell.Cell, _ Conditional, _ error) {
 	// TODO: indexed dict o(1)
 
-	var tempProofRoot *cell.ProofSkeleton
-	if proofRoot != nil {
-		tempProofRoot = cell.CreateProofSkeleton()
+	idx = cell.BeginCell().MustStoreSlice(id, 256).EndCell()
+
+	proofDict := conditionals
+	if proofBuilder != nil {
+		proofDict = proofBuilder.Root().AsDict(conditionals.GetKeySize())
 	}
 
-	idx = cell.BeginCell().MustStoreSlice(id, 256).EndCell()
-	sl, proofBranch, err := conditionals.LoadValueWithProof(idx, tempProofRoot)
+	sl, err := proofDict.LoadValue(idx)
 	if err != nil {
 		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-			if proofRoot != nil {
-				proofRoot.Merge(tempProofRoot)
-			}
 			return nil, nil, ErrNotFound
 		}
 		return nil, nil, err
 	}
 
-	cond, err := CodeToConditional(ctx, sl.MustToCell(), actions)
+	condCell := sl.MustToCell()
+	if proofBuilder != nil {
+		if err := MarkCellUsedRecursive(condCell); err != nil {
+			return nil, nil, fmt.Errorf("failed to mark conditional proof value: %w", err)
+		}
+	}
+
+	cond, err := CodeToConditional(ctx, condCell, actions)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse of one of conditionals: %w", err)
 	}
 
-	if proofRoot != nil {
-		proofBranch.SetRecursive()
-		proofRoot.Merge(tempProofRoot)
-	}
 	return idx, cond, nil
+}
+
+func MarkCellUsedRecursive(c *cell.Cell) error {
+	if c == nil {
+		return nil
+	}
+
+	sl, err := c.BeginParse()
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i < sl.RefsNum(); i++ {
+		ref, err := sl.PeekRefCellAt(i)
+		if err != nil {
+			return err
+		}
+		if err = MarkCellUsedRecursive(ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func CreateFullCellUsageProof(root *cell.Cell) (*cell.Cell, error) {
+	proofBuilder := cell.NewMerkleProofBuilder(root)
+	if err := MarkCellUsedRecursive(proofBuilder.Root()); err != nil {
+		return nil, err
+	}
+	return proofBuilder.CreateProof()
 }
 
 /*

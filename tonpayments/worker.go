@@ -1015,7 +1015,7 @@ func (s *Service) taskExecutor() {
 					}
 
 					var req payments.CooperativeCommit
-					if err = tlb.LoadFromCell(&req, data.SignedRequest.BeginParse()); err != nil {
+					if err = tlb.Parse(&req, data.SignedRequest); err != nil {
 						return fmt.Errorf("failed to serialize their commit channel request: %w", err)
 					}
 
@@ -1270,7 +1270,7 @@ func (s *Service) taskExecutor() {
 					}
 
 					var req payments.ExternalMsgDoubleSigned
-					err = tlb.LoadFromCell(&req, body.BeginParse())
+					err = tlb.Parse(&req, body)
 					if err != nil {
 						return fmt.Errorf("failed to serialize request: %w", err)
 					}
@@ -1464,7 +1464,7 @@ func (s *Service) resolveTxChain(ctx context.Context, addr, completionAddr *addr
 
 		if completionAddr != nil && address.MustParseAddr(tx.In.To).Equals(completionAddr) {
 			if sz := uint(len(completionPrefix)) * 8; tx.In.Body.BitsSize() >= sz {
-				if sz == 0 || bytes.Equal(tx.In.Body.BeginParse().MustLoadSlice(sz), completionPrefix) {
+				if sz == 0 || bytes.Equal(tx.In.Body.MustBeginParse().MustLoadSlice(sz), completionPrefix) {
 					found = true
 					return nil
 				}

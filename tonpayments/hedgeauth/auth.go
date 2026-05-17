@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +20,11 @@ const (
 
 	DefaultMaxClockSkew = 30 * time.Second
 )
+
+type Header interface {
+	Get(key string) string
+	Set(key, value string)
+}
 
 type RequestMeta struct {
 	Key       string
@@ -60,7 +64,7 @@ func NewNonce() (string, error) {
 	return base64.StdEncoding.EncodeToString(buf), nil
 }
 
-func ApplySignedRequestHeaders(headers http.Header, method, target string, body []byte, key string, secret []byte, now time.Time) (RequestMeta, error) {
+func ApplySignedRequestHeaders(headers Header, method, target string, body []byte, key string, secret []byte, now time.Time) (RequestMeta, error) {
 	nonce, err := NewNonce()
 	if err != nil {
 		return RequestMeta{}, err
@@ -100,7 +104,7 @@ func SignRequest(meta RequestMeta, secret []byte) (string, error) {
 	return base64.StdEncoding.EncodeToString(mac.Sum(nil)), nil
 }
 
-func VerifyRequest(headers http.Header, method, target string, body []byte, expectedKey string, secret []byte, now time.Time, maxSkew time.Duration) (RequestMeta, time.Time, error) {
+func VerifyRequest(headers Header, method, target string, body []byte, expectedKey string, secret []byte, now time.Time, maxSkew time.Duration) (RequestMeta, time.Time, error) {
 	meta := RequestMeta{
 		Key:       headers.Get(HeaderKey),
 		Method:    strings.ToUpper(method),
@@ -132,7 +136,7 @@ func VerifyRequest(headers http.Header, method, target string, body []byte, expe
 	return meta, ts, nil
 }
 
-func ApplySignedResponseHeaders(headers http.Header, req RequestMeta, statusCode int, body []byte, key string, secret []byte, now time.Time) error {
+func ApplySignedResponseHeaders(headers Header, req RequestMeta, statusCode int, body []byte, key string, secret []byte, now time.Time) error {
 	respTimestamp := strconv.FormatInt(now.UTC().Unix(), 10)
 	sig, err := SignResponse(req, statusCode, body, key, secret, respTimestamp)
 	if err != nil {
@@ -158,7 +162,7 @@ func SignResponse(req RequestMeta, statusCode int, body []byte, key string, secr
 	return base64.StdEncoding.EncodeToString(mac.Sum(nil)), nil
 }
 
-func VerifyResponse(headers http.Header, req RequestMeta, statusCode int, body []byte, expectedKey string, secret []byte, now time.Time, maxSkew time.Duration) error {
+func VerifyResponse(headers Header, req RequestMeta, statusCode int, body []byte, expectedKey string, secret []byte, now time.Time, maxSkew time.Duration) error {
 	key := headers.Get(HeaderKey)
 	respTimestamp := headers.Get(HeaderTimestamp)
 	if key == "" || respTimestamp == "" {

@@ -188,7 +188,7 @@ func (t *Transport) handleQuery(ctx context.Context, peer *Peer, msg any) (any, 
 		}
 
 		var state payments.StateBodySigned
-		if err := tlb.LoadFromCell(&state, q.SignedState.BeginParse()); err != nil {
+		if err := tlb.Parse(&state, q.SignedState); err != nil {
 			return nil, fmt.Errorf("failed to parse channel state")
 		}
 
@@ -229,7 +229,7 @@ func (t *Transport) handleQuery(ctx context.Context, peer *Peer, msg any) (any, 
 		}
 
 		var ctr payments.OpenConfigContainer
-		if err := tlb.LoadFromCell(&ctr, q.OpenConfig.BeginParse()); err != nil {
+		if err := tlb.Parse(&ctr, q.OpenConfig); err != nil {
 			return nil, fmt.Errorf("failed to parse channel open config")
 		}
 
@@ -317,7 +317,7 @@ func (t *Transport) auth(ctx context.Context, peer *Peer) error {
 	}
 
 	log.Debug().Str("key", base64.StdEncoding.EncodeToString(peer.AuthKey)).Msg("sending auth request")
-	
+
 	var res Authenticate
 	err = peer.Conn.Query(ctx, Authenticate{
 		Key:       t.channelKey.Public().(ed25519.PublicKey),

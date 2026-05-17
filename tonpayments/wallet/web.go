@@ -7,13 +7,13 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"sync"
-	"time"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
+	"sync"
 	"syscall/js"
+	"time"
 )
 
 type Wallet struct {
@@ -188,7 +188,7 @@ func parseResultMsg(val string) ([]byte, error) {
 	}
 
 	var msg tlb.ExternalMessageIn
-	if err = tlb.LoadFromCell(&msg, msgCell.BeginParse()); err != nil {
+	if err = tlb.Parse(&msg, msgCell); err != nil {
 		return nil, fmt.Errorf("failed to parse res msg: %w", err)
 	}
 

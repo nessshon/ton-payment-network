@@ -142,7 +142,7 @@ func LoadStorage(data *cell.Cell) (*Storage, error) {
 	}
 
 	var storage Storage
-	if err := tlb.LoadFromCell(&storage, data.BeginParse()); err != nil {
+	if err := tlb.Parse(&storage, data); err != nil {
 		return nil, fmt.Errorf("parse vault storage: %w", err)
 	}
 	return &storage, nil
