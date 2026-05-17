@@ -8,9 +8,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/actions"
+	paymentvault "github.com/xssnick/ton-payment-network/pkg/payments/vault"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain/client"
 	"github.com/xssnick/ton-payment-network/tonpayments/config"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
@@ -18,11 +25,6 @@ import (
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
-	"math/big"
-	"sort"
-	"strings"
-	"sync"
-	"time"
 )
 
 var ErrNotActive = errors.New("channel is not active")
@@ -59,6 +61,8 @@ type DB interface {
 	GetVirtualChannelMeta(ctx context.Context, key []byte) (*db.ConditionalMeta, error)
 	UpdateVirtualChannelMeta(ctx context.Context, meta *db.ConditionalMeta) error
 	CreateVirtualChannelMeta(ctx context.Context, meta *db.ConditionalMeta) error
+	ClosePairMeta(ctx context.Context, key []byte, status db.ConditionalStatus) error
+	ForEachActiveSpecialMetaKey(ctx context.Context, fn func(key ed25519.PublicKey) error) error
 
 	SetBlockOffset(ctx context.Context, seqno uint32) error
 	GetBlockOffset(ctx context.Context) (*db.BlockOffset, error)
@@ -156,7 +160,8 @@ type Service struct {
 	virtualChannelsLimitPerChannel int
 	workerSignal                   chan bool
 
-	cfg config.ChannelsConfig
+	cfg      config.ChannelsConfig
+	vaultCfg config.VaultConfig
 
 	// TODO: channel based lock
 	mx sync.Mutex
@@ -183,9 +188,11 @@ type Service struct {
 
 	urgentPeersMx sync.RWMutex
 	discoveryMx   sync.Mutex
+
+	vaultManager *paymentvault.Manager
 }
 
-func NewService(api ChainAPI, database DB, transport, webTransport Transport, wallet Wallet, updates chan any, key ed25519.PrivateKey, cfg config.ChannelsConfig, useMetrics bool) (*Service, error) {
+func NewService(api ChainAPI, database DB, transport, webTransport Transport, wallet Wallet, updates chan any, key ed25519.PrivateKey, cfg config.ChannelsConfig, vaultCfg config.VaultConfig, useMetrics bool) (*Service, error) {
 	globalCtx, globalCancel := context.WithCancel(context.Background())
 	s := &Service{
 		ton:                            api,
@@ -199,6 +206,7 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 		virtualChannelsLimitPerChannel: 30000,
 		workerSignal:                   make(chan bool, 1),
 		cfg:                            cfg,
+		vaultCfg:                       vaultCfg,
 		channelLocks:                   map[string]*channelLock{},
 		knownBalanceTypes:              map[string]*payments.CoinConfig{},
 		knownBalanceTypesSymbols:       map[string]*payments.CoinConfig{},
@@ -208,6 +216,12 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 		actionsCache:                   map[string]payments.Action{},
 		globalCtx:                      globalCtx,
 		globalCancel:                   globalCancel,
+	}
+
+	if strings.TrimSpace(cfg.DerivativesHedge.WebhookURL) != "" {
+		if _, _, err := s.derivativeHedgeAuth(); err != nil {
+			return nil, fmt.Errorf("invalid derivatives hedge config: %w", err)
+		}
 	}
 
 	addBalanceControl := func(balanceId string, currency config.CoinConfig) error {
@@ -250,6 +264,7 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 				ProxyMaxCapacity:            tlb.MustFromDecimal(cfg.VirtualTunnelConfig.ProxyMaxCapacity, int(cfg.Decimals)),
 				ProxyMinFee:                 tlb.MustFromDecimal(cfg.VirtualTunnelConfig.ProxyMinFee, int(cfg.Decimals)),
 				ProxyFeePercent:             cfg.VirtualTunnelConfig.ProxyFeePercent,
+				DerivativeFeePercent:        cfg.VirtualTunnelConfig.DerivativeFeePercent,
 				AllowTunneling:              cfg.VirtualTunnelConfig.AllowTunneling,
 			},
 			Symbol:                strings.ToUpper(cfg.Symbol),
@@ -257,6 +272,7 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 			MinCapacityRequest:    tlb.MustFromDecimal(cfg.MinCapacityRequest, int(cfg.Decimals)),
 			FeePerWithdrawPropose: tlb.MustFromDecimal(cfg.FeePerWithdrawPropose, int(cfg.Decimals)),
 			BalanceID:             id,
+			VaultResolver:         s,
 		}
 	}
 
@@ -312,6 +328,10 @@ func NewService(api ChainAPI, database DB, transport, webTransport Transport, wa
 			return nil, fmt.Errorf("duplicate currency '%s' cannot be configured", b.Symbol)
 		}
 		s.knownBalanceTypesSymbols[b.Symbol] = b
+	}
+
+	if err := s.initVaultManager(); err != nil {
+		return nil, err
 	}
 
 	if err := s.loadUrgentPeers(context.Background()); err != nil {
@@ -556,7 +576,7 @@ func (s *Service) scanSettledConditionals(ctx context.Context, ch *db.Channel, t
 	for _, info := range tx.Out {
 		if info.Type == tlb.MsgTypeExternalOut {
 			var ev payments.ConditionalsSettledEvent
-			if err := tlb.LoadFromCell(&ev, info.Body.BeginParse()); err != nil {
+			if err := tlb.Parse(&ev, info.Body); err != nil {
 				continue
 			}
 
@@ -647,7 +667,7 @@ func (s *Service) scanSettledConditionals(ctx context.Context, ch *db.Channel, t
 			}
 
 			// close next virtual channels since they commited latest resolve onchain
-			if err = s.CloseConditional(ctx, cond.GetKey()); err != nil && !errors.Is(err, ErrCannotCloseOngoingVirtual) {
+			if err = s.CloseConditional(ctx, cond.GetKey()); err != nil && !errors.Is(err, ErrCannotCloseOutgoingVirtual) {
 				log.Warn().Err(err).Bool("our", isOur).Str("address", ch.Our.Address).
 					Str("key", base64.StdEncoding.EncodeToString(cond.GetKey())).Msg("failed to create task for close virtual channel")
 			}
@@ -903,6 +923,8 @@ func (s *Service) processSideUpdate(ctx context.Context, ch *db.Channel, isOur b
 
 func (s *Service) Start() {
 	go s.taskExecutor()
+	go s.derivativePriceWorker()
+	s.startVaultWorker()
 	if s.useMetrics {
 		go s.channelsMonitor()
 		go s.walletMonitor()
@@ -972,13 +994,14 @@ func (s *Service) Start() {
 
 					if upd.Transaction.Success && upd.Transaction.In.Type == tlb.MsgTypeExternalIn {
 						var settle payments.SettleMsg
-						if err := tlb.LoadFromCell(&settle, upd.Transaction.In.Body.BeginParse()); err == nil {
+						if err := tlb.Parse(&settle, upd.Transaction.In.Body); err == nil {
 							// we need to check their conditional resolves and add missing if any, to resolve our next channels
 							// it will also update channel actions to execute later
 							s.scanSettledConditionals(context.Background(), channel, upd.Transaction, settle, false)
 						}
 					}
 
+					prevStatus := channel.Status
 					err = s.db.Transaction(context.Background(), func(ctx context.Context) error {
 						if err = s.processSideUpdate(ctx, channel, false, upd); err != nil {
 							return fmt.Errorf("failed to process side update: %w", err)
@@ -993,6 +1016,11 @@ func (s *Service) Start() {
 						log.Error().Err(err).Str("channel", channel.Our.Address).Msg("failed to set channel in db")
 						// we retry full process because we need to reproduce all changes in case of concurrent update
 						goto retry
+					}
+					if prevStatus != db.ChannelStateInactive && channel.Status == db.ChannelStateInactive {
+						if err = s.finalizeInactiveChannelDerivatives(context.Background(), channel); err != nil {
+							log.Error().Err(err).Str("channel", channel.Our.Address).Msg("failed to finalize inactive channel derivatives")
+						}
 					}
 				} else {
 					// TODO: queue transactions
@@ -1080,7 +1108,7 @@ func (s *Service) Start() {
 
 			if upd.Transaction.Success && upd.Transaction.In.Type == tlb.MsgTypeExternalIn {
 				var settle payments.SettleMsg
-				if err := tlb.LoadFromCell(&settle, upd.Transaction.In.Body.BeginParse()); err == nil {
+				if err := tlb.Parse(&settle, upd.Transaction.In.Body); err == nil {
 					// it will update channel actions to execute later
 					s.scanSettledConditionals(context.Background(), channel, upd.Transaction, settle, true)
 				}
@@ -1089,7 +1117,7 @@ func (s *Service) Start() {
 			if upd.Transaction.Success && upd.Transaction.In.Type == tlb.MsgTypeInternal && upd.LatestChannel.Status == payments.ChannelStatusClosureStarted {
 				ourState := channel.LoadSignedState()
 				var msg payments.UncoopCloseReplicateMsg
-				if err := tlb.LoadFromCell(&msg, upd.Transaction.In.Body.BeginParse()); err == nil &&
+				if err := tlb.Parse(&msg, upd.Transaction.In.Body); err == nil &&
 					msg.State != nil && msg.State.Body.Seqno >= ourState.Body.Seqno {
 					// We are checking their committed state from tx data and comparing it with ours,
 					// it can happen that party will use pending state signed by us, but not respond with his signature.
@@ -1139,6 +1167,7 @@ func (s *Service) Start() {
 				}
 			}
 
+			prevStatus := channel.Status
 			err = s.db.Transaction(context.Background(), func(ctx context.Context) error {
 				if err = s.processSideUpdate(ctx, channel, true, upd); err != nil {
 					return fmt.Errorf("failed to process our side update: %w", err)
@@ -1153,6 +1182,11 @@ func (s *Service) Start() {
 				log.Error().Err(err).Str("channel", channel.Our.Address).Msg("failed to set channel in db")
 				// we retry full process because we need to reproduce all changes in case of concurrent update
 				goto retry
+			}
+			if prevStatus != db.ChannelStateInactive && channel.Status == db.ChannelStateInactive {
+				if err = s.finalizeInactiveChannelDerivatives(context.Background(), channel); err != nil {
+					log.Error().Err(err).Str("channel", channel.Our.Address).Msg("failed to finalize inactive channel derivatives")
+				}
 			}
 
 			if s.webhook != nil {
@@ -1464,7 +1498,7 @@ func (s *Service) DebugPrintChannels(ctx context.Context, status db.ChannelStatu
 			lg.Msg("active onchain channel")
 
 			for _, kv := range ch.Our.Conditionals.All() {
-				vch, _ := payments.ParseVirtualChannelCond(kv.Value.BeginParse())
+				vch, _ := payments.ParseVirtualChannelCond(kv.Value.MustBeginParse())
 				till := time.Unix(vch.Deadline, 0).Sub(time.Now())
 				log.Info().
 					Str("capacity", cc.MustAmount(vch.Capacity).String()).
@@ -1476,7 +1510,7 @@ func (s *Service) DebugPrintChannels(ctx context.Context, status db.ChannelStatu
 					Msg("virtual from us")
 			}
 			for _, kv := range ch.Their.Conditionals.All() {
-				vch, _ := payments.ParseVirtualChannelCond(kv.Value.BeginParse())
+				vch, _ := payments.ParseVirtualChannelCond(kv.Value.MustBeginParse())
 
 				log.Info().
 					Str("capacity", tlb.MustFromNano(vch.Capacity, int(cc.Decimals)).String()).
@@ -1740,7 +1774,7 @@ func (s *Service) proposeAction(ctx context.Context, lockId int64, channelAddres
 	}
 
 	var theirState payments.StateBodySigned
-	if err = tlb.LoadFromCell(&theirState, res.SignedState.BeginParse()); err != nil {
+	if err = tlb.Parse(&theirState, res.SignedState); err != nil {
 		return fmt.Errorf("failed to parse their updated channel state: %w", err)
 	}
 
@@ -1842,14 +1876,14 @@ func (s *Service) IncrementStates(ctx context.Context, channelAddr string, wantR
 	return nil
 }
 
-func (s *Service) RequestRemoveVirtual(ctx context.Context, key ed25519.PublicKey) error {
+func (s *Service) RemoveConditional(ctx context.Context, key ed25519.PublicKey) error {
 	meta, err := s.db.GetVirtualChannelMeta(ctx, key)
 	if err != nil {
 		return err
 	}
 
 	if meta.Incoming == nil {
-		return fmt.Errorf("virtual channel has no incoming channel")
+		return fmt.Errorf("conditional has no incoming channel")
 	}
 
 	if meta.Outgoing != nil && !meta.Outgoing.UncooperativeDeadline.Before(time.Now()) {
@@ -1857,18 +1891,17 @@ func (s *Service) RequestRemoveVirtual(ctx context.Context, key ed25519.PublicKe
 	}
 
 	if meta.Status != db.ConditionalStateActive && meta.Status != db.ConditionalStatePending {
-		return fmt.Errorf("virtual channel is not active or pending")
+		return fmt.Errorf("conditional is not active or pending")
 	}
 
-	err = s.db.CreateTask(ctx, PaymentsTaskPool, "ask-remove-cond", meta.Incoming.ChannelAddress,
-		"ask-remove-cond-"+base64.StdEncoding.EncodeToString(meta.Key)+"-desire",
-		db.AskRemoveVirtualTask{
-			ChannelAddress: meta.Incoming.ChannelAddress,
-			Key:            meta.Key,
+	err = s.db.CreateTask(ctx, PaymentsTaskPool, "remove-cond", meta.Incoming.ChannelAddress,
+		"remove-cond-"+base64.StdEncoding.EncodeToString(meta.Key),
+		db.RemoveConditionalTask{
+			Key: meta.Key,
 		}, nil, nil,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to create ask-remove-cond task: %w", err)
+		return fmt.Errorf("failed to create remove-cond task: %w", err)
 	}
 	return nil
 }

@@ -6,12 +6,22 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"math"
+	"math/big"
+	"net"
+	"net/http"
+	"net/netip"
+	"strings"
+	"time"
+
 	"github.com/natefinch/lumberjack"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals/oracle"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/ton-payment-network/tonpayments/api"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain"
@@ -34,14 +44,6 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/ton/wallet"
 	"golang.org/x/crypto/ed25519"
-	"io"
-	"math"
-	"math/big"
-	"net"
-	"net/http"
-	"net/netip"
-	"strings"
-	"time"
 
 	_ "net/http/pprof"
 )
@@ -134,7 +136,12 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to load config")
 		return
 	}
-	if config.Upgrade(cfg) {
+	updated, err := config.Upgrade(cfg)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to upgrade config")
+		return
+	}
+	if updated {
 		if err = config.SaveConfig(cfg, *ConfigPath); err != nil {
 			log.Fatal().Err(err).Msg("failed to update config file")
 			return
@@ -227,12 +234,13 @@ func main() {
 			return
 		}
 
-		gate.SetAddressList([]*adnlAddress.UDP{
-			{
-				IP:   ip,
-				Port: int32(addr.Port()),
-			},
-		})
+		nodeAddress, err := adnlAddress.NewAddress(ip, int32(addr.Port()))
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to build external adnl address")
+			return
+		}
+
+		gate.SetAddressList([]adnlAddress.Address{nodeAddress})
 		if err := gate.StartServer(cfg.NodeListenAddr); err != nil {
 			log.Fatal().Err(err).Msg("failed to init adnl gateway")
 			return
@@ -333,7 +341,7 @@ func main() {
 	}
 	log.Info().Str("addr", w.WalletAddress().String()).Msg("wallet initialized")
 
-	svc, err := tonpayments.NewService(chainClient.NewTON(apiClient), fdb, tr, webTr, w, inv, ed25519.NewKeyFromSeed(cfg.PaymentNodePrivateKey), cfg.ChannelConfig, metrics.Registered)
+	svc, err := tonpayments.NewService(chainClient.NewTON(apiClient), fdb, tr, webTr, w, inv, ed25519.NewKeyFromSeed(cfg.PaymentNodePrivateKey), cfg.ChannelConfig, cfg.Vault, metrics.Registered)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to init service")
 		return
@@ -375,6 +383,11 @@ func main() {
 		}()
 	}
 
+	if err = initDerivativesResolvers(); err != nil {
+		log.Fatal().Err(err).Msg("failed to initialize derivatives price resolvers")
+		return
+	}
+
 	if *API != "" {
 		var credentials *api.Credentials
 		if *APICredentialsLogin != "" || *APICredentialsPassword != "" {
@@ -389,7 +402,22 @@ func main() {
 			}
 		}
 
-		srv := api.NewServer(*API, *Webhook, cfg.WebhooksSignatureHMACSHA256Key, svc, fdb, credentials)
+		derivSvc := tonpayments.NewDerivativesService(svc)
+		var hedgeAuthCfg *api.HedgeAuthConfig
+		if strings.TrimSpace(cfg.ChannelConfig.DerivativesHedge.WebhookURL) != "" &&
+			strings.TrimSpace(cfg.ChannelConfig.DerivativesHedge.WebhookKey) != "" &&
+			strings.TrimSpace(cfg.ChannelConfig.DerivativesHedge.WebhookSignatureHMACSHA256Key) != "" {
+			hedgeAuthCfg = &api.HedgeAuthConfig{
+				Key:                          cfg.ChannelConfig.DerivativesHedge.WebhookKey,
+				SignatureHMACSHA256KeyBase64: cfg.ChannelConfig.DerivativesHedge.WebhookSignatureHMACSHA256Key,
+			}
+		}
+
+		srv, err := api.NewServer(*API, *Webhook, cfg.WebhooksSignatureHMACSHA256Key, svc, derivSvc, fdb, credentials, hedgeAuthCfg)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to initialize api server")
+			return
+		}
 		if *Webhook != "" {
 			svc.SetWebhook(srv)
 		}
@@ -404,6 +432,25 @@ func main() {
 	}
 
 	svc.Start()
+}
+
+func initDerivativesResolvers() error {
+	const binancePriceScale = int64(1_000_000_000)
+
+	register := func(symbol string, ids ...uint32) {
+		resolver := oracle.NewResolver(oracle.NewBinanceProvider(symbol, binancePriceScale))
+		for _, id := range ids {
+			if prev := oracle.PriceResolvers[id]; prev != nil {
+				prev.Close()
+			}
+			oracle.PriceResolvers[id] = resolver
+		}
+		log.Info().Str("symbol", symbol).Msg("binance derivatives price resolver initialized")
+	}
+
+	register("BTCUSDT", oracle.GetResolverID("binance", "BTCUSDT"), 2)
+	register("TONUSDT", oracle.GetResolverID("binance", "TONUSDT"), 1)
+	return nil
 }
 
 func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt *wallet.Wallet, apiClient ton.APIClientWrapped) error {
@@ -566,7 +613,7 @@ func commandReader(svc *tonpayments.Service, cfg *config.Config, fdb *db.DB, wlt
 			return fmt.Errorf("incorrect len of key: %d, should be 32", len(btsKey))
 		}
 
-		if err = svc.RequestRemoveVirtual(context.Background(), btsKey); err != nil {
+		if err = svc.RemoveConditional(context.Background(), btsKey); err != nil {
 			return fmt.Errorf("failed to remove virtual channel: %w", err)
 		}
 	case "swap":

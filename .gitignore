@@ -8,3 +8,5 @@ build
 *.wasm
 *.gz
 *.br
+./test
+.gocache

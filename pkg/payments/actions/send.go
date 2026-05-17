@@ -48,9 +48,19 @@ func NewSendActionFromBalanceID(ctx context.Context, cc *payments.CoinConfig, a,
 		return nil, err
 	}
 
+	if cc.VaultResolver != nil {
+		action, err := newVaultActionFromBalanceID(ctx, cc, aAddr, bAddr)
+		if err != nil {
+			return nil, err
+		}
+		if action != nil {
+			return action, nil
+		}
+	}
+
 	switch {
 	case cc.BalanceID == payments.GetTONBalanceID():
-		return &ActionSendTon{
+		return &ActionSendTonInsured{
 			Coin:     cc,
 			AddressA: aAddr,
 			AddressB: bAddr,
@@ -66,7 +76,7 @@ func NewSendActionFromBalanceID(ctx context.Context, cc *payments.CoinConfig, a,
 			return nil, err
 		}
 
-		return &ActionSendJetton{
+		return &ActionSendJettonInsured{
 			Coin:     cc,
 			AddressA: aAddr,
 			AddressB: bAddr,
@@ -75,11 +85,60 @@ func NewSendActionFromBalanceID(ctx context.Context, cc *payments.CoinConfig, a,
 			WalletB:  wb,
 		}, nil
 	default:
-		return &ActionSendEC{
+		return &ActionSendECInsured{
 			Coin:     cc,
 			AddressA: aAddr,
 			AddressB: bAddr,
 			EC:       payments.GetECFromBalanceID(cc.BalanceID),
+		}, nil
+	}
+}
+
+func newVaultActionFromBalanceID(ctx context.Context, cc *payments.CoinConfig, aAddr, bAddr *address.Address) (payments.ActionSend, error) {
+	vaultA, vaultB, err := cc.VaultResolver.ResolveVaults(ctx, aAddr, bAddr)
+	if err != nil {
+		return nil, err
+	}
+	if vaultA == nil && vaultB == nil {
+		return nil, nil
+	}
+
+	switch {
+	case cc.BalanceID == payments.GetTONBalanceID():
+		return &ActionSendTonVault{
+			Coin:   cc,
+			VaultA: vaultA,
+			VaultB: vaultB,
+		}, nil
+	case cc.JettonClient != nil:
+		var walletA, walletB *address.Address
+		if vaultA != nil {
+			walletA, err = cc.JettonClient.GetWalletAddress(ctx, vaultA.Address)
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve vault jetton wallet A: %w", err)
+			}
+		}
+		if vaultB != nil {
+			walletB, err = cc.JettonClient.GetWalletAddress(ctx, vaultB.Address)
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve vault jetton wallet B: %w", err)
+			}
+		}
+
+		return &ActionSendJettonVault{
+			Coin:     cc,
+			VaultA:   vaultA,
+			VaultB:   vaultB,
+			RootAddr: cc.JettonClient.GetRootAddress(),
+			WalletA:  walletA,
+			WalletB:  walletB,
+		}, nil
+	default:
+		return &ActionSendECVault{
+			Coin:   cc,
+			VaultA: vaultA,
+			VaultB: vaultB,
+			EC:     payments.GetECFromBalanceID(cc.BalanceID),
 		}, nil
 	}
 }

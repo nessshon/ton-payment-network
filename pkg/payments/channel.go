@@ -144,7 +144,7 @@ func (c *Client) ParseChannel(addr *address.Address, code, data *cell.Cell, veri
 		Code:    code,
 	}
 
-	err := tlb.LoadFromCell(&ch.Storage, data.BeginParse())
+	err := tlb.Parse(&ch.Storage, data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load storage: %w", err)
 	}
@@ -337,9 +337,10 @@ func (c *ChannelContract) PrepareUncoopCloseMessage(ourKey ed25519.PrivateKey, s
 	return body, nil
 }
 
-func (c *ChannelContract) PrepareSettleMessage(ourKey ed25519.PrivateKey, toSettle *cell.Dictionary, condProof, actProof *cell.Cell) (body *cell.Cell, err error) {
+func (c *ChannelContract) PrepareSettleMessage(ourKey ed25519.PrivateKey, toSettle *cell.Dictionary, condProof, actProof *cell.Cell, sender *address.Address) (body *cell.Cell, err error) {
 	msg := SettleMsg{}
 	msg.Signed.ChannelID = c.Storage.ChannelID
+	msg.Signed.ExpectedSender = sender
 	msg.Signed.WalletSeqno = c.Storage.WalletSeqno
 	msg.Signed.ToSettle = toSettle
 	msg.Signed.ConditionalsProof = condProof
@@ -598,7 +599,7 @@ func UnpackOutActions(list *cell.Cell) ([]WalletMessage, error) {
 			break
 		}
 
-		sl := list.BeginParse()
+		sl := list.MustBeginParse()
 		prev, err := sl.LoadRef()
 		if err != nil {
 			return nil, fmt.Errorf("failed to load prev ref: %w", err)

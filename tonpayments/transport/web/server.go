@@ -9,17 +9,21 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/xssnick/ton-payment-network/pkg/log"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals/oracle"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain/client"
+	"github.com/xssnick/ton-payment-network/tonpayments/derivatives"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tvm/cell"
-	"net/http"
-	"reflect"
-	"strconv"
-	"sync"
-	"time"
 )
 
 type PeerConnection struct {
@@ -36,7 +40,8 @@ type HTTP struct {
 	queryHandler      func(ctx context.Context, from *transport.Peer, msg any) (any, error)
 	disconnectHandler func(ctx context.Context, from *transport.Peer) error
 
-	ton *client.TON
+	ton           *client.TON
+	derivProvider derivatives.CandleProvider
 
 	mx sync.RWMutex
 }
@@ -44,9 +49,10 @@ type HTTP struct {
 func NewHTTP(ton *client.TON, key ed25519.PrivateKey) *HTTP {
 	// id := sha256.Sum256(append([]byte("http-web-server"), key...))
 	return &HTTP{
-		key:   key,
-		ton:   ton,
-		peers: make(map[string]*PeerConnection),
+		key:           key,
+		ton:           ton,
+		peers:         make(map[string]*PeerConnection),
+		derivProvider: derivatives.NewBinanceFuturesProvider(),
 	}
 }
 
@@ -76,6 +82,9 @@ func (h *HTTP) StartServer(addr string) error {
 	m.HandleFunc("/web-channel/api/v1/ton/transaction/list", h.getListTxHandler)
 	m.HandleFunc("/web-channel/api/v1/ton/jetton/wallet", h.getJettonWalletAddrHandler)
 	m.HandleFunc("/web-channel/api/v1/ton/jetton/balance", h.getJettonWalletBalanceHandler)
+	m.HandleFunc("/web-channel/api/v1/derivatives/price", h.getDerivativePriceHandler)
+	m.HandleFunc("/web-channel/api/v1/derivatives/prices", h.getDerivativePricesRangeHandler)
+	m.HandleFunc("/web-channel/api/v1/derivatives/book_volume", h.getDerivativeBookVolumeHandler)
 
 	return http.ListenAndServe(addr, m)
 }
@@ -306,6 +315,183 @@ func (h *HTTP) getJettonWalletBalanceHandler(w http.ResponseWriter, r *http.Requ
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"Balance": res.String(),
 	})
+}
+
+func derivativeResolverCandidates(symbol string) []uint32 {
+	switch strings.ToUpper(strings.TrimSpace(symbol)) {
+	case "BTC", "BTCUSDT":
+		return []uint32{
+			oracle.GetResolverID("binance", "BTCUSDT"),
+			2, // backward compatibility with legacy hardcoded asset id
+		}
+	case "TON", "TONUSDT":
+		return []uint32{
+			oracle.GetResolverID("binance", "TONUSDT"),
+			1, // backward compatibility with legacy hardcoded asset id
+		}
+	default:
+		return nil
+	}
+}
+
+func (h *HTTP) getDerivativePriceHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	symbol := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("symbol")))
+	candidates := derivativeResolverCandidates(symbol)
+	if len(candidates) == 0 {
+		http.Error(w, "unsupported symbol", http.StatusBadRequest)
+		return
+	}
+
+	var resolver *oracle.Resolver
+	for _, id := range candidates {
+		resolver = oracle.PriceResolvers[id]
+		if resolver != nil {
+			break
+		}
+	}
+	if resolver == nil {
+		http.Error(w, "price resolver is not configured", http.StatusNotFound)
+		return
+	}
+
+	atRaw := strings.TrimSpace(r.URL.Query().Get("at"))
+
+	cells := resolver.GetSignedPricesSince(0)
+	if len(cells) == 0 {
+		http.Error(w, "price is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var found *cell.Cell
+	if atRaw == "" {
+		// Get the latest
+		found = cells[len(cells)-1]
+	} else {
+		at, err := strconv.ParseInt(atRaw, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid at", http.StatusBadRequest)
+			return
+		}
+		for _, c := range cells {
+			pAt, _, pErr := oracle.ParsePriceProof(c)
+			if pErr == nil && pAt == at {
+				found = c
+				break
+			}
+		}
+	}
+
+	if found == nil {
+		http.Error(w, "price is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Return at, price, and boc for backward compatibility
+	pAt, pPrice, _ := oracle.ParsePriceProof(found)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"symbol": symbol,
+		"at":     pAt,
+		"price":  pPrice.String(),
+		"boc":    base64.StdEncoding.EncodeToString(found.ToBOC()),
+	})
+}
+
+func (h *HTTP) getDerivativePricesRangeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	symbol := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("symbol")))
+	candidates := derivativeResolverCandidates(symbol)
+	if len(candidates) == 0 {
+		http.Error(w, "unsupported symbol", http.StatusBadRequest)
+		return
+	}
+
+	var resolver *oracle.Resolver
+	for _, id := range candidates {
+		resolver = oracle.PriceResolvers[id]
+		if resolver != nil {
+			break
+		}
+	}
+	if resolver == nil {
+		http.Error(w, "price resolver is not configured", http.StatusNotFound)
+		return
+	}
+
+	sinceRaw := strings.TrimSpace(r.URL.Query().Get("since"))
+	var since int64
+	if sinceRaw != "" {
+		var err error
+		since, err = strconv.ParseInt(sinceRaw, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid since", http.StatusBadRequest)
+			return
+		}
+	}
+
+	cells := resolver.GetSignedPricesSince(since)
+
+	// Return array of base64-encoded BOC strings
+	bocs := make([]string, 0, len(cells))
+	for _, c := range cells {
+		bocs = append(bocs, base64.StdEncoding.EncodeToString(c.ToBOC()))
+	}
+
+	_ = json.NewEncoder(w).Encode(bocs)
+}
+
+func (h *HTTP) getDerivativeBookVolumeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	symbol := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("symbol")))
+	if symbol == "" {
+		http.Error(w, "symbol is required", http.StatusBadRequest)
+		return
+	}
+
+	depth := 20
+	if rawDepth := strings.TrimSpace(r.URL.Query().Get("depth")); rawDepth != "" {
+		parsed, err := strconv.Atoi(rawDepth)
+		if err != nil || parsed <= 0 {
+			http.Error(w, "invalid depth", http.StatusBadRequest)
+			return
+		}
+		depth = parsed
+	}
+
+	volumeLimit := 120
+	if rawVolumeLimit := strings.TrimSpace(r.URL.Query().Get("volume_limit")); rawVolumeLimit != "" {
+		parsed, err := strconv.Atoi(rawVolumeLimit)
+		if err != nil || parsed <= 0 {
+			http.Error(w, "invalid volume_limit", http.StatusBadRequest)
+			return
+		}
+		volumeLimit = parsed
+	}
+
+	provider := h.derivProvider
+	if provider == nil {
+		provider = derivatives.NewBinanceFuturesProvider()
+	}
+
+	data, err := provider.FetchOrderBookAndVolume(r.Context(), symbol, depth, volumeLimit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 func (h *HTTP) pushHandler(w http.ResponseWriter, r *http.Request) {

@@ -345,7 +345,7 @@ func (c *ConditionalVirtualChannel) CheckInstruction(detailsCell *cell.Cell, isF
 
 func (c *ConditionalVirtualChannel) PrepareNext(instructionDetailsCell *cell.Cell, act payments.Action, nextDeadline time.Time) (payments.Conditional, error) {
 	var details ConditionalVirtualChannelInstructionDetails
-	if err := tlb.LoadFromCell(&details, instructionDetailsCell.BeginParse()); err != nil {
+	if err := tlb.Parse(&details, instructionDetailsCell); err != nil {
 		return nil, err
 	}
 
@@ -394,7 +394,7 @@ func (c *ConditionalVirtualChannel) ScoreTunnelTarget(instructionDetailsCell *ce
 	}
 
 	var details ConditionalVirtualChannelInstructionDetails
-	if err := tlb.LoadFromCell(&details, instructionDetailsCell.BeginParse()); err != nil {
+	if err := tlb.Parse(&details, instructionDetailsCell); err != nil {
 		return nil, err
 	}
 
@@ -412,7 +412,7 @@ func (c *ConditionalVirtualChannel) ScoreTunnelTarget(instructionDetailsCell *ce
 	return new(big.Int).Sub(avb, amt), nil
 }
 
-func (c *ConditionalVirtualChannel) ValidateState(oldStateCell, newStateCell *cell.Cell) error {
+func (c *ConditionalVirtualChannel) ValidateState(ctx context.Context, oldStateCell, newStateCell *cell.Cell) error {
 	var oldState VirtualChannelState
 	if oldStateCell != nil {
 		if err := payments.LoadState(&oldState, oldStateCell); err != nil {
@@ -432,7 +432,7 @@ func (c *ConditionalVirtualChannel) ValidateState(oldStateCell, newStateCell *ce
 	}
 
 	if oldStateCell != nil && oldState.Amount.Cmp(newState.Amount) > 0 {
-		return fmt.Errorf("amount is less than known state")
+		return payments.ErrNewerConditionalStateIsKnown
 	}
 
 	if newState.Amount.Cmp(c.Capacity) > 0 {
@@ -552,7 +552,7 @@ func ParseVirtualChannelState(data []byte, to ed25519.PrivateKey) (ed25519.Publi
 	}
 
 	var res VirtualChannelState
-	if err = tlb.LoadFromCell(&res, cll.BeginParse()); err != nil {
+	if err = tlb.Parse(&res, cll); err != nil {
 		return nil, VirtualChannelState{}, fmt.Errorf("failed to parse state: %w", err)
 	}
 
@@ -626,7 +626,7 @@ func (c *VirtualChannelState) Verify(key ed25519.PublicKey) bool {
 var virtualChannelUniversalStaticCode = func() *cell.Cell {
 	// compiled using code:
 	/*
-		fun conditional_coins(targetActionsInput: dict, condInput: slice, actionHash: int, fee: int, capacity: int, prepaid: int, deadline: int, key: int): dict {
+		fun conditional_coins(targetActionsInput: dict, condInput: slice, sender: address, actionHash: int, fee: int, capacity: int, prepaid: int, deadline: int, key: int): dict {
 		    var (actInput, ok) = targetActionsInput.uDictGet(256, actionHash);
 		    if (actInput == null || !ok) {
 		        // we must always have action to execute condition
@@ -641,13 +641,13 @@ var virtualChannelUniversalStaticCode = func() *cell.Cell {
 		    var v = actInput.loadAny<FeeActionInput>();
 		    v.amount += (amount - prepaid) + fee;
 
-		    targetActionsInput.uDictSet(256, actionHash, v.toCell().beginParse());
+		    targetActionsInput.uDictSet(256, actionHash, v.toCell().MustBeginParse());
 
 		    return targetActionsInput;
 		}
 	*/
 
-	data, err := hex.DecodeString("b5ee9c724101010100560000a853578307f40e6fa1216e92307f93b3c300e2925f08e0078308d7186603f91102f823be12b0f298fa00305203bb5312bbb0f29a04fa00fa00d70b3f5036a15003a012a0c801fa0201fa0212cb3fc9d0028307f416c626d1c9")
+	data, err := hex.DecodeString("b5ee9c724101010100550000a63653478307f40e6fa1216e92307f93b3c300e2925f08e0078308d7186608f91101f823beb0f29804fa00305202bb5341bbb0f29a04fa00fa00d70b3f5065a158a0a0c801fa025003fa02cb3fc9d0028307f41673e5e1eb")
 	if err != nil {
 		panic(err.Error())
 	}

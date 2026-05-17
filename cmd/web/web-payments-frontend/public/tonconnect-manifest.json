@@ -1,5 +1,7 @@
 {
   "url": "http://localhost:3000",
   "name": "Example TON Payments Wallet",
-  "iconUrl": "https://bags.tonutils.com/icon.png"
+  "iconUrl": "http://localhost:3000/favicon.png",
+  "termsOfUseUrl": "http://localhost:3000",
+  "privacyPolicyUrl": "http://localhost:3000"
 }

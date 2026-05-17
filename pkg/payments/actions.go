@@ -37,7 +37,7 @@ type Conditional interface {
 	GetDeadline() time.Time
 	GetLogInfo() map[string]any
 	ValidateOnAdd() error
-	ValidateState(old, new *cell.Cell) error
+	ValidateState(ctx context.Context, old, new *cell.Cell) error
 	EmulateBalance(balances map[string]*BalanceInfo, fromUs bool) error
 	Commit(updated Conditional, actState *cell.Cell) (*cell.Cell, error)
 	PrepareCommit(condState *cell.Cell) (Conditional, error)
@@ -116,7 +116,7 @@ func CodeToAction(ctx context.Context, code *cell.Cell, balanceTypes BalanceType
 		return nil, fmt.Errorf("unknown action type")
 	}
 
-	if err = a.Parse(ctx, balanceTypes, code.BeginParse()); err != nil {
+	if err = a.Parse(ctx, balanceTypes, code.MustBeginParse()); err != nil {
 		return nil, fmt.Errorf("failed to parse action code: %w", err)
 	}
 
@@ -129,7 +129,7 @@ func CodeToConditional(ctx context.Context, code *cell.Cell, actions ActionResol
 		return nil, fmt.Errorf("failed to detect cond type: %w", err)
 	}
 
-	if err = a.Parse(ctx, code.BeginParse(), actions); err != nil {
+	if err = a.Parse(ctx, code.MustBeginParse(), actions); err != nil {
 		return nil, fmt.Errorf("failed to parse cond code: %w", err)
 	}
 
@@ -166,7 +166,7 @@ func DetectConditionalType(root *cell.Cell) (Conditional, error) {
 }
 
 func LoadState(v any, state *cell.Cell) error {
-	ld := state.BeginParse()
+	ld := state.MustBeginParse()
 	if err := tlb.LoadFromCell(v, ld); err != nil {
 		return fmt.Errorf("failed to load old state: %w", err)
 	}

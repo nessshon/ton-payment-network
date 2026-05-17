@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -17,6 +18,7 @@ type VirtualConfig struct {
 	ProxyMaxCapacity            string
 	ProxyMinFee                 string
 	ProxyFeePercent             float64
+	DerivativeFeePercent        float64
 	AllowTunneling              bool
 }
 
@@ -63,12 +65,32 @@ type ChannelsConfig struct {
 	ConditionalCloseDurationSec     uint32
 	MinSafeVirtualChannelTimeoutSec uint32
 	ReplicationMessageAttachAmount  string
+	AcceptingDerivatives            bool
+	DerivativesHedge                DerivativesHedgeConfig
+}
+
+type DerivativesHedgeConfig struct {
+	WebhookURL                    string
+	WebhookKey                    string
+	WebhookSignatureHMACSHA256Key string
 }
 
 type CoinTypes struct {
 	Ton             CoinConfig
 	Jettons         map[string]CoinConfig
 	ExtraCurrencies map[uint32]CoinConfig
+}
+
+type VaultCoinBalanceConfig struct {
+	MinBalance string
+	MaxBalance string
+}
+
+type VaultConfig struct {
+	UseOnOurSide     bool
+	AllowOnTheirSide bool
+	PrivateKey       []byte
+	Coins            map[string]VaultCoinBalanceConfig
 }
 
 type Config struct {
@@ -86,10 +108,19 @@ type Config struct {
 	NetworkConfigUrl               string
 	DBPath                         string
 	SecureProofPolicy              bool
+	Vault                          VaultConfig
 	ChannelConfig                  ChannelsConfig
 }
 
-const LatestConfigVersion = 3
+const LatestConfigVersion = 6
+
+func generateBase64Random(size int) (string, error) {
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(buf), nil
+}
 
 func Generate() (*Config, error) {
 	_, priv, err := ed25519.GenerateKey(nil)
@@ -102,6 +133,11 @@ func Generate() (*Config, error) {
 		return nil, err
 	}
 
+	_, vaultPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return nil, err
+	}
+
 	_, nodePriv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		return nil, err
@@ -109,6 +145,14 @@ func Generate() (*Config, error) {
 
 	whKey := make([]byte, 32)
 	if _, err = rand.Read(whKey); err != nil {
+		return nil, err
+	}
+	hedgeKey, err := generateBase64Random(12)
+	if err != nil {
+		return nil, err
+	}
+	hedgeSigKey, err := generateBase64Random(32)
+	if err != nil {
 		return nil, err
 	}
 
@@ -127,6 +171,12 @@ func Generate() (*Config, error) {
 		DBPath:                         "./payment-node-db",
 		WebhooksSignatureHMACSHA256Key: base64.StdEncoding.EncodeToString(whKey),
 		SecureProofPolicy:              false,
+		Vault: VaultConfig{
+			UseOnOurSide:     false,
+			AllowOnTheirSide: false,
+			PrivateKey:       vaultPriv.Seed(),
+			Coins:            map[string]VaultCoinBalanceConfig{},
+		},
 		ChannelConfig: ChannelsConfig{
 			SupportedCoins: CoinTypes{
 				Ton: CoinConfig{
@@ -138,6 +188,7 @@ func Generate() (*Config, error) {
 						ProxyMaxCapacity:            "5",
 						ProxyMinFee:                 "0.0005",
 						ProxyFeePercent:             0.5,
+						DerivativeFeePercent:        0.5,
 						AllowTunneling:              true,
 					},
 					Symbol:                "TON",
@@ -160,6 +211,7 @@ func Generate() (*Config, error) {
 							ProxyMaxCapacity:            "15.5",
 							ProxyMinFee:                 "0.002",
 							ProxyFeePercent:             0.8,
+							DerivativeFeePercent:        0.5,
 							AllowTunneling:              false,
 						},
 						Symbol:                "USDT",
@@ -177,6 +229,11 @@ func Generate() (*Config, error) {
 			ConditionalCloseDurationSec:     3 * 3600,
 			MinSafeVirtualChannelTimeoutSec: 60,
 			ReplicationMessageAttachAmount:  "0.1",
+			AcceptingDerivatives:            false,
+			DerivativesHedge: DerivativesHedgeConfig{
+				WebhookKey:                    hedgeKey,
+				WebhookSignatureHMACSHA256Key: hedgeSigKey,
+			},
 		},
 	}
 
@@ -184,9 +241,9 @@ func Generate() (*Config, error) {
 	return cfg, nil
 }
 
-func Upgrade(cfg *Config) bool {
+func Upgrade(cfg *Config) (bool, error) {
 	if cfg.Version >= LatestConfigVersion {
-		return false
+		return false, nil
 	}
 
 	if cfg.Version < 2 {
@@ -229,8 +286,50 @@ func Upgrade(cfg *Config) bool {
 		}
 	}
 
+	if cfg.Version < 4 {
+		if cfg.ChannelConfig.DerivativesHedge.WebhookURL == "" {
+			cfg.ChannelConfig.DerivativesHedge = DerivativesHedgeConfig{}
+		}
+	}
+
+	if cfg.Version < 5 {
+		if cfg.ChannelConfig.DerivativesHedge.WebhookURL == "" &&
+			cfg.ChannelConfig.DerivativesHedge.WebhookKey == "" &&
+			cfg.ChannelConfig.DerivativesHedge.WebhookSignatureHMACSHA256Key == "" {
+			cfg.ChannelConfig.DerivativesHedge = DerivativesHedgeConfig{}
+		} else {
+			if cfg.ChannelConfig.DerivativesHedge.WebhookKey == "" {
+				key, err := generateBase64Random(12)
+				if err != nil {
+					return false, fmt.Errorf("generate derivatives hedge webhook key: %w", err)
+				}
+				cfg.ChannelConfig.DerivativesHedge.WebhookKey = key
+			}
+			if cfg.ChannelConfig.DerivativesHedge.WebhookSignatureHMACSHA256Key == "" {
+				key, err := generateBase64Random(32)
+				if err != nil {
+					return false, fmt.Errorf("generate derivatives hedge signature key: %w", err)
+				}
+				cfg.ChannelConfig.DerivativesHedge.WebhookSignatureHMACSHA256Key = key
+			}
+		}
+	}
+
+	if cfg.Version < 6 {
+		if len(cfg.Vault.PrivateKey) == 0 {
+			_, vaultPriv, err := ed25519.GenerateKey(nil)
+			if err != nil {
+				return false, fmt.Errorf("generate vault key: %w", err)
+			}
+			cfg.Vault.PrivateKey = vaultPriv.Seed()
+		}
+		if cfg.Vault.Coins == nil {
+			cfg.Vault.Coins = map[string]VaultCoinBalanceConfig{}
+		}
+	}
+
 	cfg.Version = LatestConfigVersion
-	return true
+	return true, nil
 }
 
 func (cfg *Config) assignBalanceID() {

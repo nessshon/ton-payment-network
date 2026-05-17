@@ -7,9 +7,17 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"math/big"
+	"strings"
+	"syscall/js"
+	"time"
+
 	"github.com/xssnick/ton-payment-network/pkg/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals/oracle"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain/client"
@@ -21,15 +29,13 @@ import (
 	"github.com/xssnick/ton-payment-network/tonpayments/wallet"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
-	"math/big"
-	"strings"
-	"syscall/js"
-	"time"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 var DB *db.DB
 var Service *tonpayments.Service
 var Config *config.Config
+var DerivativesEnabled bool
 
 const MinFee = "0.000000001"
 const FeePercentDiv100 = 0
@@ -37,6 +43,10 @@ const FeePercentDiv100 = 0
 func main() {
 	var started bool
 	var sPub ed25519.PublicKey
+
+	js.Global().Set("isDerivativesEnabled", js.FuncOf(func(this js.Value, args []js.Value) any {
+		return js.ValueOf(started && DerivativesEnabled)
+	}))
 
 	js.Global().Set("openChannel", js.FuncOf(func(this js.Value, args []js.Value) any {
 		if !started {
@@ -261,6 +271,256 @@ func main() {
 		}))
 	}))
 
+	js.Global().Set("getDerivativesPositions", js.FuncOf(func(this js.Value, args []js.Value) any {
+		promiseCtor := js.Global().Get("Promise")
+
+		return promiseCtor.New(js.FuncOf(func(this js.Value, prArgs []js.Value) any {
+			resolve := prArgs[0]
+			reject := prArgs[1]
+
+			go func() {
+				if !started {
+					resolve.Invoke(js.Global().Get("Array").New(0))
+					return
+				}
+				if !DerivativesEnabled {
+					resolve.Invoke(js.Global().Get("Array").New(0))
+					return
+				}
+
+				ch, err := getPrimaryChanel(sPub)
+				if err != nil {
+					resolve.Invoke(js.Global().Get("Array").New(0))
+					return
+				}
+
+				symbol := ""
+				if len(args) > 0 && args[0].Type() == js.TypeString {
+					symbol = args[0].String()
+				}
+
+				list, err := tonpayments.NewDerivativesService(Service).ListDerivativesPositions(context.Background(), ch.Our.Address, symbol)
+				if err != nil {
+					reject.Invoke("failed to get derivative positions: " + err.Error())
+					return
+				}
+
+				raw, err := json.Marshal(list)
+				if err != nil {
+					reject.Invoke("failed to serialize derivative positions: " + err.Error())
+					return
+				}
+
+				resolve.Invoke(js.Global().Get("JSON").Call("parse", string(raw)))
+			}()
+
+			return nil
+		}))
+	}))
+
+	js.Global().Set("getDerivativeMarketPrice", js.FuncOf(func(this js.Value, args []js.Value) any {
+		promiseCtor := js.Global().Get("Promise")
+
+		return promiseCtor.New(js.FuncOf(func(this js.Value, prArgs []js.Value) any {
+			resolve := prArgs[0]
+			reject := prArgs[1]
+
+			go func() {
+				if !started {
+					reject.Invoke("not started")
+					return
+				}
+				if !DerivativesEnabled {
+					reject.Invoke("derivatives are unavailable")
+					return
+				}
+
+				if len(args) != 1 || args[0].Type() != js.TypeString {
+					reject.Invoke("wrong number of arguments")
+					return
+				}
+
+				quote, err := tonpayments.NewDerivativesService(Service).GetMarketPrice(context.Background(), args[0].String())
+				if err != nil {
+					reject.Invoke("failed to get derivative market price: " + err.Error())
+					return
+				}
+
+				raw, err := json.Marshal(quote)
+				if err != nil {
+					reject.Invoke("failed to serialize derivative market price: " + err.Error())
+					return
+				}
+
+				resolve.Invoke(js.Global().Get("JSON").Call("parse", string(raw)))
+			}()
+
+			return nil
+		}))
+	}))
+
+	js.Global().Set("getDerivativePriceHistory", js.FuncOf(func(this js.Value, args []js.Value) any {
+		promiseCtor := js.Global().Get("Promise")
+
+		return promiseCtor.New(js.FuncOf(func(this js.Value, prArgs []js.Value) any {
+			resolve := prArgs[0]
+			reject := prArgs[1]
+
+			go func() {
+				if !started {
+					reject.Invoke("not started")
+					return
+				}
+				if !DerivativesEnabled {
+					reject.Invoke("derivatives are unavailable")
+					return
+				}
+
+				if len(args) != 1 || args[0].Type() != js.TypeString {
+					reject.Invoke("wrong number of arguments")
+					return
+				}
+
+				history, err := tonpayments.NewDerivativesService(Service).GetPriceHistory(context.Background(), args[0].String())
+				if err != nil {
+					reject.Invoke("failed to get price history: " + err.Error())
+					return
+				}
+
+				raw, err := json.Marshal(history)
+				if err != nil {
+					reject.Invoke("failed to serialize price history: " + err.Error())
+					return
+				}
+
+				resolve.Invoke(js.Global().Get("JSON").Call("parse", string(raw)))
+			}()
+
+			return nil
+		}))
+	}))
+
+	js.Global().Set("openDerivativePosition", js.FuncOf(func(this js.Value, args []js.Value) any {
+		promiseCtor := js.Global().Get("Promise")
+
+		return promiseCtor.New(js.FuncOf(func(this js.Value, prArgs []js.Value) any {
+			resolve := prArgs[0]
+			reject := prArgs[1]
+
+			go func() {
+				if !started {
+					reject.Invoke("not started")
+					return
+				}
+				if !DerivativesEnabled {
+					reject.Invoke("derivatives are unavailable")
+					return
+				}
+
+				if len(args) < 4 {
+					reject.Invoke("wrong number of arguments")
+					return
+				}
+
+				symbol := args[0].String()
+				side := strings.ToLower(strings.TrimSpace(args[1].String()))
+				leverage := args[2].Int()
+				amount := args[3].String()
+				typ := "market"
+				price := ""
+				if len(args) > 4 && args[4].Type() == js.TypeString && strings.TrimSpace(args[4].String()) != "" {
+					typ = strings.ToLower(strings.TrimSpace(args[4].String()))
+				}
+				if len(args) > 5 && args[5].Type() == js.TypeString {
+					price = strings.TrimSpace(args[5].String())
+				}
+
+				if side != "long" && side != "short" {
+					reject.Invoke("side should be long or short")
+					return
+				}
+				if leverage <= 0 {
+					reject.Invoke("leverage should be positive")
+					return
+				}
+				if typ != "market" && typ != "limit" {
+					reject.Invoke("type should be market or limit")
+					return
+				}
+				if typ == "limit" && price == "" {
+					reject.Invoke("limit order requires price")
+					return
+				}
+
+				ch, err := getPrimaryChanel(sPub)
+				if err != nil {
+					reject.Invoke("failed to get primary channel: " + err.Error())
+					return
+				}
+
+				id, err := tonpayments.NewDerivativesService(Service).OpenPosition(context.Background(), ch.Our.Address, symbol, side, leverage, amount, typ, price)
+				if err != nil {
+					reject.Invoke("failed to open derivative position: " + err.Error())
+					return
+				}
+
+				resolve.Invoke(id)
+			}()
+
+			return nil
+		}))
+	}))
+
+	js.Global().Set("closeDerivativePosition", js.FuncOf(func(this js.Value, args []js.Value) any {
+		promiseCtor := js.Global().Get("Promise")
+
+		return promiseCtor.New(js.FuncOf(func(this js.Value, prArgs []js.Value) any {
+			resolve := prArgs[0]
+			reject := prArgs[1]
+
+			go func() {
+				if !started {
+					reject.Invoke("not started")
+					return
+				}
+				if !DerivativesEnabled {
+					reject.Invoke("derivatives are unavailable")
+					return
+				}
+
+				if len(args) < 1 {
+					reject.Invoke("wrong number of arguments")
+					return
+				}
+
+				positionIdentifier := strings.TrimSpace(args[0].String())
+				typ := "market"
+				if len(args) > 1 && args[1].Type() == js.TypeString && strings.TrimSpace(args[1].String()) != "" {
+					typ = strings.ToLower(strings.TrimSpace(args[1].String()))
+				}
+				if positionIdentifier == "" {
+					reject.Invoke("position id or symbol is required")
+					return
+				}
+
+				ch, err := getPrimaryChanel(sPub)
+				if err != nil {
+					reject.Invoke("failed to get primary channel: " + err.Error())
+					return
+				}
+
+				if err = tonpayments.NewDerivativesService(Service).ClosePosition(context.Background(), ch.Our.Address, positionIdentifier, typ); err != nil {
+					reject.Invoke("failed to close derivative position: " + err.Error())
+					return
+				}
+
+				resolve.Invoke(js.Null())
+			}()
+
+			return nil
+		}))
+	}))
+
 	js.Global().Set("sendTransferWithPath", js.FuncOf(func(this js.Value, args []js.Value) any {
 		if !started {
 			return js.Null()
@@ -404,6 +664,47 @@ func main() {
 		}
 
 		return js.Null()
+	}))
+
+	js.Global().Set("closeChannelUncooperative", js.FuncOf(func(this js.Value, args []js.Value) any {
+		promiseCtor := js.Global().Get("Promise")
+
+		return promiseCtor.New(js.FuncOf(func(this js.Value, prArgs []js.Value) any {
+			resolve := prArgs[0]
+			reject := prArgs[1]
+
+			go func() {
+				if !started {
+					reject.Invoke("not started")
+					return
+				}
+
+				if len(args) != 1 {
+					reject.Invoke("wrong number of arguments")
+					return
+				}
+
+				channelAddr := args[0].String()
+				if channelAddr == "" {
+					reject.Invoke("channel address is required")
+					return
+				}
+
+				if _, err := address.ParseAddr(channelAddr); err != nil {
+					reject.Invoke("invalid channel address: " + err.Error())
+					return
+				}
+
+				if err := Service.RequestUncooperativeClose(context.Background(), channelAddr); err != nil {
+					reject.Invoke("failed to request uncooperative close: " + err.Error())
+					return
+				}
+
+				resolve.Invoke(js.Undefined())
+			}()
+
+			return nil
+		}))
 	}))
 
 	js.Global().Set("listChannelsPrint", js.FuncOf(func(this js.Value, args []js.Value) any {
@@ -633,7 +934,13 @@ func start(peerKey, channelKey []byte) {
 	if err != nil {
 		panic(err)
 	}
-	if config.Upgrade(cfg) {
+	cfg.Vault.AllowOnTheirSide = true
+	updated, err := config.Upgrade(cfg)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to upgrade config")
+		return
+	}
+	if updated {
 		if err = config.SaveConfig(cfg, configPath); err != nil {
 			log.Fatal().Err(err).Msg("failed to update config file")
 			return
@@ -646,6 +953,7 @@ func start(peerKey, channelKey []byte) {
 	cfg.ChannelConfig.SupportedCoins.Ton.VirtualTunnelConfig.MaxCapacityToRentPerTx = "5"
 	cfg.ChannelConfig.SupportedCoins.Ton.VirtualTunnelConfig.CapacityDepositFee = "0.05"
 	cfg.ChannelConfig.SupportedCoins.Ton.VirtualTunnelConfig.CapacityFeePercentPer30Days = 0.1
+	cfg.ChannelConfig.SupportedCoins.Ton.VirtualTunnelConfig.DerivativeFeePercent = 0.5
 	cfg.ChannelConfig.SupportedCoins.Ton.BalanceControl = nil
 
 	cfg.ChannelConfig.SupportedCoins.Jettons["EQDQp0PWKNlb3rFzP3WgLp_0vzL0bAcoZXWlvs9SmcGRPkJv"] = config.CoinConfig{
@@ -657,6 +965,7 @@ func start(peerKey, channelKey []byte) {
 			ProxyMaxCapacity:            "15.5",
 			ProxyMinFee:                 "0.002",
 			ProxyFeePercent:             0.8,
+			DerivativeFeePercent:        0.5,
 		},
 		Symbol:                "USDX",
 		Decimals:              6,
@@ -667,6 +976,13 @@ func start(peerKey, channelKey []byte) {
 
 	if err = config.SaveConfig(cfg, configPath); err != nil {
 		panic(err)
+	}
+
+	if err = initWebDerivativesResolvers(peerKey); err != nil {
+		DerivativesEnabled = false
+		log.Warn().Err(err).Msg("failed to initialize derivatives price resolvers for web")
+	} else {
+		DerivativesEnabled = true
 	}
 
 	idb, freshDb, err := browser.NewIndexedDB(userId + ".v2")
@@ -760,13 +1076,63 @@ func start(peerKey, channelKey []byte) {
 			resPending[cc.Symbol] = cc.MustAmount(b).String()
 		}
 
+		estimateWalletApprovals := func(channel *db.Channel) int {
+			if channel == nil || Service == nil {
+				return 0
+			}
+			if !channel.UncoopCloseStarted && channel.Status != db.ChannelStateClosing {
+				return 0
+			}
+
+			resolvers := map[string]struct{}{}
+			proxySettles := 0
+
+			collect := func(dict *cell.Dictionary, countProxy bool) {
+				if dict == nil {
+					return
+				}
+
+				items, err := dict.LoadAll()
+				if err != nil {
+					return
+				}
+
+				for _, kv := range items {
+					if kv.Value == nil || (kv.Value.BitsLeft() == 0 && kv.Value.RefsNum() == 0) {
+						continue
+					}
+
+					parsed, err := payments.CodeToConditional(ctx, kv.Value.MustToCell(), Service)
+					if err != nil {
+						continue
+					}
+
+					drv, ok := parsed.(*conditionals.ConditionalResolvable)
+					if !ok || drv.ResolverAddr == nil {
+						continue
+					}
+
+					resolvers[drv.ResolverAddr.String()] = struct{}{}
+					if countProxy {
+						proxySettles++
+					}
+				}
+			}
+
+			collect(channel.Our.Data.Conditionals, false)
+			collect(channel.Their.Data.Conditionals, true)
+			return len(resolvers)*2 + proxySettles
+		}
+
 		jsEvent := map[string]any{
-			"active":     ch.Status == db.ChannelStateActive,
-			"balances":   js.ValueOf(resBalances),
-			"capacities": js.ValueOf(resCapacities),
-			"locked":     js.ValueOf(resLocked),
-			"pendingIn":  js.ValueOf(resPending),
-			"address":    ch.Our.Address,
+			"active":                  ch.Status == db.ChannelStateActive,
+			"balances":                js.ValueOf(resBalances),
+			"capacities":              js.ValueOf(resCapacities),
+			"locked":                  js.ValueOf(resLocked),
+			"pendingIn":               js.ValueOf(resPending),
+			"address":                 ch.Our.Address,
+			"uncooperativeClose":      ch.UncoopCloseStarted || ch.Status == db.ChannelStateClosing,
+			"expectedWalletApprovals": estimateWalletApprovals(ch),
 		}
 
 		pcuFunc.Invoke(js.ValueOf(jsEvent))
@@ -777,7 +1143,7 @@ func start(peerKey, channelKey []byte) {
 		pcuHistoryFunc.Invoke()
 	})
 
-	svc, err := tonpayments.NewService(tn, d, tr, nil, wl, ch, ed25519.NewKeyFromSeed(cfg.PaymentNodePrivateKey), cfg.ChannelConfig, false)
+	svc, err := tonpayments.NewService(tn, d, tr, nil, wl, ch, ed25519.NewKeyFromSeed(cfg.PaymentNodePrivateKey), cfg.ChannelConfig, cfg.Vault, false)
 	if err != nil {
 		panic(err)
 	}
@@ -810,12 +1176,14 @@ func start(peerKey, channelKey []byte) {
 
 	if noChannels {
 		jsEvent := map[string]any{
-			"active":     false,
-			"balances":   js.ValueOf(map[string]any{}),
-			"capacities": js.ValueOf(map[string]any{}),
-			"locked":     js.ValueOf(map[string]any{}),
-			"pendingIn":  js.ValueOf(map[string]any{}),
-			"address":    "",
+			"active":                  false,
+			"balances":                js.ValueOf(map[string]any{}),
+			"capacities":              js.ValueOf(map[string]any{}),
+			"locked":                  js.ValueOf(map[string]any{}),
+			"pendingIn":               js.ValueOf(map[string]any{}),
+			"address":                 "",
+			"uncooperativeClose":      false,
+			"expectedWalletApprovals": 0,
 		}
 
 		pcuFunc.Invoke(js.ValueOf(jsEvent))
@@ -890,4 +1258,26 @@ func mapConvert(m map[string]string) map[string]any {
 		res[k] = v
 	}
 	return res
+}
+
+func initWebDerivativesResolvers(peerKey ed25519.PublicKey) error {
+	proofKey := oracle.BinanceProofPublicKey()
+
+	pairs := []struct {
+		symbol string
+		ids    []uint32
+	}{
+		{"BTCUSDT", []uint32{oracle.GetResolverID("binance", "BTCUSDT"), 2}},
+		{"TONUSDT", []uint32{oracle.GetResolverID("binance", "TONUSDT"), 1}},
+	}
+
+	for _, pair := range pairs {
+		provider := oracle.NewWebProvider(pair.symbol, proofKey)
+		resolver := oracle.NewResolver(provider)
+		for _, id := range pair.ids {
+			oracle.PriceResolvers[id] = resolver
+		}
+	}
+
+	return nil
 }

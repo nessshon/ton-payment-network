@@ -3,9 +3,10 @@ package db
 import (
 	"crypto/ed25519"
 	"encoding/json"
+	"time"
+
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/tvm/cell"
-	"time"
 )
 
 type Task struct {
@@ -120,7 +121,7 @@ type ChannelCooperativeCloseTask struct {
 	ChannelInitiatedAt time.Time
 }
 
-type ConfirmCloseVirtualTask struct {
+type CloseConditionalTask struct {
 	VirtualKey []byte
 }
 
@@ -143,19 +144,15 @@ type AddConditionalTask struct {
 	TransportAction     transport.AddConditionalAction
 }
 
+type AddDerivativeTask struct {
+	ChannelAddress  string
+	Deadline        int64
+	TransportAction transport.AddConditionalAction
+}
+
 type SwapTask struct {
 	ChannelAddress  string
 	TransportAction transport.SwapAction
-}
-
-type AskRemoveVirtualTask struct {
-	Key            []byte
-	ChannelAddress string
-}
-
-type AskCloseVirtualTask struct {
-	ID             []byte
-	ChannelAddress string
 }
 
 type IncrementStatesTask struct {
@@ -163,6 +160,6 @@ type IncrementStatesTask struct {
 	WantResponse   bool
 }
 
-type RemoveVirtualTask struct {
+type RemoveConditionalTask struct {
 	Key []byte
 }

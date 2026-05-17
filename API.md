@@ -380,6 +380,145 @@ Response example:
 
 ---
 
+## Derivatives
+
+#### GET /api/v1/derivatives/position
+
+Returns the current derivative position for `channel` and `symbol`.
+
+Query parameters:
+
+- `channel` - onchain channel address
+- `symbol` - market symbol, for example `BTCUSDT`
+
+Response example:
+
+```json
+{
+  "id": "sSKOSuuU0K9IMn16Xn7GA1FvpluHYQIKQ4hsp4VHiNM=",
+  "symbol": "BTCUSDT",
+  "channel_address": "EQClgZqAyVBCgVov80ZU_wvFwCqNM63fgKV3lNwc2QOPZ74v",
+  "collateral": "0.01",
+  "fee": "0.0005",
+  "is_long": true,
+  "leverage": 10,
+  "status": "pending_open",
+  "opened": false,
+  "hedged": true,
+  "entry_at": 1773317532,
+  "entry_price": "80",
+  "current_price": "100",
+  "pnl_percent": 0,
+  "liquidation_price": "72"
+}
+```
+
+#### POST /api/v1/derivatives/open
+
+Queues a derivative open request.
+
+Request:
+
+```json
+{
+  "channel": "EQClgZqAyVBCgVov80ZU_wvFwCqNM63fgKV3lNwc2QOPZ74v",
+  "symbol": "BTCUSDT",
+  "side": "long",
+  "leverage": 10,
+  "amount": "0.01",
+  "type": "limit",
+  "price": "80"
+}
+```
+
+Response example:
+
+```json
+{
+  "id": "sSKOSuuU0K9IMn16Xn7GA1FvpluHYQIKQ4hsp4VHiNM=",
+  "accepted_at": "2026-03-12T12:12:12Z"
+}
+```
+
+`id` is the order identifier used in hedge webhooks and in `/api/v1/derivatives/hedged`.
+
+When hedge webhooks are enabled on the accepting node, the open and close webhook requests are signed with:
+
+- `X-Payments-Hedge-Key`
+- `X-Payments-Hedge-Timestamp`
+- `X-Payments-Hedge-Nonce`
+- `X-Payments-Hedge-Signature`
+
+The hedge service response must also be signed with `X-Payments-Hedge-Key`, `X-Payments-Hedge-Timestamp`, and `X-Payments-Hedge-Signature`. Unsigned or invalid signed responses reject the derivative open.
+
+#### POST /api/v1/derivatives/close
+
+Closes or cancels a derivative position.
+
+Request:
+
+```json
+{
+  "channel": "EQClgZqAyVBCgVov80ZU_wvFwCqNM63fgKV3lNwc2QOPZ74v",
+  "id": "sSKOSuuU0K9IMn16Xn7GA1FvpluHYQIKQ4hsp4VHiNM=",
+  "type": "market"
+}
+```
+
+`type` can be:
+
+- `market` - settle the position using the current oracle price
+- `cancel` - cancel a not-yet-opened position
+
+Success response:
+
+```json
+{
+  "success": true
+}
+```
+
+#### POST /api/v1/derivatives/hedged
+
+Marks an order as hedged or not hedged.
+
+Request:
+
+```json
+{
+  "order_id": "sSKOSuuU0K9IMn16Xn7GA1FvpluHYQIKQ4hsp4VHiNM=",
+  "hedged": true
+}
+```
+
+Success response:
+
+```json
+{
+  "success": true
+}
+```
+
+This API is intended for hedge services that receive derivative open and close webhooks. `order_id` is the same base64 condition key returned by open requests and sent by the hedge webhook.
+
+If hedge auth is configured on the node, this callback must be signed with the same hedge headers and HMAC secret. The node signs the response as well, and replayed nonces are rejected.
+
+#### Derivative metadata in virtual responses
+
+`GET /api/v1/channel/virtual` and `GET /api/v1/channel/virtual/list` may include derivative metadata:
+
+```json
+{
+  "key": "sSKOSuuU0K9IMn16Xn7GA1FvpluHYQIKQ4hsp4VHiNM=",
+  "status": "active",
+  "derivative": {
+    "hedged": true
+  }
+}
+```
+
+---
+
 ## Webhooks
 
 You can subscribe to **webhook events** to receive updates about:
@@ -460,6 +599,9 @@ type VirtualChannel struct {
 	Amount    string       `json:"amount"`
 	Outgoing  *VirtualSide `json:"outgoing"`
 	Incoming  *VirtualSide `json:"incoming"`
+	Derivative *struct {
+		Hedged bool `json:"hedged"`
+	} `json:"derivative,omitempty"`
 	CreatedAt time.Time    `json:"created_at"`
 	UpdatedAt time.Time    `json:"updated_at"`
 }

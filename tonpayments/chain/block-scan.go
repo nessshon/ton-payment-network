@@ -345,7 +345,7 @@ func (v *Scanner) fetchBlock(ctx context.Context, master *ton.BlockIDExt) (trans
 						return fmt.Errorf("failed to fetch block")
 					}
 
-					shr := block.Extra.ShardAccountBlocks.BeginParse()
+					shr := block.Extra.ShardAccountBlocks.MustBeginParse()
 					shardAccBlocks, err := shr.LoadDict(256)
 					if err != nil {
 						return fmt.Errorf("faled to load shard account blocks dict: %w", err)
@@ -362,9 +362,12 @@ func (v *Scanner) fetchBlock(ctx context.Context, master *ton.BlockIDExt) (trans
 						}
 					}
 
-					sab := shardAccBlocks.All()
+					sab, err := shardAccBlocks.LoadAll()
+					if err != nil {
+						return fmt.Errorf("faled to load shard account blocks: %w", err)
+					}
 					for _, kv := range sab {
-						slc := kv.Value.BeginParse()
+						slc := kv.Value
 						if err = tlb.LoadFromCell(&tlb.CurrencyCollection{}, slc); err != nil {
 							return fmt.Errorf("faled to load aug currency collection of account block dict: %w", err)
 						}
@@ -374,10 +377,17 @@ func (v *Scanner) fetchBlock(ctx context.Context, master *ton.BlockIDExt) (trans
 							return fmt.Errorf("faled to parse account block: %w", err)
 						}
 
-						allTx := ab.Transactions.All()
+						if ab.Transactions == nil || ab.Transactions.IsEmpty() {
+							continue
+						}
+
+						allTx, err := ab.Transactions.AsCell().AsDict(64).LoadAll()
+						if err != nil {
+							return fmt.Errorf("faled to load account transactions: %w", err)
+						}
 						transactionsNum += uint64(len(allTx))
 						for _, txKV := range allTx {
-							slcTx := txKV.Value.BeginParse()
+							slcTx := txKV.Value
 							if err = tlb.LoadFromCell(&tlb.CurrencyCollection{}, slcTx); err != nil {
 								return fmt.Errorf("faled to load aug currency collection of transactions dict: %w", err)
 							}

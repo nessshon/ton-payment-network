@@ -1,4 +1,4 @@
-.PHONY: all build web-dev web-prod
+.PHONY: all build web-dev web-prod linux
 
 ver := $(shell git describe --tags --always --dirty)
 
@@ -13,6 +13,9 @@ all:
 	GOOS=windows GOARCH=amd64 go build -ldflags "-w -s -X main.GitCommit=$(ver)" -o build/payment-node-x64.exe cmd/node/main.go
 	tinygo build -target=wasm -tags=js -no-debug -o build/payment-node-web.wasm cmd/web/main.go
 	wasm-opt -Oz -o build/payment-node-web.wasm build/payment-node-web.wasm
+
+linux:
+	GOOS=linux GOARCH=amd64 go build -ldflags "-w -s -X main.GitCommit=$(ver)" -o build/payment-node-linux-amd64 cmd/node/main.go
 
 web-dev:
 	tinygo build -target=wasm -tags=js -o cmd/web/web-payments-frontend/public/web.wasm cmd/web/main.go
