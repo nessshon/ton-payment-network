@@ -2236,6 +2236,7 @@ func (s *Service) ExecuteTopup(ctx context.Context, channelAddr, balanceId strin
 
 		fee := tlb.MustFromTON(s.cfg.ReplicationMessageAttachAmount).Nano()
 		fee.Mul(fee, big.NewInt(4))
+		fee.Add(fee, tlb.MustFromTON("0.05").Nano())
 
 		// deploy a contract or activate it
 		messages = append(messages, WalletMessage{
